@@ -1299,11 +1299,23 @@ func (i *Index) Completion(uri protocol.URI, pos protocol.Position, limit int) [
 			return out
 		}
 	}
+	// A library type is commonly indexed twice, once from the dependency's own
+	// jar and once from its sources jar. Both carry the same qualified name, so
+	// offering both puts two identical-looking entries in the list with no way
+	// to choose between them. A type's qualified name identifies it uniquely;
+	// callables sharing one are overloads and must all be offered.
+	seenType := make(map[string]bool)
 	for _, id := range ids {
 		s := i.symbols[id]
 		key := s.ID
 		if seen[key] || (!strings.HasPrefix(strings.ToLower(s.Name), strings.ToLower(prefix))) {
 			continue
+		}
+		if analysis.IsTypeKind(s.Kind) && s.FQN != "" {
+			if seenType[s.FQN] {
+				continue
+			}
+			seenType[s.FQN] = true
 		}
 		seen[key] = true
 		out = append(out, *s)
@@ -1334,12 +1346,25 @@ func AnnotationAttributeOwner(source string, offset int) string {
 			depth++
 		case ')':
 			depth--
+			if depth == 0 {
+				// The annotation's own argument list closed before this
+				// position. Anything further belongs to whatever the annotation
+				// is attached to -- a class's parameter list keeps the running
+				// depth positive and made every position inside the declaration
+				// look like an annotation argument.
+				return ""
+			}
 		}
 	}
 	if depth <= 0 {
 		return ""
 	}
 	owner := strings.TrimSpace(source[start+1 : open])
+	// A use-site target names where the annotation is applied, not what it is:
+	// `@field:Column(...)` is a Column.
+	if colon := strings.IndexByte(owner, ':'); colon >= 0 {
+		owner = strings.TrimSpace(owner[colon+1:])
+	}
 	for _, value := range owner {
 		if value != '.' && value != '$' && value != '_' && !unicode.IsLetter(value) && !unicode.IsDigit(value) {
 			return ""
@@ -1646,6 +1671,19 @@ func beanPropertyName(accessor string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// OpenDocuments returns the URIs the client currently has open. Diagnostics
+// that were pushed for them may need recomputing when the index changes.
+func (i *Index) OpenDocuments() []protocol.URI {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	out := make([]protocol.URI, 0, len(i.docs))
+	for uri := range i.docs {
+		out = append(out, uri)
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a] < out[b] })
+	return out
 }
 
 func (i *Index) AllFiles() []protocol.URI {
@@ -2875,7 +2913,7 @@ func (i *Index) resolveLocked(file *analysis.ParsedFile, r analysis.Reference) [
 	if len(ids) == 0 && qualifier == "" {
 		for _, id := range i.byName[r.Name] {
 			symbol := i.symbols[id]
-			if i.accessibleLocked(file, *symbol, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) && (analysis.IsTypeKind(symbol.Kind) || symbol.ContainerID == "") {
+			if i.accessibleLocked(file, *symbol, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) && (analysis.IsTypeKind(symbol.Kind) || symbol.ContainerID == "") && i.simpleNameInScopeLocked(file, *symbol) {
 				ids = append(ids, id)
 			}
 		}
@@ -3340,7 +3378,10 @@ func (i *Index) resolveArgumentLabelLocked(file *analysis.ParsedFile, label anal
 		}
 	}
 	if call == nil {
-		return nil
+		// An annotation argument has no enclosing call reference: the
+		// annotation name is recorded as a type, not a call. Its attributes
+		// still resolve, against the annotation's own members.
+		return i.resolveAnnotationAttributeLocked(file, document, label)
 	}
 	var out []analysis.Symbol
 	for _, callable := range i.resolveLocked(file, *call) {
@@ -3367,6 +3408,33 @@ func (i *Index) resolveArgumentLabelLocked(file *analysis.ParsedFile, label anal
 					ContainerName: callable.Name, Package: callable.Package, Type: parameter.Type,
 					Signature: label.Name + ": " + parameter.Type, Library: callable.Library,
 				})
+			}
+		}
+	}
+	return uniqueSymbols(out)
+}
+
+// resolveAnnotationAttributeLocked resolves `name` in `@Ann(name = value)` to
+// the attribute declared by the annotation type. Java annotations declare them
+// as methods and Kotlin ones as constructor parameters, so both member shapes
+// are accepted.
+func (i *Index) resolveAnnotationAttributeLocked(file *analysis.ParsedFile, document *textdoc.Document, label analysis.Reference) []analysis.Symbol {
+	owner := AnnotationAttributeOwner(document.Text, label.StartByte)
+	if owner == "" {
+		return nil
+	}
+	var out []analysis.Symbol
+	for _, annotation := range i.resolveTypeSymbolsLocked(file, owner) {
+		if !analysis.IsTypeKind(annotation.Kind) {
+			continue
+		}
+		for _, memberID := range i.byContainerName[annotation.Name] {
+			member := i.symbols[memberID]
+			if member == nil || member.ContainerID != annotation.ID || member.Name != label.Name {
+				continue
+			}
+			if analysis.IsCallableKind(member.Kind) || member.Kind == analysis.KindParameter || member.Kind == analysis.KindProperty || member.Kind == analysis.KindField {
+				out = append(out, *member)
 			}
 		}
 	}
@@ -3978,6 +4046,51 @@ func matchesArityForLanguage(symbol analysis.Symbol, count int, language analysi
 	return count >= required && (variadic || count <= len(symbol.Parameters))
 }
 
+// simpleNameInScopeLocked reports whether a declaration can be named by its
+// simple name from this file. A name is in scope when it is declared here, sits
+// in the same package, is imported, or comes from a package the language
+// imports by default. Anything else needs an import first, and resolving it
+// regardless made go-to-definition jump to a declaration the file cannot name
+// and the compiler will not accept.
+func (i *Index) simpleNameInScopeLocked(file *analysis.ParsedFile, symbol analysis.Symbol) bool {
+	if symbol.URI == file.URI {
+		return true
+	}
+	if symbol.Package == file.Package {
+		return true
+	}
+	for _, imported := range file.Imports {
+		if imported.Wildcard {
+			if imported.Path == symbol.Package {
+				return true
+			}
+			continue
+		}
+		if imported.Path == symbol.FQN || imported.LocalName() == symbol.Name && strings.HasSuffix(imported.Path, "."+symbol.Name) {
+			return true
+		}
+		// A member imported by name brings only that member into scope, but its
+		// owner is named by the import path itself.
+		if strings.HasPrefix(imported.Path, symbol.Package+".") {
+			if remainder := imported.Path[len(symbol.Package)+1:]; remainder == symbol.Name || strings.HasPrefix(remainder, symbol.Name+".") {
+				return true
+			}
+		}
+	}
+	if symbol.Package == "java.lang" {
+		return true
+	}
+	if file.Language == analysis.LanguageKotlin {
+		switch symbol.Package {
+		case "kotlin", "kotlin.annotation", "kotlin.collections", "kotlin.comparisons", "kotlin.io", "kotlin.ranges", "kotlin.sequences", "kotlin.text", "kotlin.jvm":
+			return true
+		}
+	}
+	// A declaration the index recorded without a package cannot be placed, so
+	// it is accepted rather than hidden.
+	return symbol.Package == ""
+}
+
 func (i *Index) resolveTypeSymbolsLocked(file *analysis.ParsedFile, typeName string) []analysis.Symbol {
 	base, _ := splitInstantiatedType(typeName)
 	base = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(base, "out "), "in "))
@@ -4020,6 +4133,11 @@ func (i *Index) resolveTypeSymbolsLocked(file *analysis.ParsedFile, typeName str
 		if values := filter(i.byFQN[file.Package+"."+base]); len(values) > 0 {
 			return values
 		}
+	} else if values := filter(i.byFQN[base]); len(values) > 0 {
+		// A file with no package declaration sits in the root package, where a
+		// top-level declaration's qualified name is its simple name. Skipping
+		// this left such files resolving nothing by scope at all.
+		return values
 	}
 	defaults := []string{"java.lang." + base}
 	if file.Language == analysis.LanguageKotlin {
@@ -4039,10 +4157,10 @@ func (i *Index) resolveTypeSymbolsLocked(file *analysis.ParsedFile, typeName str
 			}
 		}
 	}
-	values := filter(i.byName[base])
-	if len(values) == 1 {
-		return values
-	}
+	// No global by-name fallback. A simple name that is not declared here, not
+	// imported, not in this package and not default-imported is not in scope,
+	// and Kotlin will not compile it. Resolving it anyway made navigation jump
+	// to a type the file cannot actually name.
 	return nil
 }
 

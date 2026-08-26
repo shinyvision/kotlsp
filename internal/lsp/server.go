@@ -32,33 +32,34 @@ import (
 const latencyLimit = 100 * time.Millisecond
 
 type Server struct {
-	ctx                  context.Context
-	conn                 *jsonrpc.Conn
-	index                *index.Index
-	log                  *log.Logger
-	initializeReceived   atomic.Bool
-	initialized          atomic.Bool
-	shutdown             atomic.Bool
-	runMainCodeLens      atomic.Bool
-	rootMu               sync.RWMutex
-	roots                []protocol.URI
-	clientCaps           map[string]any
-	latencyMu            sync.Mutex
-	latency              map[string]time.Duration
-	dap                  *dap.Server
-	watermark            atomic.Int64
-	watermarkPath        string
-	defaultJavaHome      string
-	modMu                sync.Mutex
-	modSequence          atomic.Int64
-	modSessions          map[int64][]map[string]any
-	modSessionCreated    map[int64]time.Time
-	completionMu         sync.Mutex
-	completionSequence   atomic.Int64
-	completionGeneration atomic.Int64
-	completionSessions   map[int64]completionApplication
-	progressActive       atomic.Bool
-	progressSequence     atomic.Int64
+	ctx                     context.Context
+	conn                    *jsonrpc.Conn
+	index                   *index.Index
+	log                     *log.Logger
+	initializeReceived      atomic.Bool
+	initialized             atomic.Bool
+	shutdown                atomic.Bool
+	runMainCodeLens         atomic.Bool
+	rootMu                  sync.RWMutex
+	roots                   []protocol.URI
+	clientCaps              map[string]any
+	latencyMu               sync.Mutex
+	latency                 map[string]time.Duration
+	dap                     *dap.Server
+	watermark               atomic.Int64
+	watermarkPath           string
+	defaultJavaHome         string
+	modMu                   sync.Mutex
+	modSequence             atomic.Int64
+	modSessions             map[int64][]map[string]any
+	modSessionCreated       map[int64]time.Time
+	completionMu            sync.Mutex
+	completionSequence      atomic.Int64
+	completionGeneration    atomic.Int64
+	completionSessions      map[int64]completionApplication
+	progressActive          atomic.Bool
+	progressSequence        atomic.Int64
+	diagnosticRefreshActive atomic.Bool
 	// clientCall is injected by the benchmark and focused unit tests. Production
 	// traffic always uses conn; keeping the same request/response contract means
 	// server-initiated requests can never be silently treated as successful.
@@ -245,6 +246,7 @@ func (s *Server) Notify(ctx context.Context, method string, params json.RawMessa
 				go s.registerWatchedFiles()
 			}
 			s.reportIndexingProgress()
+			s.refreshDiagnosticsWhenIndexed()
 		}
 		return
 	}
@@ -467,6 +469,7 @@ func (s *Server) completion(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 		}
 	}
 	snippets := s.clientCapabilityBool("textDocument", "completion", "completionItem", "snippetSupport")
+	labelDetails := s.clientCapabilityBool("textDocument", "completion", "completionItem", "labelDetailsSupport")
 	javaCanResolveImportEdits := s.clientCompletionResolveProperty("additionalTextEdits")
 	for n, sym := range symbols {
 		insertName := sym.Name
@@ -474,6 +477,18 @@ func (s *Server) completion(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 			insertName = kotlinIdentifierInsertion(insertName)
 		}
 		item := protocol.CompletionItem{Label: sym.Name, Kind: sym.Kind.Completion(), Detail: sym.DisplaySignature(), Documentation: documentation(sym), SortText: fmt.Sprintf("%04d_%s", n, sym.Name), InsertText: insertName, Data: map[string]any{"symbolId": sym.ID, "uri": string(p.TextDocument.URI)}}
+		// Two declarations reached by completion routinely share a simple name,
+		// and accepting one writes an import. Without the qualified name the
+		// list offers no way to tell them apart or to see what will be
+		// imported, so it is shown beside the label.
+		importEdit, needsImport := s.completionImportIn(p.TextDocument.URI, file, doc, sym)
+		if qualified := sym.FQN; qualified != "" && qualified != sym.Name {
+			if labelDetails {
+				item.LabelDetails = map[string]any{"description": qualified}
+			} else if needsImport {
+				item.Detail = qualified + " · " + item.Detail
+			}
+		}
 		if snippets && analysis.IsCallableKind(sym.Kind) {
 			insertSymbol := sym
 			insertSymbol.Name = insertName
@@ -497,8 +512,8 @@ func (s *Server) completion(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 			if hasDocument {
 				application.Version = doc.Version
 			}
-			if edit, needed := s.completionImportIn(p.TextDocument.URI, file, doc, sym); needed {
-				workspaceEdit := protocol.WorkspaceEdit{Changes: map[protocol.URI][]protocol.TextEdit{p.TextDocument.URI: {edit}}}
+			if needsImport {
+				workspaceEdit := protocol.WorkspaceEdit{Changes: map[protocol.URI][]protocol.TextEdit{p.TextDocument.URI: {importEdit}}}
 				application.Edit = &workspaceEdit
 			}
 			s.completionSessions[id] = application
@@ -506,10 +521,8 @@ func (s *Server) completion(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 			item.Data.(map[string]any)["completionItemId"] = id
 		} else {
 			item.Command = &protocol.Command{Title: "Apply Java completion", Command: "jetbrains.java.completion.apply", Arguments: []any{map[string]any{"type": "com.jetbrains.ls.kotlinLsp.requests.core.ModCommandData.Nothing"}}}
-			if !javaCanResolveImportEdits {
-				if edit, needed := s.completionImportIn(p.TextDocument.URI, file, doc, sym); needed {
-					item.AdditionalTextEdits = append(item.AdditionalTextEdits, edit)
-				}
+			if !javaCanResolveImportEdits && needsImport {
+				item.AdditionalTextEdits = append(item.AdditionalTextEdits, importEdit)
 			}
 		}
 		items = append(items, item)
@@ -1055,6 +1068,26 @@ func (s *Server) clientCapabilityBool(path ...string) bool {
 	return value
 }
 
+// clientCapabilityPresent reports whether the client advertised a capability at
+// all, for capabilities whose presence is the signal and whose value is an
+// object rather than a flag.
+func (s *Server) clientCapabilityPresent(path ...string) bool {
+	s.rootMu.RLock()
+	var current any = s.clientCaps
+	s.rootMu.RUnlock()
+	for _, key := range path {
+		object, ok := current.(map[string]any)
+		if !ok {
+			return false
+		}
+		current, ok = object[key]
+		if !ok || current == nil {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) clientSupportsResourceOperation(operation string) bool {
 	s.rootMu.RLock()
 	var current any = s.clientCaps
@@ -1108,11 +1141,23 @@ func (s *Server) clientCompletionResolveProperty(property string) bool {
 }
 
 func (s *Server) publishDiagnostics(uri protocol.URI, diagnostics []protocol.Diagnostic) {
+	// A client that pulls diagnostics also receiving pushed ones records both,
+	// in separate namespaces, and reports every problem twice. The pushed copy
+	// is additionally a snapshot of whatever the index knew when the document
+	// was parsed, so it keeps reporting names that later became resolvable.
+	if s.clientCapabilityPresent("textDocument", "diagnostic") {
+		return
+	}
+	if diagnostics == nil {
+		diagnostics = []protocol.Diagnostic{}
+	}
+	params := map[string]any{"uri": uri, "diagnostics": diagnostics}
+	if s.notify != nil {
+		s.notify("textDocument/publishDiagnostics", params)
+		return
+	}
 	if s.conn != nil {
-		if diagnostics == nil {
-			diagnostics = []protocol.Diagnostic{}
-		}
-		_ = s.conn.Notify("textDocument/publishDiagnostics", map[string]any{"uri": uri, "diagnostics": diagnostics})
+		_ = s.conn.Notify("textDocument/publishDiagnostics", params)
 	}
 }
 

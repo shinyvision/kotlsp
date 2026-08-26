@@ -2003,14 +2003,24 @@ func TestJavaPackagePrivateAndKotlinInternalVisibility(t *testing.T) {
 	javaURI := protocol.URI("file:///workspace/a/Hidden.java")
 	useJavaURI := protocol.URI("file:///workspace/b/Use.java")
 	idx.Open(ctx, protocol.TextDocumentItem{URI: javaURI, LanguageID: "java", Version: 1, Text: "package a; class Hidden {} public class PublicType {}"})
-	javaUse := "package b; class Use { Hidden hidden; PublicType visible; }"
+	// A type from another package is named through an import. Without one the
+	// compiler rejects the reference, so neither the package-private type nor
+	// the public one may resolve by simple name alone.
+	javaUse := "package b;\nimport a.PublicType;\nclass Use { Hidden hidden; PublicType visible; }"
 	idx.Open(ctx, protocol.TextDocumentItem{URI: useJavaURI, LanguageID: "java", Version: 1, Text: javaUse})
 	doc := textdoc.NewDocument(useJavaURI, "java", 1, javaUse)
 	if definitions := idx.Definitions(useJavaURI, doc.Position(strings.Index(javaUse, "Hidden"))); len(definitions) != 0 {
 		t.Fatalf("package-private Java type escaped its package: %#v", definitions)
 	}
-	if definitions := idx.Definitions(useJavaURI, doc.Position(strings.Index(javaUse, "PublicType"))); !containsNamedSymbol(definitions, "PublicType") {
-		t.Fatalf("public Java type did not resolve: %#v", definitions)
+	if definitions := idx.Definitions(useJavaURI, doc.Position(strings.LastIndex(javaUse, "PublicType"))); !containsNamedSymbol(definitions, "PublicType") {
+		t.Fatalf("imported public Java type did not resolve: %#v", definitions)
+	}
+	unimportedURI := protocol.URI("file:///workspace/c/Unimported.java")
+	unimported := "package c;\nclass Unimported { PublicType visible; }"
+	idx.Open(ctx, protocol.TextDocumentItem{URI: unimportedURI, LanguageID: "java", Version: 1, Text: unimported})
+	unimportedDoc := textdoc.NewDocument(unimportedURI, "java", 1, unimported)
+	if definitions := idx.Definitions(unimportedURI, unimportedDoc.Position(strings.LastIndex(unimported, "PublicType"))); len(definitions) != 0 {
+		t.Fatalf("a type that is not imported must not resolve by simple name: %#v", definitions)
 	}
 
 	internalURI := protocol.URI("file:///workspace/a/Internal.kt")

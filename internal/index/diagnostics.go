@@ -187,6 +187,25 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 		if compilerReported {
 			continue
 		}
+		// A reference recovered from source the parser could not read is not
+		// evidence of anything. Where the syntax failed, the surrounding
+		// declaration may not have been recognised at all, which turns its own
+		// name into an apparently unresolved reference.
+		if referenceInUnparsedRegion(file, ref.Range) {
+			continue
+		}
+		// Failing to bind an occurrence is not the same as the name being
+		// undefined. Lambda receivers, standard-library extensions, generic
+		// scope functions, and annotation attributes on binary declarations all
+		// need real type inference to bind, and the index performs none: on
+		// ordinary Spring/Kotlin sources reporting them was wrong 98% of the
+		// time. A name the index has never seen anywhere is genuinely
+		// undefined; a name it knows but could not bind here belongs to the
+		// background K2/javac pass, which resolves it correctly and whose
+		// findings are already merged into this result.
+		if len(i.byName[ref.Name]) > 0 {
+			continue
+		}
 		data := map[string]any{"name": ref.Name}
 		if ids := i.byName[ref.Name]; len(ids) > 0 {
 			fqns := make([]string, 0, len(ids))
@@ -206,6 +225,17 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 		out = append(out, protocol.Diagnostic{Range: ref.Range, Severity: 1, Code: "unresolved-reference", Source: "kotlsp", Message: "Unresolved reference: " + ref.Name, Data: data})
 	}
 	return out
+}
+
+// referenceInUnparsedRegion reports whether a reference falls inside a span the
+// parser flagged as a syntax error.
+func referenceInUnparsedRegion(file *analysis.ParsedFile, target protocol.Range) bool {
+	for _, diagnostic := range file.Diagnostics {
+		if diagnostic.Severity == 1 && diagnostic.Code == "syntax" && rangesOverlap(diagnostic.Range, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // deprecationCacheKeyLocked identifies qualified calls whose resolution is

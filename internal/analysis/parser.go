@@ -151,6 +151,23 @@ func Parse(ctx context.Context, doc *textdoc.Document) *ParsedFile {
 		parsed.Diagnostics = append(parsed.Diagnostics, protocol.Diagnostic{Range: protocol.Range{}, Severity: 1, Source: "kotlsp", Message: "parser did not produce a syntax tree"})
 		return parsed
 	}
+	// An empty collection literal is valid Kotlin the grammar cannot parse, and
+	// it appears in almost every annotation declaration. Retry without those
+	// defaults before any other recovery, since one such literal is enough to
+	// lose the declaration that contains it.
+	if language == LanguageKotlin && tree.RootNode().HasError() {
+		if recovered := kotlinEmptyCollectionDefaultRecovery(parserSource); !bytes.Equal(recovered, parserSource) {
+			if candidate := p.Parse(recovered, nil); candidate != nil {
+				if syntaxErrorScore(candidate.RootNode()) < syntaxErrorScore(tree.RootNode()) {
+					tree.Close()
+					tree = candidate
+					parserSource = recovered
+				} else {
+					candidate.Close()
+				}
+			}
+		}
+	}
 	if language == LanguageKotlin && hasLargeSyntaxError(tree.RootNode(), len(doc.Text)) {
 		if recovered := kotlinBraceLineRecovery(parserSource); !bytes.Equal(recovered, parserSource) {
 			if candidate := p.Parse(recovered, nil); candidate != nil {
@@ -377,8 +394,12 @@ func syntaxErrorScore(root *sitter.Node) int64 {
 // declarations such as `class A { fun f() = 1 }` followed by a generic class.
 // Replacing existing horizontal whitespace adjacent to braces with newlines
 // preserves byte offsets. Strings and comments are left untouched.
-func kotlinBraceLineRecovery(source []byte) []byte {
-	recovered := append([]byte(nil), source...)
+// kotlinCodeMask marks every byte of source that is real code: outside
+// comments, character literals, and string literals of every form. A recovery
+// rewrites source before a retry parse, so it must never reach inside a
+// literal, where a rewrite would change what the program means.
+func kotlinCodeMask(source []byte) []bool {
+	mask := make([]bool, len(source))
 	const (
 		normal = iota
 		lineComment
@@ -451,12 +472,79 @@ func kotlinBraceLineRecovery(source []byte) []byte {
 			state = singleQuoted
 			continue
 		}
+		mask[index] = true
+	}
+	return mask
+}
+
+func kotlinBraceLineRecovery(source []byte) []byte {
+	recovered := append([]byte(nil), source...)
+	mask := kotlinCodeMask(source)
+	for index, isCode := range mask {
+		if !isCode {
+			continue
+		}
+		value := source[index]
 		if value == '{' && index+1 < len(source) && (source[index+1] == ' ' || source[index+1] == '\t') {
 			recovered[index+1] = '\n'
 		}
 		if value == '}' && index > 0 && (source[index-1] == ' ' || source[index-1] == '\t') {
 			recovered[index-1] = '\n'
 		}
+	}
+	return recovered
+}
+
+// kotlinEmptyCollectionDefaultRecovery blanks `= []` defaults.
+//
+// tree-sitter-kotlin requires a collection literal to hold at least one
+// element, so the empty array literal in `val groups: Array<KClass<*>> = []`
+// does not parse -- ordinary Kotlin, and near-universal in annotation
+// declarations. A single occurrence degrades to a MISSING element, but two in
+// one declaration exhaust the grammar's recovery and collapse the whole class
+// into a single ERROR node: every declaration inside it is lost, and its own
+// name is then reported as an unresolved reference.
+//
+// The rewrite preserves length and line structure, so every byte offset in the
+// resulting tree still addresses the original source and node text may be read
+// from it unchanged. Only the record that the parameter had a default is lost,
+// and no node spans a blanked span.
+func kotlinEmptyCollectionDefaultRecovery(source []byte) []byte {
+	recovered := append([]byte(nil), source...)
+	mask := kotlinCodeMask(source)
+	isCodeSpace := func(index int) bool {
+		return mask[index] && (source[index] == ' ' || source[index] == '\t' || source[index] == '\n' || source[index] == '\r')
+	}
+	for index := 0; index < len(source); index++ {
+		if !mask[index] || source[index] != '[' {
+			continue
+		}
+		closing := index + 1
+		for closing < len(source) && isCodeSpace(closing) {
+			closing++
+		}
+		if closing >= len(source) || !mask[closing] || source[closing] != ']' {
+			continue
+		}
+		// Walk back to the assignment this literal is the default for. Without
+		// one there is nothing safe to blank, so the literal is left alone.
+		assign := index - 1
+		for assign >= 0 && isCodeSpace(assign) {
+			assign--
+		}
+		if assign < 0 || !mask[assign] || source[assign] != '=' {
+			continue
+		}
+		// A compound or comparison operator is not an assignment.
+		if assign > 0 && mask[assign-1] && bytes.IndexByte([]byte("=!<>+-*/%&|^"), source[assign-1]) >= 0 {
+			continue
+		}
+		for n := assign; n <= closing; n++ {
+			if source[n] != '\n' && source[n] != '\r' {
+				recovered[n] = ' '
+			}
+		}
+		index = closing
 	}
 	return recovered
 }
@@ -669,6 +757,10 @@ func (b *parseBuilder) walk(n *sitter.Node, parentKind string) {
 			b.addKotlinSmartCasts(n)
 		} else if kind == "when_expression" {
 			b.addKotlinWhenSmartCasts(n)
+		} else if kind == "binary_expression" {
+			// A guard does not need an `if` around it: `a != null && a.member`
+			// is an expression in its own right, and commonly the whole body.
+			b.addKotlinNullShortCircuitCasts(n)
 		}
 	}
 
@@ -1008,14 +1100,8 @@ func (b *parseBuilder) addDeclarations(n *sitter.Node, spec declarationSpec, par
 			if kind == KindFunction && len(b.container) > 0 && isContainerKind(b.parsed.Symbols[b.container[len(b.container)-1]].Kind) {
 				kind = KindMethod
 			}
-			if nodeKind == "class_parameter" {
-				head := nodeText(b.source, n)
-				if colon := strings.IndexByte(head, ':'); colon >= 0 {
-					head = head[:colon]
-				}
-				if !strings.Contains(" "+normalizeSpace(head)+" ", " val ") && !strings.Contains(" "+normalizeSpace(head)+" ", " var ") {
-					kind = KindParameter
-				}
+			if nodeKind == "class_parameter" && !classParameterDeclaresProperty(n) {
+				kind = KindParameter
 			}
 			if nodeKind == "property_declaration" && kind == KindProperty && len(b.container) > 0 && IsCallableKind(b.parsed.Symbols[b.container[len(b.container)-1]].Kind) {
 				kind = KindVariable
@@ -2213,6 +2299,27 @@ func (b *parseBuilder) isCallCallee(n *sitter.Node) bool {
 	return false
 }
 
+// classParameterDeclaresProperty reports whether a primary-constructor
+// parameter also declares a property, which it does exactly when it carries the
+// val or var keyword. The grammar emits that keyword as its own child, and that
+// is the only dependable signal: reading it out of the parameter's text is
+// defeated by a use-site-target annotation such as `@field:Column(...)`, whose
+// colon precedes the keyword. Misreading it demotes the property to a plain
+// parameter, which is deliberately kept out of the global name index, so every
+// reference to it elsewhere in the class then looks unresolved.
+func classParameterDeclaresProperty(node *sitter.Node) bool {
+	if node == nil {
+		return false
+	}
+	for index := uint(0); index < node.ChildCount(); index++ {
+		switch child := node.Child(index); child.Kind() {
+		case "val", "var":
+			return true
+		}
+	}
+	return false
+}
+
 func (b *parseBuilder) isNamedArgumentLabel(node *sitter.Node, parentKind string) bool {
 	if parentKind != "value_argument" && parentKind != "element_value_pair" || len(b.ancestorNodes) == 0 {
 		return false
@@ -2594,6 +2701,7 @@ func (b *parseBuilder) addKotlinSmartCasts(node *sitter.Node) {
 		}
 		return
 	}
+	b.addKotlinNullBranchCasts(node, condition)
 	tests := make([]*sitter.Node, 0, 2)
 	if b.nodeKind(condition) == "is_expression" {
 		tests = append(tests, condition)
@@ -2660,6 +2768,145 @@ func (b *parseBuilder) addKotlinTypeSmartCast(node, condition, test *sitter.Node
 					b.parsed.SmartCasts = append(b.parsed.SmartCasts, SmartCast{Name: name, Type: typ, StartByte: start, EndByte: end})
 				}
 			}
+		}
+	}
+}
+
+// conditionOperand is one operand of a condition's top-level && / || chain,
+// together with the operator that introduced it.
+type conditionOperand struct {
+	text       string
+	start, end int
+	precededBy string
+}
+
+// splitKotlinCondition breaks a condition into its top-level operands, ignoring
+// operators nested in parentheses, string literals, or comments.
+func splitKotlinCondition(source []byte, start, end int) []conditionOperand {
+	if start < 0 || end > len(source) || start >= end {
+		return nil
+	}
+	text := source[start:end]
+	mask := kotlinCodeMask(text)
+	operands := make([]conditionOperand, 0, 4)
+	depth, operandStart, operator := 0, 0, ""
+	for index := 0; index < len(text); index++ {
+		if !mask[index] {
+			continue
+		}
+		switch text[index] {
+		case '(', '[':
+			depth++
+			continue
+		case ')', ']':
+			depth--
+			continue
+		}
+		if depth != 0 || index+1 >= len(text) || !mask[index+1] {
+			continue
+		}
+		pair := string(text[index : index+2])
+		if pair != "&&" && pair != "||" {
+			continue
+		}
+		operands = append(operands, conditionOperand{
+			text: string(text[operandStart:index]), start: start + operandStart, end: start + index, precededBy: operator,
+		})
+		operator = pair
+		index++
+		operandStart = index + 1
+	}
+	operands = append(operands, conditionOperand{
+		text: string(text[operandStart:]), start: start + operandStart, end: end, precededBy: operator,
+	})
+	return operands
+}
+
+// addKotlinNullShortCircuitCasts records the non-null facts that hold only for
+// part of a condition. In `x == null || x.member` the right operand runs only
+// when x is non-null, and `x != null && x.member` is the same guarantee written
+// the other way round; both are how Kotlin code ordinarily guards a nullable.
+// Only a condition that was nothing but a null check used to be recognised, so
+// neither idiom resolved its members at all.
+// addKotlinNullShortCircuitCasts records the non-null facts that hold only for
+// part of a boolean expression. In `x == null || x.member` the right operand
+// runs only when x is non-null, and `x != null && x.member` is the same
+// guarantee written the other way round; both are how Kotlin code ordinarily
+// guards a nullable. Only an expression that was nothing but a null check used
+// to be recognised, so neither idiom resolved its members at all.
+func (b *parseBuilder) addKotlinNullShortCircuitCasts(node *sitter.Node) {
+	start, end := b.nodeSpan(node)
+	if start < 0 || end > len(b.source) || start >= end {
+		return
+	}
+	span := b.source[start:end]
+	if !bytes.Contains(span, []byte("&&")) && !bytes.Contains(span, []byte("||")) {
+		return
+	}
+	operands := splitKotlinCondition(b.source, start, end)
+	for index, operand := range operands {
+		name, nonNullBranch, ok := kotlinNullCheck(operand.text)
+		if !ok || index+1 >= len(operands) {
+			continue
+		}
+		following := operands[index+1]
+		if following.precededBy != "||" && following.precededBy != "&&" {
+			continue
+		}
+		// `x == null || rest` and `x != null && rest` both leave the rest
+		// reachable only when x is non-null.
+		if following.precededBy == "||" && nonNullBranch != 1 || following.precededBy == "&&" && nonNullBranch != 0 {
+			continue
+		}
+		limit := end
+		if following.precededBy == "&&" {
+			// A later `||` restores reachability when the fact is false.
+			for _, later := range operands[index+1:] {
+				if later.precededBy == "||" {
+					limit = later.start
+					break
+				}
+			}
+		}
+		if following.start < limit {
+			b.parsed.SmartCasts = append(b.parsed.SmartCasts, SmartCast{Name: name, Type: "!", StartByte: following.start, EndByte: limit})
+		}
+	}
+}
+
+// addKotlinNullBranchCasts records the non-null facts a compound if-condition
+// establishes for a whole branch: the fact holds there only when no other
+// operand could have made the condition true without it.
+func (b *parseBuilder) addKotlinNullBranchCasts(node, condition *sitter.Node) {
+	conditionStart, conditionEnd := b.nodeSpan(condition)
+	operands := splitKotlinCondition(b.source, conditionStart, conditionEnd)
+	if len(operands) < 2 {
+		return
+	}
+	disjunctive, conjunctive := false, false
+	for _, operand := range operands {
+		switch operand.precededBy {
+		case "||":
+			disjunctive = true
+		case "&&":
+			conjunctive = true
+		}
+	}
+	branches := b.kotlinIfBranches(node, condition)
+	for _, operand := range operands {
+		name, nonNullBranch, ok := kotlinNullCheck(operand.text)
+		if !ok {
+			continue
+		}
+		branch := -1
+		if nonNullBranch == 0 && conjunctive && !disjunctive {
+			branch = 0
+		} else if nonNullBranch == 1 && disjunctive && !conjunctive {
+			branch = 1
+		}
+		if branch >= 0 && branch < len(branches) {
+			start, end := b.nodeSpan(branches[branch])
+			b.parsed.SmartCasts = append(b.parsed.SmartCasts, SmartCast{Name: name, Type: "!", StartByte: start, EndByte: end})
 		}
 	}
 }
