@@ -74,10 +74,13 @@ public final class KotlspCompilerHost {
         // an orderly shutdown, but a server killed mid-compilation is not
         // reading anything, and the compiler's own threads would keep the JVM
         // alive. A daemon thread watches the parent process instead.
+        // The pid is captured once: when the server dies this process is
+        // reparented to init or to a subreaper, so asking for the current
+        // parent from then on names a live process that never owned it.
+        long parentPid = ProcessHandle.current().parent().map(ProcessHandle::pid).orElse(-1L);
         Thread watchdog = new Thread(() -> {
-            java.util.Optional<ProcessHandle> parent = ProcessHandle.current().parent();
             while (true) {
-                if (!parent.isPresent() || !parent.get().isAlive()) {
+                if (parentPid < 0 || !ProcessHandle.of(parentPid).map(ProcessHandle::isAlive).orElse(false)) {
                     Runtime.getRuntime().halt(0);
                 }
                 try {

@@ -463,16 +463,29 @@ func (s *Server) completion(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	// candidates are the nearest ones that actually match, and the list is
 	// returned as incomplete so the client re-queries as the prefix narrows --
 	// which is exactly what `isIncomplete` is for.
+	file, _ := s.index.Parsed(p.TextDocument.URI)
+	doc, hasDocument := s.index.Document(p.TextDocument.URI)
+	kotlin := file != nil && file.Language == analysis.LanguageKotlin
+	// A string body and comment prose complete nothing -- not a symbol, not a
+	// keyword, not a snippet. A doc comment completes its own tags, and
+	// declarations only where a tag takes a reference.
+	position := index.CompletionPosition{Scope: index.CompletionCode}
+	if hasDocument {
+		position = index.CompletionPositionAt(doc.Text, doc.Offset(p.Position), kotlin)
+	}
+	switch position.Scope {
+	case index.CompletionNone:
+		return protocol.CompletionList{Items: []protocol.CompletionItem{}}, nil
+	case index.CompletionDocTag:
+		return protocol.CompletionList{Items: docTagCompletions(doc, p.Position, position, kotlin)}, nil
+	}
 	symbols := s.index.Completion(p.TextDocument.URI, p.Position, completionCandidateLimit)
 	truncated := len(symbols) >= completionCandidateLimit
 	items := make([]protocol.CompletionItem, 0, len(symbols)+40)
-	file, _ := s.index.Parsed(p.TextDocument.URI)
-	doc, hasDocument := s.index.Document(p.TextDocument.URI)
 	annotationOwner := ""
 	if hasDocument {
 		annotationOwner = index.AnnotationAttributeOwner(doc.Text, doc.Offset(p.Position))
 	}
-	kotlin := file != nil && file.Language == analysis.LanguageKotlin
 	generation := s.completionGeneration.Add(1)
 	now := time.Now()
 	s.completionMu.Lock()
@@ -544,6 +557,10 @@ func (s *Server) completion(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 		items = append(items, item)
 	}
 	keywords := keywordCompletions(p.TextDocument.URI)
+	if position.Scope != index.CompletionCode {
+		// A doc reference names a declaration; a keyword is not one.
+		keywords = nil
+	}
 	if hasDocument {
 		prefix, qualified := completionKeywordContext(doc.Text, doc.Offset(p.Position))
 		filtered := keywords[:0]
@@ -568,7 +585,7 @@ func (s *Server) completion(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 		}
 	}
 	s.completionMu.Unlock()
-	if !kotlin {
+	if !kotlin && position.Scope == index.CompletionCode {
 		if doc, ok := s.index.Document(p.TextDocument.URI); ok {
 			items = append(items, javaTemplateCompletions(doc, p.Position, snippets)...)
 			items = append(items, s.javaReferenceCompletions(doc, p.Position)...)
@@ -576,6 +593,31 @@ func (s *Server) completion(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	}
 	items = append(items, keywords...)
 	return protocol.CompletionList{IsIncomplete: truncated || !s.index.Progress().Ready, Items: items}, nil
+}
+
+// docTagCompletions offers the doc tags a language accepts. The edit spans
+// the '@' the author has already typed, so accepting one never doubles it.
+func docTagCompletions(doc *textdoc.Document, at protocol.Position, position index.CompletionPosition, kotlin bool) []protocol.CompletionItem {
+	offset := doc.Offset(at)
+	if position.TagStart < 0 || position.TagStart > offset {
+		return nil
+	}
+	typed := strings.ToLower(doc.Text[position.TagStart:offset])
+	replace := protocol.Range{Start: doc.Position(position.TagStart), End: at}
+	items := make([]protocol.CompletionItem, 0, 8)
+	for _, tag := range index.DocTagCompletions(kotlin) {
+		if !strings.HasPrefix(strings.ToLower(tag), typed) {
+			continue
+		}
+		items = append(items, protocol.CompletionItem{
+			Label:      tag,
+			Kind:       protocol.CompletionKeyword,
+			FilterText: tag,
+			SortText:   "0000_" + tag,
+			TextEdit:   &protocol.TextEdit{Range: replace, NewText: tag},
+		})
+	}
+	return items
 }
 
 func completionKeywordContext(source string, offset int) (prefix string, qualified bool) {

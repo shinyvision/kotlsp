@@ -1156,13 +1156,40 @@ func (i *Index) Completion(uri protocol.URI, pos protocol.Position, limit int) [
 		return nil
 	}
 	offset := doc.Offset(pos)
+	// Nothing the index knows applies inside a string body or comment prose,
+	// and a doc comment completes declarations only in its reference
+	// positions. A tag name is the server's to offer: no symbol names it.
+	kotlin := strings.EqualFold(doc.LanguageID, "kotlin")
+	position := CompletionPositionAt(doc.Text, offset, kotlin)
+	if position.Scope == CompletionNone || position.Scope == CompletionDocTag {
+		return nil
+	}
 	prefix, qualifier := completionContext(doc.Text, offset)
+	// A Kotlin identifier never contains '$'; the one before a template's
+	// name introduces it and is not part of the name being typed.
+	if kotlin {
+		prefix = strings.TrimLeft(prefix, "$")
+	}
+	if position.Scope != CompletionCode {
+		prefix, qualifier = docReferenceContext(doc.Text, offset)
+	}
 	annotationOwner := AnnotationAttributeOwner(doc.Text, offset)
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	file := i.files[uri]
 	if file == nil {
 		return nil
+	}
+	if position.Scope == CompletionDocParameter {
+		return i.documentedParametersLocked(file, position.DocEnd, prefix)
+	}
+	// `Owner#member` and `[Owner.member]` reference a member the way code
+	// cannot: a doc reference names instance members through the type itself,
+	// where an expression would need a receiver.
+	if position.Scope == CompletionDocReference && qualifier != "" {
+		if members := i.docQualifiedMembersLocked(file, qualifier, prefix, offset); len(members) > 0 {
+			return members
+		}
 	}
 	initialCapacity := 256
 	if limited {
@@ -1345,6 +1372,14 @@ func (i *Index) Completion(uri protocol.URI, pos protocol.Position, limit int) [
 	// to choose between them. A type's qualified name identifies it uniquely;
 	// callables sharing one are overloads and must all be offered.
 	seenType := make(map[string]bool)
+	// Members of one receiver are offered once each. The same member reaches
+	// this list several times over: a multiplatform declaration from both its
+	// common and its platform source set, a member and the supertype member it
+	// overrides, and the Kotlin and Java views of the same JVM method. A
+	// receiver's member is identified by its name and parameter types, so
+	// overloads stay distinct while copies collapse -- `address.length` was
+	// offered six times before this.
+	seenMember := make(map[string]int)
 	for _, id := range ids {
 		s := i.symbols[id]
 		key := s.ID
@@ -1357,6 +1392,22 @@ func (i *Index) Completion(uri protocol.URI, pos protocol.Position, limit int) [
 			}
 			seenType[s.FQN] = true
 		}
+		if qualifier != "" && !analysis.IsTypeKind(s.Kind) {
+			member := memberSignatureKey(*s)
+			if at, exists := seenMember[member]; exists {
+				// Keep the view spelled in this file's language: a Kotlin file
+				// names `length` as a property, a Java one as `length()`.
+				if s.Language == file.Language && out[at].Language != file.Language {
+					out[at] = *s
+				}
+				continue
+			}
+			seenMember[member] = len(out)
+		}
+		// `@throws` and `@exception` take a type and nothing else.
+		if position.Scope == CompletionDocType && !analysis.IsTypeKind(s.Kind) {
+			continue
+		}
 		seen[key] = true
 		out = append(out, *s)
 		if limited && len(out) >= limit {
@@ -1364,6 +1415,135 @@ func (i *Index) Completion(uri protocol.URI, pos protocol.Position, limit int) [
 		}
 	}
 	return out
+}
+
+// memberSignatureKey identifies a receiver's member by what distinguishes one
+// member from another: its name and the types it takes.
+func memberSignatureKey(symbol analysis.Symbol) string {
+	var key strings.Builder
+	key.WriteString(symbol.Name)
+	key.WriteByte('(')
+	for _, parameter := range symbol.Parameters {
+		key.WriteString(simpleType(parameter.Type))
+		key.WriteByte(';')
+	}
+	key.WriteByte(')')
+	return key.String()
+}
+
+// documentedParametersLocked lists the parameters of the declaration a doc
+// comment documents, which is the one beginning after it.
+func (i *Index) documentedParametersLocked(file *analysis.ParsedFile, docEnd int, prefix string) []analysis.Symbol {
+	var documented *analysis.Symbol
+	for index := range file.Symbols {
+		symbol := &file.Symbols[index]
+		if symbol.Synthetic || symbol.StartByte < docEnd {
+			continue
+		}
+		if documented == nil || symbol.StartByte < documented.StartByte {
+			documented = symbol
+		}
+	}
+	if documented == nil {
+		return nil
+	}
+	out := make([]analysis.Symbol, 0, len(documented.Parameters))
+	add := func(name, typ string, kind analysis.SymbolKind) {
+		if name == "" || prefix != "" && !strings.HasPrefix(strings.ToLower(name), strings.ToLower(prefix)) {
+			return
+		}
+		for _, existing := range out {
+			if existing.Name == name {
+				return
+			}
+		}
+		out = append(out, analysis.Symbol{ID: "docparam:" + documented.ID + ":" + name, Name: name, Kind: kind, Type: typ, Language: file.Language})
+	}
+	for _, parameter := range documented.Parameters {
+		add(parameter.Name, parameter.Type, analysis.KindParameter)
+	}
+	// A class documents its constructor's parameters, and KDoc's `@property`
+	// names the properties they declare.
+	for index := range file.Symbols {
+		member := &file.Symbols[index]
+		if member.Synthetic || member.ContainerID != documented.ID {
+			continue
+		}
+		if member.Kind == analysis.KindConstructor {
+			for _, parameter := range member.Parameters {
+				add(parameter.Name, parameter.Type, analysis.KindParameter)
+			}
+		}
+		if member.Kind == analysis.KindProperty || member.Kind == analysis.KindField {
+			add(member.Name, member.Type, member.Kind)
+		}
+	}
+	// Type parameters are documented with `@param <T>` in Java and `@param T`
+	// in Kotlin.
+	for _, name := range documented.TypeParameters {
+		add(name, "", analysis.KindTypeParameter)
+	}
+	return out
+}
+
+// docQualifiedMembersLocked lists the members a doc reference may name through
+// an owning type, instance and static alike.
+func (i *Index) docQualifiedMembersLocked(file *analysis.ParsedFile, qualifier, prefix string, offset int) []analysis.Symbol {
+	owners := i.resolveTypeSymbolsLocked(file, qualifier)
+	if len(owners) == 0 {
+		return nil
+	}
+	out := make([]analysis.Symbol, 0, 16)
+	seen := make(map[string]bool)
+	for _, owner := range owners {
+		for _, container := range i.typeAndSupertypesLocked(file, owner.Name) {
+			for _, id := range i.byContainerName[container] {
+				symbol := i.symbols[id]
+				if symbol == nil || seen[symbol.ID] || symbol.Synthetic {
+					continue
+				}
+				if prefix != "" && !strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix)) {
+					continue
+				}
+				if !i.accessibleLocked(file, *symbol, offset) {
+					continue
+				}
+				seen[symbol.ID] = true
+				out = append(out, *symbol)
+			}
+		}
+	}
+	return out
+}
+
+// docReferenceContext reads the prefix and qualifier of a doc-comment
+// reference. Javadoc separates a member from its owner with '#'; everything
+// else spells references the way code does.
+func docReferenceContext(text string, offset int) (string, string) {
+	prefix, qualifier := completionContext(text, offset)
+	if qualifier != "" {
+		return prefix, qualifier
+	}
+	start := offset - len(prefix)
+	if start > 0 && text[start-1] == '#' {
+		owner := completionIdentifierBefore(text, start-1)
+		return prefix, owner
+	}
+	return prefix, ""
+}
+
+// completionIdentifierBefore returns the dotted identifier ending at the
+// offset, as `java.util.List` or `List`.
+func completionIdentifierBefore(text string, offset int) string {
+	start := offset
+	for start > 0 {
+		value := text[start-1]
+		if value != '.' && !isIdentifierByteFast(value) {
+			break
+		}
+		start--
+	}
+	return text[start:offset]
 }
 
 func AnnotationAttributeOwner(source string, offset int) string {

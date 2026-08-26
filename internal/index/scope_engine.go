@@ -1325,115 +1325,6 @@ func splitTopLevel(list string, separator byte) []string {
 	return out
 }
 
-// codeMask marks every byte that is code: outside comments and outside string
-// and character literals. Inside a Kotlin string, a template expression is
-// code again, and a `$name` template names an identifier that is code too.
-func codeMask(text string, kotlin bool) []bool {
-	mask := make([]bool, len(text))
-	type frame struct {
-		kind  byte // '"' for a string, 't' for a triple-quoted string, '{' for a template block
-		depth int
-	}
-	var stack []frame
-	for at := 0; at < len(text); at++ {
-		value := text[at]
-		if len(stack) > 0 && stack[len(stack)-1].kind != '{' {
-			top := &stack[len(stack)-1]
-			if value == '\\' && top.kind == '"' {
-				at++
-				continue
-			}
-			if top.kind == '"' && (value == '"' || value == '\n') {
-				stack = stack[:len(stack)-1]
-				continue
-			}
-			if top.kind == 't' && value == '"' && at+2 < len(text) && text[at+1] == '"' && text[at+2] == '"' {
-				stack = stack[:len(stack)-1]
-				at += 2
-				continue
-			}
-			if kotlin && value == '$' && at+1 < len(text) {
-				if text[at+1] == '{' {
-					stack = append(stack, frame{kind: '{'})
-					at++
-					mask[at] = true
-					continue
-				}
-				if isIdentifierByteFast(text[at+1]) && !(text[at+1] >= '0' && text[at+1] <= '9') {
-					end := at + 1
-					for end < len(text) && isIdentifierByteFast(text[end]) {
-						mask[end] = true
-						end++
-					}
-					at = end - 1
-				}
-			}
-			continue
-		}
-		// Code, possibly inside a template block.
-		if value == '/' && at+1 < len(text) && text[at+1] == '/' {
-			for at < len(text) && text[at] != '\n' {
-				at++
-			}
-			continue
-		}
-		if value == '/' && at+1 < len(text) && text[at+1] == '*' {
-			depth := 1
-			at += 2
-			for at < len(text) && depth > 0 {
-				if kotlin && text[at] == '/' && at+1 < len(text) && text[at+1] == '*' {
-					depth++
-					at += 2
-					continue
-				}
-				if text[at] == '*' && at+1 < len(text) && text[at+1] == '/' {
-					depth--
-					at += 2
-					continue
-				}
-				at++
-			}
-			at--
-			continue
-		}
-		if value == '"' {
-			if at+2 < len(text) && text[at+1] == '"' && text[at+2] == '"' {
-				stack = append(stack, frame{kind: 't'})
-				at += 2
-			} else {
-				stack = append(stack, frame{kind: '"'})
-			}
-			continue
-		}
-		if value == '\'' {
-			end := at + 1
-			for end < len(text) && text[end] != '\'' && text[end] != '\n' {
-				if text[end] == '\\' {
-					end++
-				}
-				end++
-			}
-			at = end
-			continue
-		}
-		if len(stack) > 0 {
-			top := &stack[len(stack)-1]
-			if value == '{' {
-				top.depth++
-			} else if value == '}' {
-				if top.depth == 0 {
-					mask[at] = true
-					stack = stack[:len(stack)-1]
-					continue
-				}
-				top.depth--
-			}
-		}
-		mask[at] = true
-	}
-	return mask
-}
-
 // isBinarySymbol reports whether a symbol was indexed from a class file
 // rather than from source.
 func isBinarySymbol(symbol analysis.Symbol) bool {
@@ -1443,7 +1334,7 @@ func isBinarySymbol(symbol analysis.Symbol) bool {
 // isJvmFunctionType recognises the JVM spellings of Kotlin function types.
 func isJvmFunctionType(base string) bool {
 	base = strings.TrimPrefix(strings.TrimPrefix(base, "kotlin.jvm.functions."), "kotlin.")
-	for _, prefix := range []string{"Function", "SuspendFunction", "FunctionN"} {
+	for _, prefix := range []string{"SuspendFunction", "FunctionN", "Function"} {
 		if rest, ok := strings.CutPrefix(base, prefix); ok {
 			if rest == "" {
 				return true
