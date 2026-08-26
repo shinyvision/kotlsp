@@ -1904,11 +1904,12 @@ func (i *Index) AddLibraryBatch(files []LibraryFile) {
 }
 
 func (i *Index) addLibraryBatch(files []LibraryFile, generation uint64) {
-	// One parsed source file per critical section bounds reader wait time even
+	// A short run of files per critical section bounds reader wait time even
 	// when a cached archive contains tens of thousands of classes. Library
-	// loading is background work; foreground completion/navigation wins every
-	// scheduling opportunity between files.
-	const chunkSize = 1
+	// loading is background work; foreground completion/navigation wins a
+	// scheduling opportunity every few files, while the lock is not taken a
+	// hundred thousand times per scan.
+	const chunkSize = 16
 	for start := 0; start < len(files); start += chunkSize {
 		if i.generation.Load() != generation {
 			return
@@ -2035,10 +2036,11 @@ func retainLibrarySourceOnlySymbols(parsed *analysis.ParsedFile, matched map[str
 	parsed.Symbols = kept
 }
 
-func (i *Index) replaceLocked(file *analysis.ParsedFile) {
-	if old := i.files[file.URI]; old != nil {
-		preserveLibraryAttachments(old, file)
-		i.removeFileContentsLocked(old)
+// prepareInterop drops stale derived symbols and appends the JVM-view ones.
+// It touches only the file, so it may run before the index lock is taken.
+func prepareInterop(file *analysis.ParsedFile) {
+	if file.InteropPrepared {
+		return
 	}
 	base := file.Symbols[:0]
 	for _, symbol := range file.Symbols {
@@ -2054,6 +2056,41 @@ func (i *Index) replaceLocked(file *analysis.ParsedFile) {
 		copy(combined[len(file.Symbols):], interop)
 		file.Symbols = combined
 	}
+	file.InteropPrepared = true
+}
+
+// reserveLibraryCapacityLocked grows the global maps ahead of a library scan
+// so a million symbols do not arrive into maps that rehash at every doubling
+// while the lock is held.
+func (i *Index) reserveLibraryCapacityLocked(files int64) {
+	expected := int(files) * 8
+	if expected < 1<<16 || len(i.symbols) >= expected/2 {
+		return
+	}
+	grow := func(m map[string][]string) map[string][]string {
+		out := make(map[string][]string, expected)
+		for k, v := range m {
+			out[k] = v
+		}
+		return out
+	}
+	symbols := make(map[string]*analysis.Symbol, expected)
+	for k, v := range i.symbols {
+		symbols[k] = v
+	}
+	i.symbols = symbols
+	i.byName = grow(i.byName)
+	i.byFQN = grow(i.byFQN)
+	i.byContainerName = grow(i.byContainerName)
+	i.byContainerMember = grow(i.byContainerMember)
+}
+
+func (i *Index) replaceLocked(file *analysis.ParsedFile) {
+	if old := i.files[file.URI]; old != nil {
+		preserveLibraryAttachments(old, file)
+		i.removeFileContentsLocked(old)
+	}
+	prepareInterop(file)
 	i.files[file.URI] = file
 	libraryFile := false
 	if _, exists := i.librarySources[file.URI]; exists {
@@ -6249,16 +6286,27 @@ func (i *Index) scan(ctx context.Context, roots []string, generation uint64) {
 	case <-ctx.Done():
 		return
 	}
-	i.scanLibraries(ctx, roots, generation)
+	// Ready means every declaration is indexed. That is true once the
+	// workspace and every binary archive are in; the source archives that
+	// follow only attach navigation text to declarations already present, and
+	// on a large classpath they take as long again. Predictions and
+	// navigation start at the earlier point; attachment finishes behind them.
+	markReady := func() {
+		if i.generation.Load() != generation {
+			return
+		}
+		// Decided here, in the background, so the foreground never walks the
+		// disk or takes a lock it already holds to find out.
+		i.computeGeneratedSourceState()
+		done := i.Progress()
+		done.Ready = true
+		i.progress.Store(&done)
+	}
+	i.scanLibraries(ctx, roots, generation, markReady)
 	if i.generation.Load() != generation {
 		return
 	}
-	// Decided here, in the background, so the foreground never walks the
-	// disk or takes a lock it already holds to find out.
-	i.computeGeneratedSourceState()
-	done := i.Progress()
-	done.Ready = true
-	i.progress.Store(&done)
+	markReady()
 	go func() {
 		if disableCompilerPasses {
 			return

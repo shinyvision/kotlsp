@@ -7,6 +7,8 @@ import (
 	"os"
 	"runtime/debug"
 	"runtime/pprof"
+	"strconv"
+	"time"
 
 	"github.com/shinyvision/kotlsp/internal/lsp"
 )
@@ -38,12 +40,19 @@ func main() {
 		fmt.Fprintln(os.Stderr, "only --stdio is currently supported")
 		os.Exit(2)
 	}
+	// KOTLSP_CPU_PROFILE=path profiles the first KOTLSP_CPU_PROFILE_SECONDS
+	// (default 15) of the process, which covers a cold start. The server
+	// exits through os.Exit, so a deferred stop would never run.
 	if profilePath := os.Getenv("KOTLSP_CPU_PROFILE"); profilePath != "" {
-		if profile, err := os.Create(profilePath); err == nil {
-			if err := pprof.StartCPUProfile(profile); err == nil {
-				defer pprof.StopCPUProfile()
-			}
-			defer profile.Close()
+		seconds := 15
+		if value, err := strconv.Atoi(os.Getenv("KOTLSP_CPU_PROFILE_SECONDS")); err == nil && value > 0 {
+			seconds = value
+		}
+		if profile, err := os.Create(profilePath); err == nil && pprof.StartCPUProfile(profile) == nil {
+			time.AfterFunc(time.Duration(seconds)*time.Second, func() {
+				pprof.StopCPUProfile()
+				_ = profile.Close()
+			})
 		}
 	}
 	if profilePath := os.Getenv("KOTLSP_HEAP_PROFILE"); profilePath != "" {

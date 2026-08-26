@@ -727,11 +727,23 @@ func (i *Index) lambdaReceiversLocked(c *unresolvedNameContext, open int, scope 
 	if len(candidates) == 0 {
 		return nil, false, "callee " + callee + " is unknown"
 	}
+	// A declaration indexed from both its binary and its sources: the source
+	// spells function types as written, the binary only as FunctionN, so the
+	// binary copy is consulted only when no source copy exists.
+	sourceSignatures := make(map[string]bool)
+	for _, id := range candidates {
+		if candidate := i.symbols[id]; candidate != nil && !isBinarySymbol(*candidate) {
+			sourceSignatures[candidate.FQN+"/"+itoa(len(candidate.Parameters))] = true
+		}
+	}
 	var receivers []string
 	for _, id := range candidates {
 		candidate := i.symbols[id]
 		if candidate == nil {
 			return nil, false, "dangling symbol"
+		}
+		if isBinarySymbol(*candidate) && sourceSignatures[candidate.FQN+"/"+itoa(len(candidate.Parameters))] {
+			continue
 		}
 		if !analysis.IsCallableKind(candidate.Kind) && !analysis.IsTypeKind(candidate.Kind) {
 			// A value invoked with a trailing lambda goes through an `invoke`
@@ -843,6 +855,12 @@ func (i *Index) functionTypeReceiverLocked(callable *analysis.Symbol, parameterT
 	base = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(base, "vararg "), "?"))
 	if containsString(callable.TypeParameters, base) {
 		return "", true
+	}
+	// A Kotlin declaration read from bytecode spells `T.() -> Unit` as
+	// `Function1<in T, Unit>`: the receiver is gone. Whether such a lambda
+	// has one cannot be told from here.
+	if isBinarySymbol(*callable) && callable.Language == analysis.LanguageKotlin && isJvmFunctionType(base) {
+		return "", false
 	}
 	// A type parameter of the owning class (`Function<T, R>.apply(T)`) binds
 	// through the receiver's type arguments; the caller checks those for a
@@ -1414,4 +1432,32 @@ func codeMask(text string, kotlin bool) []bool {
 		mask[at] = true
 	}
 	return mask
+}
+
+// isBinarySymbol reports whether a symbol was indexed from a class file
+// rather than from source.
+func isBinarySymbol(symbol analysis.Symbol) bool {
+	return strings.HasSuffix(string(symbol.URI), ".class")
+}
+
+// isJvmFunctionType recognises the JVM spellings of Kotlin function types.
+func isJvmFunctionType(base string) bool {
+	base = strings.TrimPrefix(strings.TrimPrefix(base, "kotlin.jvm.functions."), "kotlin.")
+	for _, prefix := range []string{"Function", "SuspendFunction", "FunctionN"} {
+		if rest, ok := strings.CutPrefix(base, prefix); ok {
+			if rest == "" {
+				return true
+			}
+			digits := true
+			for index := 0; index < len(rest); index++ {
+				if rest[index] < '0' || rest[index] > '9' {
+					digits = false
+				}
+			}
+			if digits {
+				return true
+			}
+		}
+	}
+	return false
 }

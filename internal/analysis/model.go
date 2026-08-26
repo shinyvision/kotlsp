@@ -315,6 +315,10 @@ type ParsedFile struct {
 	Folds         []protocol.FoldingRange
 	Version       int
 	TextHash      uint64
+	// InteropPrepared records that the JVM-view symbols have already been
+	// merged into Symbols, so the index does not derive them again under its
+	// lock. Library loading does this on a worker before insertion.
+	InteropPrepared bool
 }
 
 func SymbolID(uri protocol.URI, start int, kind SymbolKind, name string) string {

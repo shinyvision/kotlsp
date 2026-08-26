@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -104,7 +105,15 @@ func filterArchives(archives []sourceArchive) []sourceArchive {
 	return kept
 }
 
-func (i *Index) scanLibraries(ctx context.Context, roots []string, generation uint64) {
+// scanTiming prints per-phase library scan timing to stderr, for profiling a
+// cold start: KOTLSP_SCAN_TIMING=1.
+var scanTiming = os.Getenv("KOTLSP_SCAN_TIMING") != ""
+
+// scanDeclarationsCompleteHook lets a test hold the scan at the point where
+// declarations are complete but sources are not yet attached.
+var scanDeclarationsCompleteHook func()
+
+func (i *Index) scanLibraries(ctx context.Context, roots []string, generation uint64, declarationsComplete func()) {
 	// Not complete until this pass finishes; a rescan starts incomplete again.
 	i.librariesScanned.Store(false)
 	if skipLibraryScan {
@@ -224,15 +233,44 @@ func (i *Index) scanLibraries(ctx context.Context, roots []string, generation ui
 	p := i.Progress()
 	p.LibrariesTotal = total
 	i.progress.Store(&p)
-	workers := runtime.GOMAXPROCS(0) / 2
-	if workers < 1 {
-		workers = 1
+	i.mu.Lock()
+	i.reserveLibraryCapacityLocked(total)
+	i.mu.Unlock()
+	// Parsing an archive from its jar holds whole entries and parse trees in
+	// memory, so at most two run at once. Loading one from the snapshot
+	// cache is a stream of small decodes and can use most of the machine;
+	// on a 16-core laptop the scan was two-core-bound while the other
+	// fourteen idled.
+	parseWorkers := runtime.GOMAXPROCS(0) / 2
+	if parseWorkers < 1 {
+		parseWorkers = 1
 	}
-	if workers > 2 {
-		workers = 2
+	if parseWorkers > 2 {
+		parseWorkers = 2
 	}
+	cachedWorkers := runtime.GOMAXPROCS(0) - 2
+	if cachedWorkers < parseWorkers {
+		cachedWorkers = parseWorkers
+	}
+	if cachedWorkers > 8 {
+		cachedWorkers = 8
+	}
+	// The scan allocates in bursts that the collector would otherwise chase
+	// continuously; give it room, within the process memory limit.
+	previousGC := debug.SetGCPercent(400)
+	defer debug.SetGCPercent(previousGC)
 	var parsed atomic.Int64
+	scanStart := time.Now()
 	indexPhase := func(phase []sourceArchive, countProgress bool) bool {
+		workers := parseWorkers
+		if archivesAreCached(phase) {
+			workers = cachedWorkers
+		}
+		if scanTiming {
+			defer func(started time.Time, count int, workers int) {
+				fmt.Fprintf(os.Stderr, "kotlsp scan: %d archives on %d workers in %s (t+%s)\n", count, workers, time.Since(started).Round(time.Millisecond), time.Since(scanStart).Round(time.Millisecond))
+			}(time.Now(), len(phase), workers)
+		}
 		jobs := make(chan sourceArchive, 8)
 		var wg sync.WaitGroup
 		for worker := 0; worker < workers; worker++ {
@@ -293,18 +331,40 @@ func (i *Index) scanLibraries(ctx context.Context, roots []string, generation ui
 	if !indexPhase(binaryArchives, true) {
 		return
 	}
-	if !indexPhase(sourceArchives, true) {
-		return
-	}
-	// Less common JDK modules and the monolithic JDK source ZIP are deliberately
-	// deferred so they cannot postpone vendor source attachment.
 	if len(jdkBinaries) > 1 && !indexPhase(jdkBinaries[1:], true) {
 		return
 	}
-	indexPhase(deferredSources, true)
-	// Only a pass that ran to the end makes the index complete: every early
-	// return above is a superseded generation.
+	// The Kotlin builtins -- Any, Unit, Int, Nothing, the Function types --
+	// have no class files: they exist only in the standard library's sources.
+	// Those sources are the one archive that adds declarations rather than
+	// attaching them, so they come before the index may call itself complete.
+	var builtinSources, otherSources []sourceArchive
+	for _, archive := range sourceArchives {
+		if strings.Contains(strings.ToLower(filepath.Base(archive.path)), "kotlin-stdlib") {
+			builtinSources = append(builtinSources, archive)
+		} else {
+			otherSources = append(otherSources, archive)
+		}
+	}
+	if len(builtinSources) > 0 && !indexPhase(builtinSources, true) {
+		return
+	}
+	// Every declaration on the classpath is now indexed. What follows attaches
+	// sources for navigation and hover; nothing it adds is a new name, so the
+	// index is complete for the purpose of deciding what is unresolved.
 	i.librariesScanned.Store(true)
+	if declarationsComplete != nil {
+		declarationsComplete()
+	}
+	if scanDeclarationsCompleteHook != nil {
+		scanDeclarationsCompleteHook()
+	}
+	if !indexPhase(otherSources, true) {
+		return
+	}
+	// The monolithic JDK source ZIP is deferred so it cannot postpone vendor
+	// source attachment.
+	indexPhase(deferredSources, true)
 }
 
 func (i *Index) workspaceLibraryImports() []string {
@@ -434,27 +494,53 @@ func libraryArchiveImportScore(archive sourceArchive, imports []string) int {
 		return 0
 	}
 	defer reader.Close()
+	type target struct{ dot, dollar, pkg string }
+	targets := make([]target, 0, len(imports))
+	for _, imported := range imports {
+		path := strings.ReplaceAll(imported, ".", "/")
+		pkg := path
+		if slash := strings.LastIndexByte(pkg, '/'); slash >= 0 {
+			pkg = pkg[:slash+1]
+		}
+		targets = append(targets, target{dot: path + ".", dollar: path + "$", pkg: pkg})
+	}
 	score := 0
 	for _, file := range reader.File {
 		name := strings.TrimPrefix(filepath.ToSlash(file.Name), "classes/")
-		lower := strings.ToLower(name)
-		for _, imported := range imports {
-			target := strings.ReplaceAll(imported, ".", "/")
-			if strings.HasPrefix(name, target+".") || strings.HasPrefix(name, target+"$") {
+		var lower string
+		for _, t := range targets {
+			if strings.HasPrefix(name, t.dot) || strings.HasPrefix(name, t.dollar) {
 				return 1000
 			}
-			packagePath := target
-			if slash := strings.LastIndexByte(packagePath, '/'); slash >= 0 {
-				packagePath = packagePath[:slash+1]
-			}
-			if strings.HasPrefix(name, packagePath) && (strings.HasSuffix(lower, ".class") || sourceEntry(name)) {
-				if score < 100 {
+			if score < 100 && strings.HasPrefix(name, t.pkg) {
+				if lower == "" {
+					lower = strings.ToLower(name)
+				}
+				if strings.HasSuffix(lower, ".class") || sourceEntry(name) {
 					score = 100
 				}
 			}
 		}
 	}
 	return score
+}
+
+// archivesAreCached reports whether every archive of a phase has a snapshot,
+// in which case the phase does no parsing and may use many workers.
+func archivesAreCached(phase []sourceArchive) bool {
+	for _, archive := range phase {
+		if archive.noCache {
+			return false
+		}
+		path, ok := archiveCachePath(archive)
+		if !ok {
+			return false
+		}
+		if _, err := os.Stat(path); err != nil {
+			return false
+		}
+	}
+	return len(phase) > 0
 }
 
 func defaultKotlinLibraries() []string {
@@ -508,17 +594,39 @@ type cachedSourceFile struct {
 
 func (i *Index) indexSourceArchive(ctx context.Context, archive sourceArchive, generation uint64, progress func(int64)) {
 	mirror := i.newArchiveMirror(archive)
+	// Entries are prepared on this worker and inserted a few at a time: one
+	// lock per file made eight decoders queue behind a lock taken a hundred
+	// thousand times.
+	const batchSize = 16
+	var batch []LibraryFile
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		i.backgroundMu.RLock()
+		i.addLibraryBatch(batch, generation)
+		i.backgroundMu.RUnlock()
+		progress(int64(len(batch)))
+		batch = nil
+	}
 	if !archive.noCache && loadArchiveCache(ctx, archive, func(entry cachedSourceFile) bool {
 		if i.generation.Load() != generation {
 			return false
 		}
 		i.backgroundMu.RLock()
-		defer i.backgroundMu.RUnlock()
 		i.canonicalizeLibraryFile(&entry.Parsed)
-		i.addLibraryBatch([]LibraryFile{{Source: entry.Source, Parsed: entry.Parsed}}, generation)
-		progress(1)
+		i.backgroundMu.RUnlock()
+		for symbol := range entry.Parsed.Symbols {
+			entry.Parsed.Symbols[symbol].Library = true
+		}
+		prepareInterop(&entry.Parsed)
+		batch = append(batch, LibraryFile{Source: entry.Source, Parsed: entry.Parsed})
+		if len(batch) >= batchSize {
+			flush()
+		}
 		return true
 	}) {
+		flush()
 		// The parse came from the snapshot cache, so the loop below never ran
 		// and never produced entry content. Mirror the archive separately when
 		// its files are missing; a complete mirror makes this a no-op.
