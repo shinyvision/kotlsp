@@ -1,0 +1,8 @@
+# Build artifacts. The repo has no commits yet, so without this the first one
+# would carry ~30MB of binaries into history permanently.
+/kotlsp
+*.test
+
+# Profiling and coverage output
+*.prof
+*.out

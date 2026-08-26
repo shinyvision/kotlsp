@@ -1,0 +1,123 @@
+name: release
+
+# Tagging v1.2.3 builds every target and publishes them as that release.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            static: yes
+          - target: linux-arm64
+            os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            cc: aarch64-linux-gnu-gcc
+            # libc6-dev-arm64-cross carries the arm64 sysroot headers and
+            # libc.a. Without it the cross compiler falls back to the host's
+            # x86 /usr/include and fails on bits/libc-header-start.h.
+            packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+            static: yes
+          - target: windows-amd64
+            os: ubuntu-latest
+            goos: windows
+            goarch: amd64
+            cc: x86_64-w64-mingw32-gcc
+            packages: gcc-mingw-w64-x86-64
+            ext: .exe
+            static: yes
+          - target: darwin-arm64
+            os: macos-latest
+            goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # The parser is tree-sitter, so every target is a cgo build and needs a C
+      # toolchain for that architecture. Linux and Windows cross-compile from
+      # the x86 runner; darwin/arm64 builds natively on Apple silicon.
+      - name: Install cross toolchain
+        if: matrix.packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.packages }}
+
+      - name: Build
+        env:
+          CGO_ENABLED: '1'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
+        run: |
+          set -euo pipefail
+          LDFLAGS="-s -w -X main.version=${GITHUB_REF_NAME}"
+          # Static where the platform supports it, so a release binary has no
+          # runtime dependency on the builder's libc or mingw runtime. macOS
+          # does not support static linking of the system libraries.
+          if [ -n "${{ matrix.static }}" ]; then
+            LDFLAGS="$LDFLAGS -extldflags -static"
+          fi
+          go build -trimpath -ldflags "$LDFLAGS" -o "kotlsp${{ matrix.ext }}" ./cmd/kotlsp
+          file "kotlsp${{ matrix.ext }}" || true
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="kotlsp_${GITHUB_REF_NAME}_${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "kotlsp${{ matrix.ext }}" README.md LICENSE "dist/$name/"
+          cd dist
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip -r "$name.zip" "$name"
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+          rm -rf "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          # Written outside the directory first so the glob cannot pick up the
+          # checksum file it is still producing.
+          sha256sum * > "${RUNNER_TEMP}/checksums.txt"
+          mv "${RUNNER_TEMP}/checksums.txt" "kotlsp_${GITHUB_REF_NAME}_checksums.txt"
+          ls -l
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes dist/*
