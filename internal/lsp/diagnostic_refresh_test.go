@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,8 +61,8 @@ func TestClientIsAskedToRefreshOnceIndexingCompletes(t *testing.T) {
 		}
 		return nil
 	}
-	var ready bool
-	s.progressSource = func() index.Progress { return index.Progress{Ready: ready} }
+	var ready atomic.Bool
+	s.progressSource = func() index.Progress { return index.Progress{Ready: ready.Load()} }
 
 	s.refreshDiagnosticsWhenIndexed()
 	select {
@@ -69,7 +70,7 @@ func TestClientIsAskedToRefreshOnceIndexingCompletes(t *testing.T) {
 		t.Fatal("refresh was requested before the index was ready")
 	case <-time.After(600 * time.Millisecond):
 	}
-	ready = true
+	ready.Store(true)
 	select {
 	case <-refreshed:
 	case <-time.After(10 * time.Second):
@@ -86,5 +87,31 @@ func TestRefreshIsSilentWithoutClientSupport(t *testing.T) {
 	s.refreshDiagnostics()
 	if calls != 0 || len(recorder.snapshot()) != 0 {
 		t.Fatalf("refresh contacted a client that advertised nothing: %d calls, %d notifications", calls, len(recorder.snapshot()))
+	}
+}
+
+// The whole path: the index finishes a background compiler pass and the client
+// is asked to re-request. Without this the recomputed diagnostics sit unread
+// until the editor is restarted.
+func TestCompilerPassAsksTheClientToRefresh(t *testing.T) {
+	s, _ := diagnosticServer(t, map[string]any{
+		"textDocument": map[string]any{"diagnostic": map[string]any{}},
+		"workspace":    map[string]any{"diagnostics": map[string]any{"refreshSupport": true}},
+	})
+	refreshed := make(chan struct{}, 4)
+	s.clientCall = func(_ context.Context, method string, _, _ any) error {
+		if method == "workspace/diagnostic/refresh" {
+			select {
+			case refreshed <- struct{}{}:
+			default:
+			}
+		}
+		return nil
+	}
+	s.index.ScheduleCompilerDiagnostics(context.Background())
+	select {
+	case <-refreshed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the client was never asked to re-request after a compiler pass")
 	}
 }

@@ -60,6 +60,7 @@ type Server struct {
 	progressActive          atomic.Bool
 	progressSequence        atomic.Int64
 	diagnosticRefreshActive atomic.Bool
+	compilerProgressActive  atomic.Bool
 	// clientCall is injected by the benchmark and focused unit tests. Production
 	// traffic always uses conn; keeping the same request/response contract means
 	// server-initiated requests can never be silently treated as successful.
@@ -71,6 +72,9 @@ type Server struct {
 	// can be driven without waiting on a real workspace scan. Production
 	// traffic always reads the index.
 	progressSource func() index.Progress
+	// compilerStatusSource is injected the same way, so validation reporting
+	// can be exercised without a compiler installed.
+	compilerStatusSource func() []index.CompilerPassStatus
 }
 
 type completionApplication struct {
@@ -124,6 +128,10 @@ func NewServer(ctx context.Context, logger *log.Logger) *Server {
 			s.publishDiagnostics(uri, diagnostics)
 		}
 	})
+	// Compiler validation finishes long after the edit that triggered it. A
+	// client that pulls diagnostics has to be told to ask again, or the
+	// recomputed set is never seen.
+	s.index.SetDiagnosticsListener(s.refreshDiagnostics)
 	return s
 }
 
@@ -226,6 +234,8 @@ func (s *Server) Request(ctx context.Context, method string, params json.RawMess
 		return s.willRenameFiles(params)
 	case "workspace/executeCommand":
 		return s.executeCommand(ctx, params)
+	case "kotlsp/status":
+		return s.serverStatus()
 	default:
 		return nil, &jsonrpc.ResponseError{Code: jsonrpc.MethodNotFound, Message: "method not found: " + method}
 	}
@@ -247,6 +257,7 @@ func (s *Server) Notify(ctx context.Context, method string, params json.RawMessa
 			}
 			s.reportIndexingProgress()
 			s.refreshDiagnosticsWhenIndexed()
+			s.watchCompilerProgress()
 		}
 		return
 	}
@@ -382,9 +393,14 @@ func (s *Server) initialize(ctx context.Context, raw json.RawMessage) (any, *jso
 		var options struct {
 			RunMainCodeLens bool   `json:"runMainCodeLens"`
 			DefaultSDK      string `json:"defaultSdk"`
+			// DiagnosticsTrigger is "change" (default) or "save".
+			DiagnosticsTrigger string `json:"diagnosticsTrigger"`
 		}
 		if json.Unmarshal(p.InitializationOptions, &options) == nil {
 			s.runMainCodeLens.Store(options.RunMainCodeLens)
+			if strings.EqualFold(options.DiagnosticsTrigger, "save") {
+				s.index.SetCompilerTrigger(index.CompilerOnSave)
+			}
 			if options.DefaultSDK != "" {
 				home, err := filepath.Abs(options.DefaultSDK)
 				if err != nil {

@@ -114,3 +114,23 @@ func TestEmptyCollectionRecoverySkipsComparisons(t *testing.T) {
 		t.Fatalf("comparison operand was blanked: %q", got)
 	}
 }
+
+// A declaration whose type runs straight into the closing brace of a one-line
+// class body is ordinary Kotlin the grammar rejects. Losing the parse loses
+// every declaration in the class and silences every rule that reads it.
+func TestOneLineClassBodyParses(t *testing.T) {
+	for _, source := range []string{
+		"package demo\nclass H { val h: Int }\n",
+		"package demo\nclass H { var h: Int }\n",
+		"package demo\nclass Late { lateinit var late: String }\n",
+		"package demo\nclass Pair { val a: Int; val b: String }\n",
+	} {
+		parsed := parseKotlin(t, source)
+		if len(parsed.Diagnostics) != 0 {
+			t.Fatalf("%q reported %#v", source, parsed.Diagnostics)
+		}
+		if !containsName(symbolNames(parsed), "h") && !containsName(symbolNames(parsed), "late") && !containsName(symbolNames(parsed), "a") {
+			t.Fatalf("%q lost its property, got %v", source, symbolNames(parsed))
+		}
+	}
+}

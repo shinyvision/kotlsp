@@ -824,6 +824,19 @@ func RenderJava(class *Class) string {
 		out.WriteString(" extends ")
 		out.WriteString(superName)
 	}
+	if class.Access&accAnnotation != 0 {
+		// An annotation interface implicitly extends Annotation, and the
+		// source form may not spell it; rendering it made the whole
+		// declaration unparseable, which is how java.lang.Override went
+		// missing from the index.
+		kept := interfaces[:0]
+		for _, implemented := range interfaces {
+			if implemented != "java.lang.annotation.Annotation" {
+				kept = append(kept, implemented)
+			}
+		}
+		interfaces = kept
+	}
 	if len(interfaces) > 0 {
 		if class.Access&accInterface != 0 {
 			out.WriteString(" extends ")

@@ -37,7 +37,7 @@ func TestAnnotationAttributeLabelResolves(t *testing.T) {
 		idx.Open(context.Background(), protocol.TextDocumentItem{URI: usageURI, LanguageID: "kotlin", Version: 1, Text: fixture.usage})
 
 		for _, diagnostic := range idx.Diagnostics(usageURI) {
-			if diagnostic.Code == "unresolved-reference" {
+			if diagnostic.Code == "UNRESOLVED_REFERENCE" {
 				t.Fatalf("%s: %s", fixture.label, diagnostic.Message)
 			}
 		}

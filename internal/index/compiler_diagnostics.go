@@ -26,11 +26,17 @@ var kotlincDiagnosticPattern = regexp.MustCompile(`^(.+\.kts?):(\d+):(\d+):\s+(w
 // errors and lint warnings without allowing compiler startup or I/O to consume
 // any part of the 100 ms request budget.
 func (i *Index) scanJavaCompilerDiagnostics(parent context.Context, generation uint64) {
+	started := i.compilerStatus.begin("java")
+	javacHosted := false
+	defer func() { i.compilerStatus.finish("java", started, javacHosted) }()
 	if i.generation.Load() != generation {
 		return
 	}
 	files := i.WorkspaceFiles()
 	units := i.compilerUnits(files)
+	if !anyUnitHasLanguage(units, "java") {
+		return
+	}
 	temporary, err := os.MkdirTemp("", "kotlsp-javac-")
 	if err != nil {
 		return
@@ -39,8 +45,15 @@ func (i *Index) scanJavaCompilerDiagnostics(parent context.Context, generation u
 	ctx := parent
 	diagnostics := make(map[protocol.URI][]protocol.Diagnostic)
 	for unitIndex, unit := range units {
-		if i.generation.Load() != generation || ctx.Err() != nil || !unit.hasPrimaryLanguage("java") {
+		if i.generation.Load() != generation || ctx.Err() != nil {
 			break
+		}
+		// A unit with none of this language cannot produce a finding for it.
+		// Skipping the unit is not the same as abandoning the pass: units are
+		// not ordered by language, so stopping here silently dropped every
+		// later unit's diagnostics.
+		if !unit.hasPrimaryLanguage("java") {
+			continue
 		}
 		javac := javacExecutableInHome(unit.JavaHome)
 		if javac == "" && unit.JavaHome == "" {
@@ -82,7 +95,10 @@ func (i *Index) scanJavaCompilerDiagnostics(parent context.Context, generation u
 				if compiler.stdlib != "" {
 					kotlinClasspath = append(kotlinClasspath, compiler.stdlib)
 				}
-				_, _ = runKotlinCompiler(ctx, compiler, mixedPaths, kotlinClasses, kotlinClasspath)
+				// Through the warm host as well: this inner compile exists only
+				// to give javac Kotlin symbols, and paying a cold compiler
+				// start for it made the Java pass the slowest of the two.
+				_, _ = i.runKotlinCompilerHostedTracked(ctx, compiler, mixedPaths, kotlinClasses, kotlinClasspath)
 				classpath = append(classpath, kotlinClasses)
 				if compiler.stdlib != "" {
 					classpath = append(classpath, compiler.stdlib)
@@ -92,10 +108,25 @@ func (i *Index) scanJavaCompilerDiagnostics(parent context.Context, generation u
 		if len(classpath) > 0 {
 			commandArgs = append(commandArgs, "-classpath", strings.Join(classpath, string(os.PathListSeparator)))
 		}
-		commandArgs = append(commandArgs, "@"+argumentFile)
-		command := exec.CommandContext(ctx, javac, commandArgs...)
-		configureCompilerProcess(command)
-		output, _ := command.CombinedOutput()
+		// The warm host can run javac in-process, but only when it is the same
+		// JDK: a module with its own toolchain must still get that toolchain.
+		var output []byte
+		hostedJavac := false
+		if compiler, available := i.kotlinCompiler(); available && compiler.embedded && sameJavaHome(unit.JavaHome, i.DefaultJavaHome()) {
+			// The tool API takes source paths directly, so no argument file and
+			// no command-line length limit.
+			hostedArgs := append(append([]string(nil), commandArgs...), paths...)
+			if answer, ok := i.compilerHosts.runJavac(ctx, compiler, i.DefaultJavaHome(), hostedArgs); ok {
+				output, hostedJavac = answer, true
+			}
+		}
+		if !hostedJavac {
+			commandArgs = append(commandArgs, "@"+argumentFile)
+			command := exec.CommandContext(ctx, javac, commandArgs...)
+			configureCompilerProcess(command)
+			output, _ = command.CombinedOutput()
+		}
+		javacHosted = javacHosted || hostedJavac
 		values := remapCompilerDiagnostics(parseJavacDiagnostics(string(output)), staged)
 		i.expandCompilerDiagnosticRanges(values)
 		mergePrimaryCompilerDiagnostics(diagnostics, values, unit.Primary, "java")
@@ -132,6 +163,10 @@ type kotlinCompiler struct {
 	prefix     []string
 	stdlib     string
 	embedded   bool
+	// runtimeJars is the compiler's own classpath, kept separately so the
+	// persistent host can be launched with the same one.
+	runtimeJars []string
+	jvmFlags    []string
 }
 
 // scanKotlinCompilerDiagnostics uses the installed kotlinc command when
@@ -139,12 +174,18 @@ type kotlinCompiler struct {
 // Gradle cache. It is optional and entirely background; the in-memory
 // diagnostic providers remain available when neither compiler is installed.
 func (i *Index) scanKotlinCompilerDiagnostics(parent context.Context, generation uint64) {
+	started := i.compilerStatus.begin("kotlin")
+	hosted := false
+	defer func() { i.compilerStatus.finish("kotlin", started, hosted) }()
 	compiler, ok := i.kotlinCompiler()
 	if !ok || i.generation.Load() != generation {
 		return
 	}
 	files := i.WorkspaceFiles()
 	units := i.compilerUnits(files)
+	if !anyUnitHasLanguage(units, "kotlin") {
+		return
+	}
 	temporary, err := os.MkdirTemp("", "kotlsp-kotlinc-")
 	if err != nil {
 		return
@@ -153,8 +194,15 @@ func (i *Index) scanKotlinCompilerDiagnostics(parent context.Context, generation
 	ctx := parent
 	diagnostics := make(map[protocol.URI][]protocol.Diagnostic)
 	for unitIndex, unit := range units {
-		if i.generation.Load() != generation || ctx.Err() != nil || !unit.hasPrimaryLanguage("kotlin") {
+		if i.generation.Load() != generation || ctx.Err() != nil {
 			break
+		}
+		// A unit with none of this language cannot produce a finding for it.
+		// Skipping the unit is not the same as abandoning the pass: units are
+		// not ordered by language, so stopping here silently dropped every
+		// later unit's diagnostics.
+		if !unit.hasPrimaryLanguage("kotlin") {
+			continue
 		}
 		unitDirectory := filepath.Join(temporary, "unit-"+strconv.Itoa(unitIndex))
 		if os.MkdirAll(unitDirectory, 0o700) != nil {
@@ -170,7 +218,8 @@ func (i *Index) scanKotlinCompilerDiagnostics(parent context.Context, generation
 		if compiler.stdlib != "" {
 			classpath = append(classpath, compiler.stdlib)
 		}
-		output, _ := runKotlinCompiler(ctx, compiler, paths, filepath.Join(unitDirectory, "classes"), classpath)
+		output, usedHost := i.runKotlinCompilerHostedTracked(ctx, compiler, paths, filepath.Join(unitDirectory, "classes"), classpath)
+		hosted = hosted || usedHost
 		values := remapCompilerDiagnostics(parseKotlincDiagnostics(string(output)), staged)
 		i.expandCompilerDiagnosticRanges(values)
 		mergePrimaryCompilerDiagnostics(diagnostics, values, unit.Primary, "kotlin")
@@ -295,6 +344,30 @@ func (i *Index) compilerUnits(files []*analysis.ParsedFile) []compilerUnit {
 	return units
 }
 
+// sameJavaHome reports whether a unit's toolchain is the one the host runs on.
+// An empty unit home means "whatever the server is configured with", which is
+// exactly the host's JDK.
+// anyUnitHasLanguage reports whether a pass for this language could produce
+// anything at all, so a project without it pays nothing.
+func anyUnitHasLanguage(units []compilerUnit, language string) bool {
+	for _, unit := range units {
+		if unit.hasPrimaryLanguage(language) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameJavaHome(unitHome, defaultHome string) bool {
+	if unitHome == "" {
+		return true
+	}
+	if defaultHome == "" {
+		return false
+	}
+	return filepath.Clean(unitHome) == filepath.Clean(defaultHome)
+}
+
 func javacExecutableInHome(home string) string {
 	if home == "" {
 		return ""
@@ -366,6 +439,75 @@ func hasKotlinSource(paths []string) bool {
 		}
 	}
 	return false
+}
+
+// kotlinCompilerArguments builds the compiler's own arguments, shared by the
+// one-shot command line and the persistent host.
+func kotlinCompilerArguments(compiler kotlinCompiler, destination, argumentFile string, classpath []string) []string {
+	arguments := make([]string, 0, 8)
+	if compiler.embedded {
+		arguments = append(arguments, "-no-stdlib", "-no-reflect")
+	}
+	// Joint compilation is required for cyclic Java/Kotlin source dependencies:
+	// Java sources serve as symbols for K2 and are compiled by javac in the same
+	// invocation, making both language outputs available to the follow-up lint.
+	arguments = append(arguments, "-Xcompile-java", "-Xrender-internal-diagnostic-names", "-d", destination)
+	if len(classpath) > 0 {
+		arguments = append(arguments, "-classpath", strings.Join(classpath, string(os.PathListSeparator)))
+	}
+	return append(arguments, "@"+argumentFile)
+}
+
+func writeCompilerArgumentFile(destination string, paths []string) (string, error) {
+	argumentFile := filepath.Join(filepath.Dir(destination), filepath.Base(destination)+"-sources.args")
+	var arguments strings.Builder
+	for _, path := range paths {
+		arguments.WriteString(quoteJavacArgument(path))
+		arguments.WriteByte('\n')
+	}
+	if err := os.WriteFile(argumentFile, []byte(arguments.String()), 0o600); err != nil {
+		return "", err
+	}
+	return argumentFile, nil
+}
+
+// runKotlinCompilerHosted compiles through the long-lived host, falling back to
+// a one-shot process whenever the host is unavailable. A failure to keep a warm
+// compiler must never cost the user their diagnostics.
+func (i *Index) runKotlinCompilerHosted(ctx context.Context, compiler kotlinCompiler, paths []string, destination string, classpath []string) ([]byte, error) {
+	if err := os.MkdirAll(destination, 0o700); err != nil {
+		return nil, err
+	}
+	argumentFile, err := writeCompilerArgumentFile(destination, paths)
+	if err != nil {
+		return nil, err
+	}
+	arguments := kotlinCompilerArguments(compiler, destination, argumentFile, classpath)
+	output, hostErr := i.compilerHosts.run(ctx, compiler, i.DefaultJavaHome(), arguments)
+	if hostErr == nil {
+		return output, nil
+	}
+	if ctx.Err() != nil {
+		return nil, hostErr
+	}
+	return runKotlinCompiler(ctx, compiler, paths, destination, classpath)
+}
+
+// runKotlinCompilerHostedTracked reports whether the warm host answered, so the
+// status surface can say whether validation is running hot or cold.
+func (i *Index) runKotlinCompilerHostedTracked(ctx context.Context, compiler kotlinCompiler, paths []string, destination string, classpath []string) ([]byte, bool) {
+	if err := os.MkdirAll(destination, 0o700); err == nil {
+		if argumentFile, argErr := writeCompilerArgumentFile(destination, paths); argErr == nil {
+			arguments := kotlinCompilerArguments(compiler, destination, argumentFile, classpath)
+			if output, hostErr := i.compilerHosts.run(ctx, compiler, i.DefaultJavaHome(), arguments); hostErr == nil {
+				return output, true
+			} else if ctx.Err() != nil {
+				return nil, false
+			}
+		}
+	}
+	output, _ := runKotlinCompiler(ctx, compiler, paths, destination, classpath)
+	return output, false
 }
 
 func runKotlinCompiler(ctx context.Context, compiler kotlinCompiler, paths []string, destination string, classpath []string) ([]byte, error) {
@@ -526,9 +668,14 @@ func findKotlinCompiler() (kotlinCompiler, bool) {
 	if stdlib == "" {
 		return kotlinCompiler{}, false
 	}
+	// A one-shot process never repays compiling the compiler to the top JIT
+	// tier, so it stops at C1. A persistent host is the opposite case and keeps
+	// the default tiering, since it compiles many times.
+	oneShotFlags := []string{"-Xmx2g", "-XX:+ExitOnOutOfMemoryError", "-XX:TieredStopAtLevel=1", "-XX:+UseSerialGC"}
+	prefix := append(append([]string(nil), oneShotFlags...), "-cp", strings.Join(runtimeJars, string(os.PathListSeparator)), "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler")
 	return kotlinCompiler{
-		executable: java, prefix: []string{"-cp", strings.Join(runtimeJars, string(os.PathListSeparator)), "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler"},
-		stdlib: stdlib, embedded: true,
+		executable: java, prefix: prefix, stdlib: stdlib, embedded: true,
+		runtimeJars: runtimeJars, jvmFlags: oneShotFlags,
 	}, true
 }
 
@@ -553,10 +700,58 @@ func latestBinaryGlob(pattern string) string {
 	return latest
 }
 
+// CompilerTrigger selects when full validation runs.
+type CompilerTrigger int
+
+const (
+	// CompilerOnChange validates after every pause in typing. Most responsive,
+	// and with a warm host the cost is bounded.
+	CompilerOnChange CompilerTrigger = iota
+	// CompilerOnSave validates only on save. Nothing runs while typing, which
+	// suits a large project where even a warm pass is not instant.
+	CompilerOnSave
+)
+
+// SetCompilerTrigger selects when background validation runs.
+func (i *Index) SetCompilerTrigger(trigger CompilerTrigger) {
+	i.compilerTrigger.Store(int32(trigger))
+}
+
+// CompilerTrigger reports when background validation runs.
+func (i *Index) CompilerTrigger() CompilerTrigger { return i.compilerTriggerValue() }
+
+func (i *Index) compilerTriggerValue() CompilerTrigger {
+	return CompilerTrigger(i.compilerTrigger.Load())
+}
+
+// ScheduleCompilerDiagnosticsForSave always runs, whatever the trigger policy.
+func (i *Index) ScheduleCompilerDiagnosticsForSave(parent context.Context) {
+	i.scheduleCompilerDiagnostics(parent, true)
+}
+
 // ScheduleCompilerDiagnostics debounces full javac/K2 validation after saves.
 // Compilation remains entirely off the foreground notification/request path;
 // only the last requested run is allowed to publish results.
 func (i *Index) ScheduleCompilerDiagnostics(parent context.Context) {
+	i.scheduleCompilerDiagnostics(parent, false)
+}
+
+func (i *Index) scheduleCompilerDiagnostics(parent context.Context, saved bool) {
+	if !saved && i.compilerTriggerValue() == CompilerOnSave {
+		return
+	}
+	i.scheduleCompilerDiagnosticsNow(parent)
+}
+
+// disableCompilerPasses turns background validation off entirely. Only tests
+// set it: a test that asserts nothing about compiler output must not start a
+// JVM, and the ones that do opt back in for their own duration.
+var disableCompilerPasses bool
+
+func (i *Index) scheduleCompilerDiagnosticsNow(parent context.Context) {
+	if disableCompilerPasses {
+		return
+	}
 	i.compilerCancelMu.Lock()
 	if i.compilerCancel != nil {
 		i.compilerCancel()
@@ -577,13 +772,29 @@ func (i *Index) ScheduleCompilerDiagnostics(parent context.Context) {
 		if i.compilerRun.Load() != run || i.generation.Load() != generation {
 			return
 		}
+		// Each language is announced the moment its own pass finishes. javac
+		// answers in about a tenth of a second while K2 takes seconds, so
+		// waiting for both would hold Java results back for no reason.
 		i.compilerMu.Lock()
-		defer i.compilerMu.Unlock()
-		if i.compilerRun.Load() != run || i.generation.Load() != generation {
+		superseded := i.compilerRun.Load() != run || i.generation.Load() != generation
+		if !superseded {
+			i.scanJavaCompilerDiagnostics(ctx, generation)
+		}
+		i.compilerMu.Unlock()
+		if superseded {
 			return
 		}
-		i.scanJavaCompilerDiagnostics(ctx, generation)
-		i.scanKotlinCompilerDiagnostics(ctx, generation)
+		i.notifyDiagnosticsChanged()
+
+		i.compilerMu.Lock()
+		superseded = i.compilerRun.Load() != run || i.generation.Load() != generation
+		if !superseded {
+			i.scanKotlinCompilerDiagnostics(ctx, generation)
+		}
+		i.compilerMu.Unlock()
+		if !superseded {
+			i.notifyDiagnosticsChanged()
+		}
 	}()
 }
 

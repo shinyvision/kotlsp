@@ -103,9 +103,36 @@ type Index struct {
 	compilerCancel        context.CancelFunc
 	cancel                context.CancelFunc
 	onParsed              func(protocol.URI, []protocol.Diagnostic)
+	diagnosticsListenerMu sync.RWMutex
+	compilerHosts         compilerHostPool
+	compilerStatus        compilerStatusTracker
+	compilerTrigger       atomic.Int32
+	generatedSources      generatedSourceState
+	librariesScanned      atomic.Bool
+	onDiagnosticsChanged  func()
 }
 
 func (i *Index) DiagnosticsVersion() uint64 { return i.diagnosticsVersion.Load() }
+
+// SetDiagnosticsListener registers a callback for diagnostics that change
+// outside a document edit. Compiler validation runs in the background long
+// after the edit that triggered it, and a client that pulls diagnostics only
+// re-requests when told to: without this the recomputed set sits in the index,
+// correct and unread, until something else makes the client ask again.
+func (i *Index) SetDiagnosticsListener(listener func()) {
+	i.diagnosticsListenerMu.Lock()
+	i.onDiagnosticsChanged = listener
+	i.diagnosticsListenerMu.Unlock()
+}
+
+func (i *Index) notifyDiagnosticsChanged() {
+	i.diagnosticsListenerMu.RLock()
+	listener := i.onDiagnosticsChanged
+	i.diagnosticsListenerMu.RUnlock()
+	if listener != nil {
+		listener()
+	}
+}
 
 func New(onParsed func(protocol.URI, []protocol.Diagnostic)) *Index {
 	i := &Index{files: make(map[protocol.URI]*analysis.ParsedFile), fileSymbolsByName: make(map[protocol.URI]map[string][]*analysis.Symbol), fileSmartCastsByName: make(map[protocol.URI]map[string][]analysis.SmartCast), fileAnonymousByName: make(map[protocol.URI]map[string][]*analysis.Symbol), interactiveStarted: make(chan struct{}), docs: make(map[protocol.URI]*textdoc.Document), indexedDocs: make(map[protocol.URI]*textdoc.Document), libraryDocs: make(map[protocol.URI]*textdoc.Document), librarySources: make(map[protocol.URI]LibrarySource), libraryAccess: make(map[string]map[string]bool), libraryStrings: make(map[string]string), symbols: make(map[string]*analysis.Symbol), byName: make(map[string][]string), byFQN: make(map[string][]string), bySuper: make(map[string][]string), byContainerName: make(map[string][]string), byContainerMember: make(map[string][]string), byReceiver: make(map[string][]string), byReceiverMember: make(map[string][]string), byOrigin: make(map[string][]string), byPackage: make(map[string][]string), packageChildren: make(map[string][]string), packageCounts: make(map[string]int), workspaceByName: make(map[string][]string), workspaceKnown: make(map[string]bool), workspaceByChar: make(map[byte][]string), workspaceByInitial: make(map[byte][]string), workspaceByPrefix: make(map[string][]string), completionByName: make(map[string][]string), completionKnown: make(map[string]bool), completionByInitial: make(map[byte][]string), completionByPrefix: make(map[string][]string), refsByName: make(map[string][]analysis.Reference), packages: make(map[string][]protocol.URI), importersByPrefix: make(map[string][]protocol.URI), compilerDiagnostics: make(map[protocol.URI][]protocol.Diagnostic), documentRevision: make(map[protocol.URI]uint64), onParsed: onParsed}
@@ -115,6 +142,9 @@ func New(onParsed func(protocol.URI, []protocol.Diagnostic)) *Index {
 
 func (i *Index) Close() {
 	i.cancelCompilerDiagnostics()
+	// The hosted compiler outlives individual passes, so it is shut down with
+	// the index rather than left behind as an orphaned JVM.
+	i.compilerHosts.shutdown()
 	if i.cancel != nil {
 		i.cancel()
 	}
@@ -238,6 +268,7 @@ func (i *Index) Open(ctx context.Context, item protocol.TextDocumentItem) *analy
 	i.nextDocumentRevision++
 	i.documentRevision[item.URI] = i.nextDocumentRevision
 	delete(i.indexedDocs, item.URI)
+	i.dropCompilerDiagnosticsLocked(item.URI)
 	i.replaceLocked(parsed)
 	i.mu.Unlock()
 	if i.onParsed != nil {
@@ -282,6 +313,10 @@ func (i *Index) Change(ctx context.Context, params protocol.DidChangeTextDocumen
 	parsed = recoverDeclarations(parsed, previousParsed, old.Text)
 	i.mu.Lock()
 	i.docs[old.URI] = old
+	// The next compiler pass is seconds away. Keep the findings it produced for
+	// the previous text, moved to follow this edit, so the file stays annotated
+	// instead of going blank for the whole wait.
+	i.retainCompilerDiagnosticsLocked(old.URI, params.ContentChanges)
 	i.replaceLocked(parsed)
 	i.mu.Unlock()
 	if i.onParsed != nil {
@@ -345,6 +380,7 @@ func (i *Index) CloseDocument(ctx context.Context, uri protocol.URI) {
 			return
 		}
 		i.indexedDocs[uri] = doc
+		i.dropCompilerDiagnosticsLocked(parsed.URI)
 		i.replaceLocked(parsed)
 		i.mu.Unlock()
 		if i.onParsed != nil {
@@ -388,6 +424,7 @@ func (i *Index) Reload(ctx context.Context, uri protocol.URI) <-chan struct{} {
 			return
 		}
 		i.indexedDocs[uri] = doc
+		i.dropCompilerDiagnosticsLocked(parsed.URI)
 		i.replaceLocked(parsed)
 		i.mu.Unlock()
 		if i.onParsed != nil {
@@ -447,7 +484,10 @@ func (i *Index) Save(ctx context.Context, uri protocol.URI) {
 	// didOpen/didChange already synchronously publish an indexed snapshot. A
 	// save does not alter that authoritative text, so reparsing it would create
 	// an avoidable race where the save watermark preceded replacement.
-	i.ScheduleCompilerDiagnostics(ctx)
+	//
+	// A save validates whatever the trigger policy is: it is the one moment the
+	// author has explicitly declared the text finished.
+	i.ScheduleCompilerDiagnosticsForSave(ctx)
 }
 
 func (i *Index) Document(uri protocol.URI) (*textdoc.Document, bool) {
@@ -2047,7 +2087,6 @@ func (i *Index) replaceLocked(file *analysis.ParsedFile) {
 		}
 		i.fileSmartCastsByName[file.URI] = fileSmartCasts
 	}
-	delete(i.compilerDiagnostics, file.URI)
 	i.addPackageLocked(file)
 	i.addCompletionPackageLocked(file.Package)
 	for symbolIndex := range file.Symbols {
@@ -4139,11 +4178,16 @@ func (i *Index) resolveTypeSymbolsLocked(file *analysis.ParsedFile, typeName str
 		// this left such files resolving nothing by scope at all.
 		return values
 	}
+	// In a Kotlin file `String` is kotlin.String, never java.lang.String,
+	// however both are on the classpath: Kotlin's own default imports shadow
+	// the Java ones. Java files see only java.lang.
 	defaults := []string{"java.lang." + base}
 	if file.Language == analysis.LanguageKotlin {
+		defaults = defaults[:0]
 		for _, prefix := range []string{"kotlin.", "kotlin.annotation.", "kotlin.collections.", "kotlin.comparisons.", "kotlin.io.", "kotlin.ranges.", "kotlin.sequences.", "kotlin.text.", "kotlin.jvm."} {
 			defaults = append(defaults, prefix+base)
 		}
+		defaults = append(defaults, "java.lang."+base)
 	}
 	for _, fqn := range defaults {
 		if values := filter(i.byFQN[fqn]); len(values) > 0 {
@@ -6170,6 +6214,7 @@ func (i *Index) scan(ctx context.Context, roots []string, generation uint64) {
 				}
 				if _, open := i.docs[u]; !open {
 					i.indexedDocs[u] = doc
+					i.dropCompilerDiagnosticsLocked(parsed.URI)
 					i.replaceLocked(parsed)
 				}
 				i.mu.Unlock()
@@ -6208,14 +6253,23 @@ func (i *Index) scan(ctx context.Context, roots []string, generation uint64) {
 	if i.generation.Load() != generation {
 		return
 	}
+	// Decided here, in the background, so the foreground never walks the
+	// disk or takes a lock it already holds to find out.
+	i.computeGeneratedSourceState()
 	done := i.Progress()
 	done.Ready = true
 	i.progress.Store(&done)
 	go func() {
-		i.compilerMu.Lock()
-		defer i.compilerMu.Unlock()
-		i.scanJavaCompilerDiagnostics(ctx, generation)
-		i.scanKotlinCompilerDiagnostics(ctx, generation)
+		if disableCompilerPasses {
+			return
+		}
+		func() {
+			i.compilerMu.Lock()
+			defer i.compilerMu.Unlock()
+			i.scanJavaCompilerDiagnostics(ctx, generation)
+			i.scanKotlinCompilerDiagnostics(ctx, generation)
+		}()
+		i.notifyDiagnosticsChanged()
 	}()
 }
 

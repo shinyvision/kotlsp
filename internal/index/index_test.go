@@ -1197,7 +1197,7 @@ func TestSemanticDiagnosticsAcrossKotlinAndJava(t *testing.T) {
 	if hasDiagnostic(diagnostics, "unresolved-import", "model.Widget") {
 		t.Fatalf("cross-language import was reported unresolved: %#v", diagnostics)
 	}
-	for _, expected := range []struct{ code, text string }{{"unresolved-import", "model.Missing"}, {"unresolved-reference", "Unknown"}, {"unresolved-reference", "makeMissing"}} {
+	for _, expected := range []struct{ code, text string }{{"unresolved-import", "model.Missing"}, {"UNRESOLVED_REFERENCE", "Unknown"}, {"UNRESOLVED_REFERENCE", "makeMissing"}} {
 		if !hasDiagnostic(diagnostics, expected.code, expected.text) {
 			t.Fatalf("missing diagnostic %s/%s: %#v", expected.code, expected.text, diagnostics)
 		}

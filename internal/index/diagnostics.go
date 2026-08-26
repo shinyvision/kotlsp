@@ -31,10 +31,16 @@ func (i *Index) Diagnostics(uri protocol.URI) []protocol.Diagnostic {
 		return nil
 	}
 	out := append([]protocol.Diagnostic(nil), file.Diagnostics...)
-	out = append(out, i.compilerDiagnostics[uri]...)
+	// Predictions the index can prove without a compiler, so the author sees
+	// them immediately. The compiler may add findings these did not, but must
+	// never contradict one, which the soundness gate asserts. They carry the
+	// compiler's own code and wording, so a confirming finding changes nothing.
+	predictions := append(i.declarationDiagnosticsLocked(file), i.referenceDiagnosticsLocked(file)...)
+	predictions = append(predictions, i.fastDiagnosticsLocked(file)...)
+	predictions, compiler := reconcilePredictions(predictions, i.compilerDiagnostics[uri])
+	out = append(out, compiler...)
 	out = append(out, i.importDiagnosticsLocked(file)...)
-	out = append(out, i.declarationDiagnosticsLocked(file)...)
-	out = append(out, i.referenceDiagnosticsLocked(file)...)
+	out = append(out, predictions...)
 	out = append(out, i.springDataDiagnosticsLocked(file)...)
 	sort.SliceStable(out, func(a, b int) bool {
 		if out[a].Range.Start == out[b].Range.Start {
@@ -80,8 +86,62 @@ func (i *Index) importDiagnosticsLocked(file *analysis.ParsedFile) []protocol.Di
 	return out
 }
 
+// redeclaration builds the finding for one of two conflicting declarations,
+// pointing at the other. kotlinc names the three cases differently; each
+// message is its first line, which is all a line-based renderer shows. javac's
+// wording carries context the index cannot reproduce, so a Java redeclaration
+// stays a plain lint finding.
+// redeclarationLocked builds the compiler's own finding for a duplicate. K2
+// reports both declarations; javac reports only the later one, and names the
+// owner in the message, so a Java first occurrence yields nothing and a Java
+// second occurrence yields nothing when javac's wording cannot be reproduced.
+func (i *Index) redeclarationLocked(file *analysis.ParsedFile, symbol, other analysis.Symbol, second bool) (protocol.Diagnostic, bool) {
+	code, message := "REDECLARATION", "Conflicting declarations:"
+	if file.Language == analysis.LanguageKotlin {
+		if analysis.IsTypeKind(symbol.Kind) && symbol.Kind != analysis.KindTypeParameter {
+			code, message = "CLASSIFIER_REDECLARATION", "Redeclaration:"
+		} else if analysis.IsCallableKind(symbol.Kind) {
+			code, message = "CONFLICTING_OVERLOADS", "Conflicting overloads:"
+		}
+	} else {
+		if !second {
+			return protocol.Diagnostic{}, false
+		}
+		code = "compiler"
+		owner := i.symbols[symbol.ContainerID]
+		switch {
+		case symbol.ContainerID == "" && analysis.IsTypeKind(symbol.Kind) && symbol.FQN != "":
+			message = javaDuplicateClass + symbol.FQN
+		case owner == nil:
+			return protocol.Diagnostic{}, false
+		case symbol.Kind == analysis.KindField && owner.Kind == analysis.KindClass:
+			message = "variable " + symbol.Name + javaAlreadyDefined + "class " + owner.Name
+		case symbol.Kind == analysis.KindMethod && owner.Kind == analysis.KindClass:
+			signature, ok := javaSignature(owner, &symbol)
+			if !ok {
+				return protocol.Diagnostic{}, false
+			}
+			message = "method " + signature + javaAlreadyDefined + "class " + owner.Name
+		case symbol.Kind == analysis.KindVariable && owner.Kind == analysis.KindMethod:
+			signature, ok := javaSignature(i.symbols[owner.ContainerID], owner)
+			if !ok {
+				return protocol.Diagnostic{}, false
+			}
+			message = "variable " + symbol.Name + javaAlreadyDefined + "method " + signature
+		default:
+			return protocol.Diagnostic{}, false
+		}
+	}
+	return protocol.Diagnostic{
+		Range: symbol.SelectionRange, Severity: 1, Code: code, Source: "kotlsp",
+		Message:            message,
+		RelatedInformation: []protocol.DiagnosticRelated{{Location: other.Location(), Message: "Conflicting declaration is here"}},
+	}, true
+}
+
 func (i *Index) declarationDiagnosticsLocked(file *analysis.ParsedFile) []protocol.Diagnostic {
 	seen := make(map[string]analysis.Symbol)
+	reportedFirst := make(map[string]bool)
 	var out []protocol.Diagnostic
 	for _, symbol := range file.Symbols {
 		if symbol.Synthetic {
@@ -90,19 +150,31 @@ func (i *Index) declarationDiagnosticsLocked(file *analysis.ParsedFile) []protoc
 		if symbol.Kind == analysis.KindParameter || symbol.Kind == analysis.KindTypeParameter {
 			continue
 		}
+		// Two companions are a different error (MANY_COMPANION_OBJECTS), and
+		// the parser names every companion 'Companion'.
+		if symbol.Kind == analysis.KindObject && containsString(symbol.Modifiers, "companion") {
+			continue
+		}
 		key := symbol.ContainerID + "|" + symbol.Name + "|" + declarationDiscriminator(symbol)
 		if isLexicalSymbol(symbol) {
 			// Locals conflict only inside the same lexical block. A nested local
 			// is ordinary shadowing even though both declarations share the same
-			// callable ContainerID.
-			key += fmt.Sprintf("|scope:%d:%d", symbol.ScopeStartByte, symbol.ScopeEndByte)
+			// callable ContainerID. A local's scope starts at its own
+			// declaration and ends with its block, so the block is the end.
+			key += fmt.Sprintf("|scope:%d", symbol.ScopeEndByte)
 		}
 		if first, exists := seen[key]; exists {
-			out = append(out, protocol.Diagnostic{
-				Range: symbol.SelectionRange, Severity: 1, Code: "duplicate-declaration", Source: "kotlsp",
-				Message:            "Conflicting declaration: " + symbol.Name,
-				RelatedInformation: []protocol.DiagnosticRelated{{Location: first.Location(), Message: "First declaration is here"}},
-			})
+			// The compiler reports both declarations. Reporting only the
+			// second would leave the first to appear seconds later.
+			if !reportedFirst[key] {
+				reportedFirst[key] = true
+				if diagnostic, ok := i.redeclarationLocked(file, first, symbol, false); ok {
+					out = append(out, diagnostic)
+				}
+			}
+			if diagnostic, ok := i.redeclarationLocked(file, symbol, first, true); ok {
+				out = append(out, diagnostic)
+			}
 			continue
 		}
 		seen[key] = symbol
@@ -127,9 +199,16 @@ func declarationDiscriminator(symbol analysis.Symbol) string {
 func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol.Diagnostic {
 	var out []protocol.Diagnostic
 	deprecationCache := make(map[string]bool)
+	scopeContext := newUnresolvedNameContext(file)
 	for _, ref := range file.References {
 		reportUnresolved := ref.Role == analysis.RoleType || ref.Qualifier == "" && (ref.Role == analysis.RoleCall || ref.Role == analysis.RoleRead || ref.Role == analysis.RoleWrite)
 		if implicitNames[ref.Name] {
+			reportUnresolved = false
+		}
+		// An argument label is never unresolved on its own. It binds through
+		// its owner, and when the owner cannot be resolved the compiler reports
+		// the owner and says nothing about the label.
+		if ref.ArgumentLabel {
 			reportUnresolved = false
 		}
 		if reportUnresolved && file.Language == analysis.LanguageKotlin && ref.Role == analysis.RoleCall && i.generation.Load() > 0 && !i.Progress().Ready && len(i.byName[ref.Name]) == 0 {
@@ -177,16 +256,9 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 		if !reportUnresolved {
 			continue
 		}
-		compilerReported := false
-		for _, diagnostic := range i.compilerDiagnostics[file.URI] {
-			if diagnostic.Severity == 1 && rangesOverlap(diagnostic.Range, ref.Range) {
-				compilerReported = true
-				break
-			}
-		}
-		if compilerReported {
-			continue
-		}
+		// Not suppressed when the compiler has reported here: the prediction
+		// carries the compiler's own wording, and reconciliation keeps whichever
+		// copy makes nothing change on screen.
 		// A reference recovered from source the parser could not read is not
 		// evidence of anything. Where the syntax failed, the surrounding
 		// declaration may not have been recognised at all, which turns its own
@@ -203,7 +275,28 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 		// undefined; a name it knows but could not bind here belongs to the
 		// background K2/javac pass, which resolves it correctly and whose
 		// findings are already merged into this result.
-		if len(i.byName[ref.Name]) > 0 {
+		// A name absent from the index is evidence of nothing until the index
+		// holds the standard library and every dependency. Reporting before
+		// then is how a cold start showed errors on kotlin.annotation.Target.
+		// An index with no workspace scan at all is a deliberate in-memory
+		// one and is complete by construction.
+		if i.generation.Load() > 0 && !i.librariesScanned.Load() {
+			continue
+		}
+		if !predictionsApplyTo(file) {
+			continue
+		}
+		// A name the index knows but could not bind here is the common case
+		// -- a member of some other class, a property of a sibling controller
+		// -- and is exactly what the scope engine exists for: it proves that
+		// no declaration of the name can be visible at this position, or it
+		// abstains. Type references stay with the type rule.
+		if len(i.byName[ref.Name]) > 0 && (ref.Role == analysis.RoleType || !i.fastDiagnosticsEligibleLocked(file) || !i.nameProvablyUnresolvedLocked(scopeContext, ref)) {
+			continue
+		}
+		// A name with no declaration anywhere may still be a package: the
+		// first segments of `java.io.IOException` are references too.
+		if scopeContext.isPackageSegment(i, ref.Name) || scopeContext.isDeclarationName(ref.StartByte) {
 			continue
 		}
 		data := map[string]any{"name": ref.Name}
@@ -222,7 +315,13 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 				data["candidates"] = fqns
 			}
 		}
-		out = append(out, protocol.Diagnostic{Range: ref.Range, Severity: 1, Code: "unresolved-reference", Source: "kotlsp", Message: "Unresolved reference: " + ref.Name, Data: data})
+		// Each compiler's own wording, so its later finding reconciles with
+		// this one instead of appearing beside it.
+		code, message := "UNRESOLVED_REFERENCE", "Unresolved reference '"+ref.Name+"'."
+		if file.Language == analysis.LanguageJava {
+			code, message = "compiler", "cannot find symbol"
+		}
+		out = append(out, protocol.Diagnostic{Range: ref.Range, Severity: 1, Code: code, Source: "kotlsp", Message: message, Data: data})
 	}
 	return out
 }

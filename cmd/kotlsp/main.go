@@ -38,6 +38,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "only --stdio is currently supported")
 		os.Exit(2)
 	}
+	if profilePath := os.Getenv("KOTLSP_CPU_PROFILE"); profilePath != "" {
+		if profile, err := os.Create(profilePath); err == nil {
+			if err := pprof.StartCPUProfile(profile); err == nil {
+				defer pprof.StopCPUProfile()
+			}
+			defer profile.Close()
+		}
+	}
 	if profilePath := os.Getenv("KOTLSP_HEAP_PROFILE"); profilePath != "" {
 		defer func() {
 			if profile, err := os.Create(profilePath); err == nil {

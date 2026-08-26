@@ -168,7 +168,13 @@ func Parse(ctx context.Context, doc *textdoc.Document) *ParsedFile {
 			}
 		}
 	}
-	if language == LanguageKotlin && hasLargeSyntaxError(tree.RootNode(), len(doc.Text)) {
+	// The grammar also rejects a declaration whose type runs straight into a
+	// closing brace on the same line, as in `class C { val v: Int }`, which
+	// is ordinary for a small class. The brace recovery below turns that into
+	// a form it accepts; it used to run only for large errors, but a small one
+	// hides a whole declaration just as well, and the retry is kept only when
+	// it scores better.
+	if language == LanguageKotlin && tree.RootNode().HasError() {
 		if recovered := kotlinBraceLineRecovery(parserSource); !bytes.Equal(recovered, parserSource) {
 			if candidate := p.Parse(recovered, nil); candidate != nil {
 				if syntaxErrorScore(candidate.RootNode()) < syntaxErrorScore(tree.RootNode()) {
@@ -1167,12 +1173,12 @@ func (b *parseBuilder) addDeclarations(n *sitter.Node, spec declarationSpec, par
 				s.Modifiers = append(s.Modifiers, "data")
 			}
 		}
-		if kind == KindProperty {
-			declaration := strings.TrimSpace(nodeText(b.source, n))
-			if wordIndex(declaration, "var") >= 0 {
-				s.Modifiers = append(s.Modifiers, "var")
-			} else if wordIndex(declaration, "val") >= 0 {
-				s.Modifiers = append(s.Modifiers, "val")
+		// A local is a variable rather than a property, but whether it was
+		// bound with val or var matters just as much: assigning to a val is an
+		// error the index can prove without a compiler.
+		if kind == KindProperty || kind == KindVariable {
+			if keyword := kotlinBindingKeyword(n); keyword != "" {
+				s.Modifiers = append(s.Modifiers, keyword)
 			}
 		}
 		if nodeKind == "companion_object" {
@@ -2308,16 +2314,24 @@ func (b *parseBuilder) isCallCallee(n *sitter.Node) bool {
 // parameter, which is deliberately kept out of the global name index, so every
 // reference to it elsewhere in the class then looks unresolved.
 func classParameterDeclaresProperty(node *sitter.Node) bool {
+	return kotlinBindingKeyword(node) != ""
+}
+
+// kotlinBindingKeyword returns the val or var a declaration was written with.
+// The grammar emits the keyword as its own child, which is the only dependable
+// reading: the declaration's text includes its initialiser, where the words
+// appear inside strings and identifiers that mean nothing.
+func kotlinBindingKeyword(node *sitter.Node) string {
 	if node == nil {
-		return false
+		return ""
 	}
 	for index := uint(0); index < node.ChildCount(); index++ {
-		switch child := node.Child(index); child.Kind() {
+		switch kind := node.Child(index).Kind(); kind {
 		case "val", "var":
-			return true
+			return kind
 		}
 	}
-	return false
+	return ""
 }
 
 func (b *parseBuilder) isNamedArgumentLabel(node *sitter.Node, parentKind string) bool {

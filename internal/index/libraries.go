@@ -84,7 +84,32 @@ gradle.projectsEvaluated {
 }
 `
 
+// skipLibraryScan suppresses dependency indexing. Only tests set it: indexing
+// the JDK and every jar in the Gradle cache is tens of thousands of files, and
+// a test whose fixture has no dependencies pays five seconds for nothing.
+var skipLibraryScan bool
+
+// libraryArchiveFilter restricts which archives are indexed. Only tests set
+// it: a compiler-backed test needs the standard library and java.base so that
+// `String` means kotlin.String, and nothing else from the dependency cache.
+var libraryArchiveFilter func(sourceArchive) bool
+
+func filterArchives(archives []sourceArchive) []sourceArchive {
+	kept := archives[:0:0]
+	for _, archive := range archives {
+		if libraryArchiveFilter(archive) {
+			kept = append(kept, archive)
+		}
+	}
+	return kept
+}
+
 func (i *Index) scanLibraries(ctx context.Context, roots []string, generation uint64) {
+	// Not complete until this pass finishes; a rescan starts incomplete again.
+	i.librariesScanned.Store(false)
+	if skipLibraryScan {
+		return
+	}
 	binaryArchives := make([]sourceArchive, 0)
 	sourceArchives := make([]sourceArchive, 0)
 	deferredSources := make([]sourceArchive, 0, 1)
@@ -165,6 +190,12 @@ func (i *Index) scanLibraries(ctx context.Context, roots []string, generation ui
 	prioritizeLibraryArchives(sourceArchives, wantedImports)
 	if len(jdkBinaries) > 1 {
 		prioritizeLibraryArchives(jdkBinaries[1:], wantedImports)
+	}
+	if libraryArchiveFilter != nil {
+		binaryArchives = filterArchives(binaryArchives)
+		sourceArchives = filterArchives(sourceArchives)
+		jdkBinaries = filterArchives(jdkBinaries)
+		deferredSources = filterArchives(deferredSources)
 	}
 	archives := make([]sourceArchive, 0, len(binaryArchives)+len(sourceArchives)+len(jdkBinaries)+len(deferredSources))
 	archives = append(archives, binaryArchives...)
@@ -271,6 +302,9 @@ func (i *Index) scanLibraries(ctx context.Context, roots []string, generation ui
 		return
 	}
 	indexPhase(deferredSources, true)
+	// Only a pass that ran to the end makes the index complete: every early
+	// return above is a superseded generation.
+	i.librariesScanned.Store(true)
 }
 
 func (i *Index) workspaceLibraryImports() []string {
@@ -461,7 +495,7 @@ func defaultKotlinLibraries() []string {
 	return libraries
 }
 
-const libraryCacheVersion = 28
+const libraryCacheVersion = 29
 
 type cachedArchive struct {
 	Version int

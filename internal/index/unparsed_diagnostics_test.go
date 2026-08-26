@@ -30,7 +30,7 @@ func TestUnresolvedReferencesAreNotReportedInsideSyntaxErrors(t *testing.T) {
 		t.Fatalf("the real syntax error was not reported: %#v", found)
 	}
 	for _, diagnostic := range found {
-		if diagnostic.Code != "unresolved-reference" {
+		if diagnostic.Code != "UNRESOLVED_REFERENCE" {
 			continue
 		}
 		for _, other := range found {

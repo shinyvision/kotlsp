@@ -131,10 +131,15 @@ func TestIndexingProgressIsSkippedWithoutClientSupport(t *testing.T) {
 	}
 }
 
+// progressKinds lists the progress kinds seen for one token, or for every
+// token when token is empty.
 func progressKinds(notifications []map[string]any, token string) []string {
 	kinds := make([]string, 0, len(notifications))
 	for _, notification := range notifications {
-		if notification["__method"] != "$/progress" || notification["token"] != token {
+		if notification["__method"] != "$/progress" {
+			continue
+		}
+		if token != "" && notification["token"] != token {
 			continue
 		}
 		value, ok := notification["value"].(map[string]any)
