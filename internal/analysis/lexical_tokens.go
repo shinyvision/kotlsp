@@ -48,7 +48,7 @@ func (b *parseBuilder) addLexicalTokens() {
 			}
 			mods := uint32(0)
 			if at+2 < len(source) && source[at+2] == '*' {
-				mods = 1 << 8
+				mods = SemanticModifierDocumentation
 			}
 			b.addLexicalSpan(at, end, 17, mods)
 			at = end

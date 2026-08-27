@@ -13,6 +13,9 @@ import (
 // the interaction budget or it is not fast at all. This bounds it well below
 // the 100ms the request as a whole is held to.
 func TestFastDiagnosticsStayWithinTheInteractionBudget(t *testing.T) {
+	if raceDetector {
+		t.Skip("wall-clock budget cannot hold under -race instrumentation")
+	}
 	// A ready index: an abstaining one would measure nothing.
 	idx, root := startedFixtureIndex(t)
 	var source strings.Builder

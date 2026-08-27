@@ -66,9 +66,15 @@ func TestSemanticTokensPropagateResolvedSymbolModifiers(t *testing.T) {
 		declarationModifiers        uint32
 		referenceModifiers          uint32
 	}{
-		{"file:///workspace/Tokens.kt", "kotlin", "val top = 1\nfun consume() = top\n", "top", 13, 12},
-		{"file:///workspace/Mutable.kt", "kotlin", "var mutable = 0\nfun read() = mutable\nfun write() { mutable = 1 }\n", "mutable", 137, 136},
-		{"file:///workspace/Tokens.java", "java", "class Tokens { static final int VALUE = 1; int consume() { return VALUE; } }", "VALUE", 13, 12},
+		{"file:///workspace/Tokens.kt", "kotlin", "val top = 1\nfun consume() = top\n", "top",
+			analysis.SemanticModifierDeclaration | analysis.SemanticModifierReadonly | analysis.SemanticModifierStatic,
+			analysis.SemanticModifierReadonly | analysis.SemanticModifierStatic},
+		{"file:///workspace/Mutable.kt", "kotlin", "var mutable = 0\nfun read() = mutable\nfun write() { mutable = 1 }\n", "mutable",
+			analysis.SemanticModifierDeclaration | analysis.SemanticModifierStatic | analysis.SemanticModifierModification,
+			analysis.SemanticModifierStatic | analysis.SemanticModifierModification},
+		{"file:///workspace/Tokens.java", "java", "class Tokens { static final int VALUE = 1; int consume() { return VALUE; } }", "VALUE",
+			analysis.SemanticModifierDeclaration | analysis.SemanticModifierReadonly | analysis.SemanticModifierStatic,
+			analysis.SemanticModifierReadonly | analysis.SemanticModifierStatic},
 	}
 	for _, fixture := range fixtures {
 		uri := protocol.URI(fixture.uri)

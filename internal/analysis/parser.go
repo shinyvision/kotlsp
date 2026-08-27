@@ -3367,21 +3367,21 @@ func (b *parseBuilder) buildSemanticTokens() {
 	symbolTokens := make([]Token, 0, len(b.parsed.Symbols))
 	for _, s := range b.parsed.Symbols {
 		typ := semanticTypeForKind(s.Kind)
-		mods := uint32(1)
+		mods := SemanticModifierDeclaration
 		if contains(s.Modifiers, "static") || contains(s.Modifiers, "companion") {
-			mods |= 1 << 3
+			mods |= SemanticModifierStatic
 		}
 		if contains(s.Modifiers, "abstract") {
-			mods |= 1 << 5
+			mods |= SemanticModifierAbstract
 		}
 		if contains(s.Modifiers, "final") || contains(s.Modifiers, "const") || contains(s.Modifiers, "val") {
-			mods |= 1 << 2
+			mods |= SemanticModifierReadonly
 		}
 		if contains(s.Modifiers, "suspend") {
-			mods |= 1 << 6
+			mods |= SemanticModifierAsync
 		}
 		if s.Deprecated {
-			mods |= 1 << 4
+			mods |= SemanticModifierDeprecated
 		}
 		symbolTokens = append(symbolTokens, Token{Range: s.SelectionRange, StartByte: s.NameStartByte, EndByte: s.NameEndByte, Type: typ, Modifiers: mods})
 	}
