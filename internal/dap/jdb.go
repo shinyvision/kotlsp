@@ -26,6 +26,23 @@ type jdbProcess struct {
 	onOutput  func(string)
 	commandMu sync.Mutex
 	closeOnce sync.Once
+	// commandTimeout bounds a single jdb query. jdb answers suspended-VM
+	// queries in milliseconds; an unanswered command historically meant the
+	// prompt boundary was missed, and the lock above then wedged every later
+	// request with no error anywhere. Failing loudly beats a silent wedge.
+	commandTimeout time.Duration
+	// Thread names observed from stop lines and `threads` output. Prompt
+	// detection trusts this list rather than character heuristics: thread
+	// names like HikariPool-1:housekeeper legitimately contain punctuation,
+	// and heuristic bans either false-positive on renderings like `int[3] `
+	// or false-negative on real threads -- both desync every later command.
+	threadNames sync.Map
+}
+
+func (p *jdbProcess) addThreadName(name string) {
+	if name != "" {
+		p.threadNames.Store(name, true)
+	}
 }
 
 func startJDB(ctx context.Context, executable string, args []string, directory string, environment []string, onOutput func(string)) (*jdbProcess, error) {
@@ -51,7 +68,7 @@ func startJDB(ctx context.Context, executable string, args []string, directory s
 		_ = writer.Close()
 		return nil, err
 	}
-	process := &jdbProcess{ctx: ctx, cmd: cmd, stdin: stdin, incoming: make(chan string), chunks: make(chan string), done: make(chan error, 1), onOutput: onOutput}
+	process := &jdbProcess{ctx: ctx, cmd: cmd, stdin: stdin, incoming: make(chan string), chunks: make(chan string), done: make(chan error, 1), onOutput: onOutput, commandTimeout: 30 * time.Second}
 	go process.relayChunks()
 	go process.readOutput(reader)
 	go func() {
@@ -68,7 +85,7 @@ func startJDB(ctx context.Context, executable string, args []string, directory s
 	// The attaching connector first prints a bare prompt, then reports the VM
 	// start and emits the real thread prompt. Consuming that second prompt here
 	// prevents it from being mistaken for the response to the first DAP command.
-	if len(initial) > 0 && !isThreadJDBPrompt(initial[len(initial)-1]) {
+	if len(initial) > 0 && !process.isThreadJDBPrompt(initial[len(initial)-1]) {
 		if _, err = process.waitForPrompt(); err != nil {
 			process.close()
 			return nil, fmt.Errorf("jdb did not report the attached VM prompt: %w", err)
@@ -92,7 +109,7 @@ func (p *jdbProcess) readOutput(reader *io.PipeReader) {
 		}
 		value.WriteByte(b)
 		text := value.String()
-		if b == '\n' || b == ' ' && isJDBPrompt(text) {
+		if b == '\n' || b == ' ' && p.isJDBPrompt(text) {
 			p.emit(text)
 			value.Reset()
 		}
@@ -133,23 +150,26 @@ func (p *jdbProcess) relayChunks() {
 	}
 }
 
-func isJDBPrompt(value string) bool {
+func (p *jdbProcess) isJDBPrompt(value string) bool {
 	trimmed := strings.TrimRight(value, "\r\n")
 	if strings.HasSuffix(trimmed, "> ") {
 		return true
 	}
-	return isThreadJDBPrompt(value)
+	return p.isThreadJDBPrompt(value)
 }
 
-func isThreadJDBPrompt(value string) bool {
+func (p *jdbProcess) isThreadJDBPrompt(value string) bool {
 	trimmed := strings.TrimRight(value, "\r\n")
 	trimmed = strings.TrimSuffix(trimmed, " ")
 	open := strings.LastIndexByte(trimmed, '[')
 	if open < 0 || !strings.HasSuffix(trimmed, "]") {
 		return false
 	}
-	if strings.TrimSpace(trimmed[:open]) == "" {
-		return false
+	name := strings.TrimSpace(trimmed[:open])
+	if name != "main" {
+		if _, known := p.threadNames.Load(name); !known {
+			return false
+		}
 	}
 	for _, r := range trimmed[open+1 : len(trimmed)-1] {
 		if r < '0' || r > '9' {
@@ -159,16 +179,25 @@ func isThreadJDBPrompt(value string) bool {
 	return open+1 < len(trimmed)-1
 }
 
+func (p *jdbProcess) timeoutChan() <-chan time.Time {
+	if p.commandTimeout <= 0 {
+		return nil
+	}
+	return time.After(p.commandTimeout)
+}
+
 func (p *jdbProcess) waitForPrompt() ([]string, error) {
 	lines := make([]string, 0, 16)
 	for {
 		select {
+		case <-p.timeoutChan():
+			return lines, errors.New("jdb did not answer in time (wedged bridge)")
 		case chunk, ok := <-p.chunks:
 			if !ok {
 				return lines, errors.New("jdb output closed")
 			}
 			lines = append(lines, chunk)
-			if isJDBPrompt(chunk) {
+			if p.isJDBPrompt(chunk) {
 				return lines, nil
 			}
 			if isAsyncJDBNotification(chunk) {
@@ -235,11 +264,13 @@ func (p *jdbProcess) waitForCommandPrompt(command string) ([]string, error) {
 	sawOutput := false
 	for {
 		select {
+		case <-p.timeoutChan():
+			return lines, fmt.Errorf("jdb did not answer %q in time (wedged bridge)", command)
 		case chunk, ok := <-p.chunks:
 			if !ok {
 				return lines, errors.New("jdb output closed")
 			}
-			if isJDBPrompt(chunk) {
+			if p.isJDBPrompt(chunk) {
 				if requireOutput && !sawOutput {
 					// An asynchronous stop emits its prompt just after the stop
 					// notification. If a client immediately sends a query, that
@@ -269,6 +300,18 @@ func (p *jdbProcess) send(command string) error {
 	defer p.commandMu.Unlock()
 	_, err := io.WriteString(p.stdin, command+"\n")
 	return err
+}
+
+// kill tears down the bridge without the "exit" handshake: the debuggee is
+// already gone, jdb can never answer again, and any in-flight execute must be
+// released via p.done immediately rather than riding out the timeout.
+func (p *jdbProcess) kill() {
+	p.closeOnce.Do(func() {
+		_ = p.stdin.Close()
+		if p.cmd != nil && p.cmd.Process != nil {
+			_ = p.cmd.Process.Kill()
+		}
+	})
 }
 
 func (p *jdbProcess) close() {

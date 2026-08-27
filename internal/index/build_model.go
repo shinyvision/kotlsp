@@ -24,17 +24,18 @@ func resolveClasspath(ctx context.Context, root string) []string {
 }
 
 type classpathResolution struct {
-	Classpath             []string
-	ModuleClasspath       map[string][]string
-	Dependencies          map[string][]string
-	SourceSetClasspath    map[string]map[string][]string
-	SourceSetDependencies map[string]map[string][]string
-	SourceSetExported     map[string]map[string][]string
-	SourceSetDependsOn    map[string]map[string][]string
-	SourceSetRoots        map[string]map[string][]string
+	Classpath                 []string
+	ModuleClasspath           map[string][]string
+	Dependencies              map[string][]string
+	SourceSetClasspath        map[string]map[string][]string
+	RuntimeSourceSetClasspath map[string]map[string][]string
+	SourceSetDependencies     map[string]map[string][]string
+	SourceSetExported         map[string]map[string][]string
+	SourceSetDependsOn        map[string]map[string][]string
+	SourceSetRoots            map[string]map[string][]string
 }
 
-const buildModelCacheVersion = 4
+const buildModelCacheVersion = 5
 
 type cachedBuildModel struct {
 	Version     int
@@ -90,13 +91,14 @@ func isModularPath(path string) bool {
 
 func newClasspathResolution() classpathResolution {
 	return classpathResolution{
-		ModuleClasspath:       make(map[string][]string),
-		Dependencies:          make(map[string][]string),
-		SourceSetClasspath:    make(map[string]map[string][]string),
-		SourceSetDependencies: make(map[string]map[string][]string),
-		SourceSetExported:     make(map[string]map[string][]string),
-		SourceSetDependsOn:    make(map[string]map[string][]string),
-		SourceSetRoots:        make(map[string]map[string][]string),
+		ModuleClasspath:           make(map[string][]string),
+		Dependencies:              make(map[string][]string),
+		SourceSetClasspath:        make(map[string]map[string][]string),
+		RuntimeSourceSetClasspath: make(map[string]map[string][]string),
+		SourceSetDependencies:     make(map[string]map[string][]string),
+		SourceSetExported:         make(map[string]map[string][]string),
+		SourceSetDependsOn:        make(map[string]map[string][]string),
+		SourceSetRoots:            make(map[string]map[string][]string),
 	}
 }
 
@@ -116,6 +118,7 @@ func resolveClasspathModel(ctx context.Context, root string) classpathResolution
 		resolution.ModuleClasspath = gradleResolution.ModuleClasspath
 		resolution.Dependencies = gradleResolution.Dependencies
 		resolution.SourceSetClasspath = gradleResolution.SourceSetClasspath
+		resolution.RuntimeSourceSetClasspath = gradleResolution.RuntimeSourceSetClasspath
 		resolution.SourceSetDependencies = gradleResolution.SourceSetDependencies
 		resolution.SourceSetExported = gradleResolution.SourceSetExported
 		resolution.SourceSetDependsOn = gradleResolution.SourceSetDependsOn
@@ -333,6 +336,18 @@ func gradleClasspathModel(parent context.Context, root, gradle string) classpath
 					}
 					set := sourceSetFromConfiguration(parts[1])
 					resolution.SourceSetClasspath[parts[0]][set] = append(resolution.SourceSetClasspath[parts[0]][set], absolute)
+				}
+			}
+		}
+		if value, ok := strings.CutPrefix(line, "KOTLSP_RUNTIME="); ok {
+			parts := strings.SplitN(value, "\t", 3)
+			if len(parts) == 3 {
+				if absolute, err := filepath.Abs(parts[2]); err == nil {
+					if resolution.RuntimeSourceSetClasspath[parts[0]] == nil {
+						resolution.RuntimeSourceSetClasspath[parts[0]] = make(map[string][]string)
+					}
+					set := sourceSetFromConfiguration(parts[1])
+					resolution.RuntimeSourceSetClasspath[parts[0]][set] = append(resolution.RuntimeSourceSetClasspath[parts[0]][set], absolute)
 				}
 			}
 		}

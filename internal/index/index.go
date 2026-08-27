@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
@@ -97,6 +98,23 @@ type Index struct {
 }
 
 func (i *Index) DiagnosticsVersion() uint64 { return i.diagnosticsVersion.Load() }
+
+// WaitForLibraries blocks until the initial library scan has landed (or ctx
+// ends). Until then ClasspathFor answers with module output directories only,
+// which is fatally incomplete for run/debug classpaths. An index without any
+// workspace scan is complete by construction and never blocks.
+func (i *Index) WaitForLibraries(ctx context.Context) bool {
+	for {
+		if i.generation.Load() == 0 || i.librariesScanned.Load() {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
 
 // SetDiagnosticsListener registers a callback for diagnostics that change
 // outside a document edit. Compiler validation runs in the background long

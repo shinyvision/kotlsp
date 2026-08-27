@@ -1486,11 +1486,32 @@ func (s *Server) executeCommand(ctx context.Context, raw json.RawMessage) (any, 
 	case "intellij.java.resolveWorkingDirectory":
 		return s.resolveWorkingDirectoryCommand(p.Arguments)
 	case "intellij.java.resolveClasspath":
+		// Launch/debug clients build their classpath from this command. During
+		// the initial workspace scan the module classpaths are still empty, so
+		// answering immediately would hand the debuggee a classpath of just its
+		// own output directories and it would die on the first missing class.
+		// Block until the scan lands instead; bounded by the request context.
+		s.index.WaitForLibraries(ctx)
 		uri, responseErr := s.commandDocumentURI(p.Arguments)
 		if responseErr != nil {
 			return nil, responseErr
 		}
 		classpath, modulePath, moduleName := s.index.ClasspathFor(uri)
+		// Launch/debug clients need the runtime classpath: runtimeOnly
+		// dependencies (JDBC drivers, devtools) are absent from the compile
+		// classpath that ClasspathFor reports.
+		if runtime := s.index.RuntimeClasspathFor(uri); len(runtime) > 0 {
+			seen := make(map[string]bool, len(classpath))
+			for _, entry := range classpath {
+				seen[entry] = true
+			}
+			for _, entry := range runtime {
+				if !seen[entry] {
+					classpath = append(classpath, entry)
+				}
+			}
+			sort.Strings(classpath)
+		}
 		return map[string]any{"classpath": classpath, "modulePath": modulePath, "moduleName": moduleName}, nil
 	case "set-highwatermark-file":
 		if len(p.Arguments) != 1 {

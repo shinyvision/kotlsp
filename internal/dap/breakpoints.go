@@ -221,6 +221,13 @@ func (s *session) setExceptionBreakpoints(raw json.RawMessage) (any, bool, strin
 	for _, filter := range args.Filters {
 		if filter == "caught" || filter == "uncaught" {
 			_, _ = debugger.execute("catch " + filter + " java.lang.Throwable")
+			if filter == "uncaught" {
+				// spring-boot-devtools restarts the application by throwing
+				// SilentExitException on the main thread. It is control flow,
+				// not a failure, and pausing on it at every launch is pure
+				// noise.
+				_, _ = debugger.execute("ignore uncaught org.springframework.boot.devtools.restart.SilentExitExceptionHandler$SilentExitException")
+			}
 		}
 	}
 	return map[string]any{"breakpoints": []any{}}, true, ""

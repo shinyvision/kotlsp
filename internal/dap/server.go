@@ -11,9 +11,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Server struct {
@@ -81,8 +83,15 @@ func serveConnection(ctx context.Context, connection net.Conn) {
 		if json.Unmarshal(payload, &request) != nil || request.Type != "request" {
 			continue
 		}
+		dispatchStart := time.Now()
 		body, success, responseText := session.dispatch(request.Command, request.Arguments)
-		if session.respond(request, body, success, responseText) != nil {
+		if elapsed := time.Since(dispatchStart); elapsed > 3*time.Second {
+			// A slow dispatch here almost always means the jdb bridge is
+			// stuck; without this line the wedge is invisible in every log.
+			fmt.Fprintf(os.Stderr, "kotlsp dap: slow dispatch: %s took %s\n", request.Command, elapsed)
+		}
+		if err := session.respond(request, body, success, responseText); err != nil {
+			fmt.Fprintf(os.Stderr, "kotlsp dap: connection closing: respond %s: %v\n", request.Command, err)
 			return
 		}
 		if request.Command == "initialize" {

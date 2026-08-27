@@ -29,6 +29,10 @@ type debugFrame struct {
 type variableContext struct {
 	frameID    int
 	expression string
+	// hint is the already-known rendering of the expression's value (e.g.
+	// `instance of int[3] (id=12)`); the inspector uses it to classify the
+	// runtime type without re-evaluating the expression.
+	hint string
 }
 
 type sourceBreakpoint struct {
@@ -65,6 +69,7 @@ type session struct {
 	sourceByName  map[string]string
 	sourceRoots   []string
 	sourceCache   map[string]string
+	sources       *sourceStore
 	classPaths    []string
 	lastException string
 	lastStop      string
@@ -79,6 +84,7 @@ func newSession(parent context.Context, writer *bufio.Writer) *session {
 		frames: make(map[int]debugFrame), nextFrameID: 1,
 		variables: make(map[int]variableContext), nextVariable: 1,
 		breakpoints: make(map[string][]sourceBreakpoint), sourceByName: make(map[string]string), sourceCache: make(map[string]string),
+		sources: newSourceStore(),
 	}
 }
 
@@ -184,7 +190,7 @@ func (s *session) dispatch(command string, raw json.RawMessage) (any, bool, stri
 	case "modules":
 		return map[string]any{"modules": []any{}, "totalModules": 0}, true, ""
 	case "source":
-		return nil, false, "sourceReference is not available; source paths are returned directly"
+		return s.sourceContent(raw)
 	case "completions":
 		return s.completions(raw)
 	case "exceptionInfo":
@@ -321,6 +327,7 @@ func (s *session) launch(raw json.RawMessage) (any, bool, string) {
 	s.sourceRoots = debugSourceRoots(args.CWD, args.SourcePaths)
 	s.sourceCache = make(map[string]string)
 	s.stateMu.Unlock()
+	s.sources.reset()
 	javaExec := args.JavaExec
 	if javaExec == "" {
 		javaExec = "java"
@@ -477,6 +484,18 @@ func (s *session) disconnect(raw json.RawMessage, force bool) {
 func (s *session) emitTerminated() {
 	if s.terminated.CompareAndSwap(false, true) {
 		_ = s.event("terminated", map[string]any{})
+		// A dead VM leaves jdb unable to answer; an open bridge turns every
+		// later request into a 30s timeout. Kill it asynchronously (this runs
+		// on the jdb reader goroutine, which must never wait on commandMu).
+		go func() {
+			s.debugMu.Lock()
+			debugger := s.debug
+			s.debug = nil
+			s.debugMu.Unlock()
+			if debugger != nil {
+				debugger.kill()
+			}
+		}()
 	}
 }
 
@@ -485,9 +504,21 @@ var stoppedLinePattern = regexp.MustCompile(`\bline=(\d+)\b`)
 var stoppedClassPattern = regexp.MustCompile(`,\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+)\.[A-Za-z_$<][\w$<>]*\(\),\s*line=`)
 var stoppedFramePattern = regexp.MustCompile(`,\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+\.[A-Za-z_$<][\w$<>]*)\(\),\s*line=(\d+)`)
 
+// isDevtoolsRestartStop reports whether an exception stop is
+// spring-boot-devtools' deliberate SilentExitException, thrown to kill the
+// main thread before the restart classloader relaunches the application. The
+// exception is a nested class of SilentExitExceptionHandler.
+func isDevtoolsRestartStop(description string) bool {
+	return strings.Contains(description, "org.springframework.boot.devtools.restart.SilentExitExceptionHandler$SilentExitException") ||
+		strings.Contains(description, "org.springframework.boot.devtools.restart.SilentExitException ")
+}
+
 func (s *session) handleJDBOutput(output string) {
 	trimmed := strings.TrimSpace(output)
-	if trimmed == "" || isJDBPrompt(output) {
+	if trimmed == "" {
+		return
+	}
+	if debugger := s.currentDebugger(); debugger != nil && debugger.isJDBPrompt(output) {
 		return
 	}
 	lower := strings.ToLower(trimmed)
@@ -511,6 +542,21 @@ func (s *session) handleJDBOutput(output string) {
 	case strings.Contains(trimmed, "Interrupted:"):
 		reason = "pause"
 	}
+	if reason == "exception" && isDevtoolsRestartStop(trimmed) {
+		// spring-boot-devtools restarts the application by throwing
+		// SilentExitException on the main thread. It is control flow, not a
+		// failure; pausing on it at every launch is pure noise, so resume
+		// without telling the client.
+		go func() {
+			// Mirror handleBreakpointStop: let the reader publish JDB's
+			// prompt before issuing the resume.
+			time.Sleep(5 * time.Millisecond)
+			if debugger := s.currentDebugger(); debugger != nil {
+				_ = debugger.send("cont")
+			}
+		}()
+		return
+	}
 	if reason != "" {
 		s.stateMu.Lock()
 		s.lastStop = trimmed
@@ -518,6 +564,11 @@ func (s *session) handleJDBOutput(output string) {
 		token := "main"
 		if match := stoppedThreadPattern.FindStringSubmatch(trimmed); len(match) == 2 {
 			token = strings.TrimSpace(match[1])
+			// Prompt recognition depends on knowing thread names; the stop line
+			// is the first place a name is observed.
+			if debugger := s.currentDebugger(); debugger != nil {
+				debugger.addThreadName(token)
+			}
 		}
 		threadID := s.threadID(token)
 		if reason == "breakpoint" {
@@ -527,7 +578,9 @@ func (s *session) handleJDBOutput(output string) {
 		_ = s.event("stopped", map[string]any{"reason": reason, "threadId": threadID, "allThreadsStopped": true, "description": trimmed})
 		return
 	}
-	_ = s.event("output", map[string]any{"category": "console", "output": output})
+	// Anything else is jdb chatter (command echoes, resolution notices). The
+	// debuggee's own output arrives via streamDebuggee; forwarding jdb's text
+	// here only pollutes the client's console.
 }
 
 func (s *session) handleBreakpointStop(description, token string, threadID int) {
@@ -646,7 +699,15 @@ func (s *session) threadIdentity(token, name string) int {
 	return id
 }
 
-var threadPattern = regexp.MustCompile(`\)\s*(0x[0-9a-fA-F]+|\S+)\s+([^\s]+)\s+(?:running|sleeping|waiting|cond\. waiting|zombie)`)
+var threadPattern = regexp.MustCompile(`\)\s*(0x[0-9a-fA-F]+|\S+)\s+([^\s]+)\s+(running|sleeping|waiting|cond\. waiting|zombie)`)
+
+// unusableThread reports threads jdb cannot answer `where` for.
+// DestroyJavaVM is the husk of a returned main thread: it sits in native VM
+// teardown and a JDWP stack request for it never returns, hanging jdb (and,
+// before the execute timeout existed, wedging the whole session).
+func unusableThread(name, state string) bool {
+	return name == "DestroyJavaVM" || state == "zombie"
+}
 
 func (s *session) threads() (any, bool, string) {
 	debugger := s.currentDebugger()
@@ -661,10 +722,14 @@ func (s *session) threads() (any, bool, string) {
 	seen := map[string]bool{}
 	for _, line := range lines {
 		match := threadPattern.FindStringSubmatch(strings.TrimSpace(line))
-		if len(match) != 3 || seen[match[1]] {
+		if len(match) != 4 || seen[match[1]] {
 			continue
 		}
 		seen[match[1]] = true
+		if unusableThread(match[2], match[3]) {
+			continue
+		}
+		debugger.addThreadName(match[2])
 		threads = append(threads, map[string]any{"id": s.threadIdentity(match[1], match[2]), "name": match[2]})
 	}
 	if len(threads) == 0 {
@@ -728,10 +793,7 @@ func (s *session) stackTrace(raw json.RawMessage) (any, bool, string) {
 			break
 		}
 		frameID := s.addFrame(debugFrame{threadToken: token, threadID: args.ThreadID, index: index, name: match[2]})
-		source := map[string]any{"name": match[3]}
-		if path := s.pathForSource(match[3], match[2]); path != "" {
-			source["path"] = path
-		}
+		source := s.frameSource(match[3], match[2])
 		frames = append(frames, map[string]any{"id": frameID, "name": match[2], "source": source, "line": lineNumber, "column": 1})
 	}
 	if len(frames) == 0 {
@@ -752,10 +814,7 @@ func (s *session) stackTrace(raw json.RawMessage) (any, bool, string) {
 				sourceName = sourceName[dot+1:]
 			}
 			sourceName += ".java"
-			source := map[string]any{"name": sourceName}
-			if path := s.pathForSource(sourceName, name); path != "" {
-				source["path"] = path
-			}
+			source := s.frameSource(sourceName, name)
 			frameID := s.addFrame(debugFrame{threadToken: token, threadID: args.ThreadID, index: 1, name: name})
 			frames = append(frames, map[string]any{"id": frameID, "name": name, "source": source, "line": lineNumber, "column": 1})
 		}
@@ -805,7 +864,6 @@ func (s *session) addVariableContext(value variableContext) int {
 }
 
 var localPattern = regexp.MustCompile(`^\s*([A-Za-z_$][\w$]*)\s*=\s*(.*)$`)
-var fieldPattern = regexp.MustCompile(`^\s*([A-Za-z_$][\w$]*)\s*:\s*(.*?)[,}]?$`)
 
 func (s *session) variableValues(raw json.RawMessage) (any, bool, string) {
 	var args struct {
@@ -820,45 +878,31 @@ func (s *session) variableValues(raw json.RawMessage) (any, bool, string) {
 	if !ok {
 		return nil, false, "unknown variables reference"
 	}
-	frame, ok := s.selectFrame(contextValue.frameID)
-	if !ok {
+	if _, ok := s.selectFrame(contextValue.frameID); !ok {
 		return nil, false, "unknown stack frame"
 	}
-	command := "locals"
-	pattern := localPattern
-	if contextValue.expression != "" {
-		command = "dump " + contextValue.expression
-		pattern = fieldPattern
-	}
 	debugger := s.currentDebugger()
-	lines, err := debugger.execute(command)
+	if debugger == nil {
+		return nil, false, "debugger is not attached"
+	}
+	if contextValue.expression != "" {
+		variables := s.inspectVariables(debugger, contextValue.frameID, contextValue.expression, contextValue.hint)
+		return map[string]any{"variables": variables}, true, ""
+	}
+	lines, err := debugger.execute("locals")
 	if err != nil {
 		return nil, false, err.Error()
 	}
+	insp := &inspector{debugger: debugger, session: s, frameID: contextValue.frameID, kinds: make(map[string]inspectKind)}
 	variables := make([]map[string]any, 0)
 	for _, line := range lines {
-		match := pattern.FindStringSubmatch(strings.TrimSpace(line))
+		match := localPattern.FindStringSubmatch(strings.TrimSpace(line))
 		if len(match) != 3 {
 			continue
 		}
-		name, value := match[1], strings.TrimSpace(match[2])
-		expression := name
-		if contextValue.expression != "" {
-			expression = contextValue.expression + "." + name
-		}
-		reference := 0
-		if looksExpandable(value) {
-			reference = s.addVariableContext(variableContext{frameID: contextValue.frameID, expression: expression})
-		}
-		variables = append(variables, map[string]any{"name": name, "value": value, "variablesReference": reference, "evaluateName": expression})
+		variables = append(variables, insp.child(match[1], match[1], strings.TrimSpace(match[2])))
 	}
-	_ = frame
 	return map[string]any{"variables": variables}, true, ""
-}
-
-func looksExpandable(value string) bool {
-	value = strings.TrimSpace(value)
-	return value != "" && value != "null" && !strings.HasPrefix(value, "\"") && value != "true" && value != "false" && !allDigits(value)
 }
 
 func allDigits(value string) bool {
@@ -1011,10 +1055,21 @@ func (s *session) evaluate(raw json.RawMessage) (any, bool, string) {
 	if err != nil {
 		return nil, false, err.Error()
 	}
+	// A jdb error rendered as a fake value leaves clients showing an empty
+	// hover; report it as a failure so the user sees the actual message.
+	if text := jdbErrorText(lines); text != "" {
+		return nil, false, text
+	}
 	value := parsePrintedValue(lines)
+	if value == "" {
+		// jdb answered with nothing (or its answer was consumed elsewhere): an
+		// empty result renders in clients as an empty hover box. Fail loudly
+		// instead so the user sees that evaluation found nothing.
+		return nil, false, "no value for expression: " + args.Expression
+	}
 	reference := 0
-	if args.FrameID != 0 && looksExpandable(value) {
-		reference = s.addVariableContext(variableContext{frameID: args.FrameID, expression: args.Expression})
+	if args.FrameID != 0 && expandableResult(value) {
+		reference = s.addVariableContext(variableContext{frameID: args.FrameID, expression: args.Expression, hint: value})
 	}
 	return map[string]any{"result": value, "variablesReference": reference}, true, ""
 }
@@ -1046,7 +1101,7 @@ func (s *session) setVariable(raw json.RawMessage) (any, bool, string) {
 	}
 	expression := args.Name
 	if variable.expression != "" {
-		expression = variable.expression + "." + args.Name
+		expression = childExpression(variable.expression, args.Name)
 	}
 	return s.assignExpression(expression, args.Value)
 }
@@ -1137,6 +1192,42 @@ func (s *session) pause(raw json.RawMessage) (any, bool, string) {
 		_ = s.event("stopped", map[string]any{"reason": "pause", "threadId": threadID, "allThreadsStopped": !strings.Contains(command, " "), "description": "Paused by client"})
 	}()
 	return map[string]any{}, true, ""
+}
+
+// frameSource builds the DAP source object for a stack frame: a disk path
+// when the file lives under a source root, otherwise a sourceReference into
+// the dependency's sources jar so the client can fetch it via the source
+// request. Frames with neither keep just a display name.
+func (s *session) frameSource(sourceName, frameName string) map[string]any {
+	source := map[string]any{"name": sourceName}
+	if path := s.pathForSource(sourceName, frameName); path != "" {
+		source["path"] = path
+		return source
+	}
+	s.stateMu.Lock()
+	classPaths := append([]string(nil), s.classPaths...)
+	s.stateMu.Unlock()
+	if ref, origin := s.sources.referenceFor(classPaths, frameName, sourceName); ref > 0 {
+		source["sourceReference"] = ref
+		source["origin"] = origin
+	}
+	return source
+}
+
+// sourceContent answers the DAP source request for a reference handed out by
+// frameSource, streaming the entry from the sources jar.
+func (s *session) sourceContent(raw json.RawMessage) (any, bool, string) {
+	var args struct {
+		SourceReference int `json:"sourceReference"`
+	}
+	if json.Unmarshal(raw, &args) != nil || args.SourceReference <= 0 {
+		return nil, false, "invalid source arguments"
+	}
+	content, ok := s.sources.contentFor(args.SourceReference)
+	if !ok {
+		return nil, false, "source content is not available for this reference"
+	}
+	return map[string]any{"content": content}, true, ""
 }
 
 func (s *session) pathForSource(name string, frameNames ...string) string {

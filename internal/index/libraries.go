@@ -37,6 +37,11 @@ gradle.projectsEvaluated {
                 }.each { configuration ->
 					configuration.resolve().each { println("KOTLSP_CLASSPATH=" + project.path + "\t" + configuration.name + "\t" + it.absolutePath) }
 				}
+				project.configurations.findAll {
+					it.canBeResolved && (it.name.endsWith("RuntimeClasspath") || it.name == "runtimeClasspath")
+				}.each { configuration ->
+					configuration.resolve().each { println("KOTLSP_RUNTIME=" + project.path + "\t" + configuration.name + "\t" + it.absolutePath) }
+				}
 				project.configurations.each { configuration ->
 					configuration.allDependencies.each { dependency ->
 						if (dependency instanceof org.gradle.api.artifacts.ProjectDependency) {

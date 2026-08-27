@@ -285,3 +285,196 @@ func containsString(values []string, expected string) bool {
 	}
 	return false
 }
+
+func TestDevtoolsRestartStopDetection(t *testing.T) {
+	restart := `Exception occurred: org.springframework.boot.devtools.restart.SilentExitExceptionHandler$SilentExitException (uncaught)"thread=main", org.springframework.boot.devtools.restart.SilentExitExceptionHandler.exitCurrentThread(), line=94 bci=16`
+	if !isDevtoolsRestartStop(restart) {
+		t.Fatal("devtools restart stop was not detected")
+	}
+	real := `Exception occurred: java.lang.NullPointerException (uncaught)"thread=main", com.acme.Widget.run(), line=3 bci=4`
+	if isDevtoolsRestartStop(real) {
+		t.Fatal("ordinary exception misdetected as devtools restart")
+	}
+}
+
+func findVariable(t *testing.T, variables []map[string]any, name string) map[string]any {
+	t.Helper()
+	for _, variable := range variables {
+		if variable["name"] == name {
+			return variable
+		}
+	}
+	t.Fatalf("variable %s not found in %#v", name, variables)
+	return nil
+}
+
+func fetchVariables(t *testing.T, s *session, reference int) []map[string]any {
+	t.Helper()
+	result, ok, message := s.dispatch("variables", mustRaw(t, map[string]any{"variablesReference": reference}))
+	if !ok {
+		t.Fatalf("variables(%d) failed: %s", reference, message)
+	}
+	return result.(map[string]any)["variables"].([]map[string]any)
+}
+
+func TestVariableInspectionExpandsObjectsCollectionsArraysAndMaps(t *testing.T) {
+	if testing.Short() || runtime.GOOS == "windows" {
+		t.Skip("requires the JDK debugger")
+	}
+	for _, tool := range []string{"java", "javac", "jdb"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skip(tool + " is unavailable")
+		}
+	}
+	classes := t.TempDir()
+	source, err := filepath.Abs(filepath.Join("testdata", "Inspection.java"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	compile := exec.Command("javac", "-g", "-d", classes, source)
+	if output, err := compile.CombinedOutput(); err != nil {
+		t.Fatalf("javac: %v\n%s", err, output)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	s := newSession(ctx, bufio.NewWriter(io.Discard))
+	defer s.close()
+	launch := mustRaw(t, map[string]any{"mainClass": "dapfixture.Inspection", "classPaths": []string{classes}})
+	if _, ok, message := s.dispatch("launch", launch); !ok {
+		t.Fatalf("launch failed: %s", message)
+	}
+	breakpointArgs := mustRaw(t, map[string]any{"source": map[string]any{"name": "Inspection.java", "path": source}, "breakpoints": []any{map[string]any{"line": 22}}})
+	if _, ok, message := s.dispatch("setBreakpoints", breakpointArgs); !ok {
+		t.Fatalf("setBreakpoints failed: %s", message)
+	}
+	if _, ok, message := s.dispatch("configurationDone", json.RawMessage(`{}`)); !ok {
+		t.Fatalf("configurationDone failed: %s", message)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		s.stateMu.Lock()
+		stopped := len(s.threadIDs) > 0
+		s.stateMu.Unlock()
+		if stopped {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mainID := s.threadID("main")
+	if _, ok, message := s.dispatch("stackTrace", mustRaw(t, map[string]any{"threadId": mainID})); !ok {
+		t.Fatalf("stackTrace failed: %s", message)
+	}
+	s.stateMu.Lock()
+	frameID := 0
+	for id := range s.frames {
+		frameID = id
+		break
+	}
+	s.stateMu.Unlock()
+	scopesResult, ok, message := s.dispatch("scopes", mustRaw(t, map[string]any{"frameId": frameID}))
+	if !ok {
+		t.Fatalf("scopes failed: %s", message)
+	}
+	scopes := scopesResult.(map[string]any)["scopes"].([]any)
+	localsReference := scopes[0].(map[string]any)["variablesReference"].(int)
+
+	locals := fetchVariables(t, s, localsReference)
+	body := findVariable(t, locals, "body")
+	if body["type"] != "dapfixture.Inspection$Body" {
+		t.Fatalf("body type = %#v", body["type"])
+	}
+	bodyReference := body["variablesReference"].(int)
+	if bodyReference == 0 {
+		t.Fatalf("body is not expandable: %#v", body)
+	}
+	// Expandable locals show the toString preview instead of the raw hint.
+	if preview, _ := body["value"].(string); !strings.HasPrefix(preview, `"dapfixture.Inspection$Body@`) {
+		t.Fatalf("body preview = %#v", body["value"])
+	}
+	text := findVariable(t, locals, "text")
+	if text["value"] != `"scalpel"` || text["variablesReference"] != 0 {
+		t.Fatalf("text local = %#v", text)
+	}
+
+	fields := fetchVariables(t, s, bodyReference)
+	if tag := findVariable(t, fields, "tag"); tag["value"] != `"body"` {
+		t.Fatalf("tag field = %#v", tag)
+	}
+	if inherited := findVariable(t, fields, "dapfixture.Inspection$Organ.name"); inherited["value"] != `"heart"` {
+		t.Fatalf("inherited name field = %#v", inherited)
+	}
+	if missing := findVariable(t, fields, "missing"); missing["value"] != "null" || missing["variablesReference"] != 0 {
+		t.Fatalf("null field = %#v", missing)
+	}
+
+	parts := findVariable(t, fields, "parts")
+	if parts["type"] != "java.util.ArrayList" || parts["variablesReference"] == 0 {
+		t.Fatalf("parts field = %#v", parts)
+	}
+	elements := fetchVariables(t, s, parts["variablesReference"].(int))
+	if len(elements) != 2 {
+		t.Fatalf("list elements = %#v", elements)
+	}
+	if elements[0]["name"] != "[0]" || elements[0]["value"] != `"arm"` || elements[1]["value"] != `"leg"` {
+		t.Fatalf("list elements = %#v", elements)
+	}
+
+	sizes := findVariable(t, fields, "sizes")
+	if sizes["type"] != "java.util.HashMap" || sizes["variablesReference"] == 0 {
+		t.Fatalf("sizes field = %#v", sizes)
+	}
+	entries := fetchVariables(t, s, sizes["variablesReference"].(int))
+	if len(entries) != 2 {
+		t.Fatalf("map entries = %#v", entries)
+	}
+	var armEntry map[string]any
+	for _, entry := range entries {
+		if entry["value"] == `"arm=2"` {
+			armEntry = entry
+		}
+	}
+	if armEntry == nil {
+		t.Fatalf("map entries = %#v", entries)
+	}
+	entryReference := armEntry["variablesReference"].(int)
+	if entryReference == 0 {
+		t.Fatalf("map entry is not expandable: %#v", armEntry)
+	}
+	entryFields := fetchVariables(t, s, entryReference)
+	if key := findVariable(t, entryFields, "key"); key["value"] != `"arm"` {
+		t.Fatalf("entry key = %#v", key)
+	}
+
+	nums := findVariable(t, locals, "nums")
+	if nums["type"] != "int[3]" || nums["variablesReference"] == 0 {
+		t.Fatalf("nums local = %#v", nums)
+	}
+	arrayElements := fetchVariables(t, s, nums["variablesReference"].(int))
+	if len(arrayElements) != 3 {
+		t.Fatalf("array elements = %#v", arrayElements)
+	}
+	for index, want := range []string{"7", "8", "9"} {
+		if arrayElements[index]["name"] != "["+strconv.Itoa(index)+"]" || arrayElements[index]["value"] != want {
+			t.Fatalf("array element %d = %#v", index, arrayElements[index])
+		}
+	}
+	// An evaluate result is a quoted toString preview; it must still be
+	// expandable in place (hover/watch/REPL).
+	evaluation, ok, message := s.dispatch("evaluate", mustRaw(t, map[string]any{"frameId": frameID, "expression": "body.parts"}))
+	if !ok {
+		t.Fatalf("evaluate failed: %s", message)
+	}
+	evalBody := evaluation.(map[string]any)
+	if evalBody["result"] != `"[arm, leg]"` {
+		t.Fatalf("evaluate result = %#v", evalBody["result"])
+	}
+	evalReference := evalBody["variablesReference"].(int)
+	if evalReference == 0 {
+		t.Fatalf("evaluate result is not expandable: %#v", evalBody)
+	}
+	evalElements := fetchVariables(t, s, evalReference)
+	if len(evalElements) != 2 || evalElements[0]["value"] != `"arm"` || evalElements[1]["value"] != `"leg"` {
+		t.Fatalf("evaluate expansion = %#v", evalElements)
+	}
+	s.disconnect(json.RawMessage(`{"terminateDebuggee":true}`), true)
+}

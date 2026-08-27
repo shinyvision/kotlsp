@@ -15,22 +15,23 @@ import (
 // ModuleInfo is the immutable build-model subset needed by foreground
 // visibility, launch, and classpath requests.
 type ModuleInfo struct {
-	Name                    string
-	Dir                     string
-	Root                    string
-	SourceRoots             []string
-	SourceSets              map[string][]string
-	Classpath               []string
-	ClasspathBySourceSet    map[string][]string
-	ModulePath              []string
-	ModulePathBySourceSet   map[string][]string
-	JavaModuleName          string
-	JavaHome                string
-	Dependencies            []string
-	DependenciesBySourceSet map[string][]string
-	ExportedBySourceSet     map[string][]string
-	DependencyExclusions    map[string][]string
-	SourceSetDependsOn      map[string][]string
+	Name                        string
+	Dir                         string
+	Root                        string
+	SourceRoots                 []string
+	SourceSets                  map[string][]string
+	Classpath                   []string
+	ClasspathBySourceSet        map[string][]string
+	RuntimeClasspathBySourceSet map[string][]string
+	ModulePath                  []string
+	ModulePathBySourceSet       map[string][]string
+	JavaModuleName              string
+	JavaHome                    string
+	Dependencies                []string
+	DependenciesBySourceSet     map[string][]string
+	ExportedBySourceSet         map[string][]string
+	DependencyExclusions        map[string][]string
+	SourceSetDependsOn          map[string][]string
 }
 
 var gradleProjectDependencyPattern = regexp.MustCompile(`project\s*\(\s*(?:path\s*[:=]\s*)?["'](:[^"']+)["']`)
@@ -723,6 +724,12 @@ func (i *Index) mergeModuleBuildResolution(root string, resolution classpathReso
 				i.libraryAccess[key][libraryAccessKey(module.Dir, sourceSet)] = true
 			}
 		}
+		if module.RuntimeClasspathBySourceSet == nil {
+			module.RuntimeClasspathBySourceSet = make(map[string][]string)
+		}
+		for sourceSet, values := range resolution.RuntimeSourceSetClasspath[module.Name] {
+			module.RuntimeClasspathBySourceSet[sourceSet] = uniqueSortedStrings(append(module.RuntimeClasspathBySourceSet[sourceSet], values...))
+		}
 		if dependencies := resolution.Dependencies[module.Name]; len(dependencies) > 0 {
 			module.Dependencies = uniqueSortedStrings(append(module.Dependencies, dependencies...))
 		}
@@ -1116,6 +1123,27 @@ func (i *Index) ClasspathFor(uri protocol.URI) (classpath, modulePath []string, 
 		moduleName = module.JavaModuleName
 	}
 	return classpath, modulePath, moduleName
+}
+
+// RuntimeClasspathFor returns the runtime classpath entries for the module
+// owning uri: the compile classpath misses runtimeOnly dependencies (the JDBC
+// driver being the classic example), which makes it wrong for launching a
+// debuggee. Compile entries remain the authority for analysis; this is only
+// for run/debug.
+func (i *Index) RuntimeClasspathFor(uri protocol.URI) []string {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	module := i.moduleForURILocked(uri)
+	if module == nil {
+		return nil
+	}
+	sourceSet := i.sourceSetForURILocked(uri, module)
+	var out []string
+	out = append(out, module.RuntimeClasspathBySourceSet[sourceSet]...)
+	for _, dependencySet := range sourceSetDependencyClosure(module, sourceSet) {
+		out = append(out, module.RuntimeClasspathBySourceSet[dependencySet]...)
+	}
+	return uniqueSortedStrings(out)
 }
 
 func sourceSetDependencyClosure(module *ModuleInfo, sourceSet string) []string {
