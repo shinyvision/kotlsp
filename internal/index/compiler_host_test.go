@@ -1,15 +1,122 @@
 package index
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/shinyvision/kotlsp/internal/protocol"
 )
+
+type testWriteCloser struct{ io.Writer }
+
+func (testWriteCloser) Close() error { return nil }
+
+func TestCompilerHostValidatesResponseTrailer(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		trailer string
+		wantErr bool
+	}{
+		{"ok", "EXIT OK", false},
+		{"compilation error is a valid compiler result", "EXIT COMPILATION_ERROR", false},
+		{"internal failure", "EXIT INTERNAL_ERROR", true},
+		{"missing marker", "DONE OK", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var request bytes.Buffer
+			host := &compilerHost{
+				stdin:  testWriteCloser{&request},
+				stdout: bufio.NewReader(strings.NewReader("OUTPUT 3\nabc" + test.trailer + "\n")),
+			}
+			output, err := host.compile([]string{"source.kt"})
+			if (err != nil) != test.wantErr {
+				t.Fatalf("compile error = %v, wantErr %v", err, test.wantErr)
+			}
+			if !test.wantErr && string(output) != "abc" {
+				t.Fatalf("output = %q", output)
+			}
+		})
+	}
+}
+
+func TestCompilerHostCancellationDiscardsInFlightStream(t *testing.T) {
+	requestReader, requestWriter := io.Pipe()
+	responseReader, responseWriter := io.Pipe()
+	t.Cleanup(func() {
+		_ = requestReader.Close()
+		_ = responseWriter.Close()
+	})
+	host := &compilerHost{
+		stdin:        requestWriter,
+		stdout:       bufio.NewReader(responseReader),
+		stdoutCloser: responseReader,
+	}
+	pool := &compilerHostPool{host: host, key: "\x00"}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := pool.run(ctx, kotlinCompiler{embedded: true}, "", []string{"source.kt"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled run error = %v", err)
+	}
+	if pool.host != nil {
+		t.Fatal("canceled in-flight host remained reusable")
+	}
+}
+
+func TestCompilerCommandCompletedRejectsInfrastructureFailure(t *testing.T) {
+	if !compilerCommandCompleted(context.Background(), nil) {
+		t.Fatal("successful command was rejected")
+	}
+	if compilerCommandCompleted(context.Background(), errors.New("could not start")) {
+		t.Fatal("startup failure was treated as a diagnostic result")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if compilerCommandCompleted(ctx, nil) {
+		t.Fatal("canceled command was treated as complete")
+	}
+	if compilerCommandCompleted(context.Background(), errCompilerOutputLimit) {
+		t.Fatal("truncated output was treated as complete")
+	}
+}
+
+func TestCompilerOutputWriterIsBounded(t *testing.T) {
+	writer := &boundedCompilerOutput{limit: 4}
+	if n, err := writer.Write([]byte("abcdefgh")); err != nil || n != 8 {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	if string(writer.data) != "abcd" || !writer.truncated {
+		t.Fatalf("bounded output = %q, truncated=%v", writer.data, writer.truncated)
+	}
+}
+
+func TestCompilerDiagnosticBudgetPrioritizesErrors(t *testing.T) {
+	uri := protocol.URI("file:///workspace/Many.kt")
+	diagnostics := make([]protocol.Diagnostic, maxCompilerDiagnosticsPerFile+2)
+	for index := range diagnostics {
+		diagnostics[index] = protocol.Diagnostic{Severity: 2, Message: "warning"}
+	}
+	diagnostics[len(diagnostics)-1] = protocol.Diagnostic{Severity: 1, Message: "important error"}
+	values := map[protocol.URI][]protocol.Diagnostic{uri: diagnostics}
+	budgetCompilerDiagnostics(values)
+	if len(values[uri]) != maxCompilerDiagnosticsPerFile+1 {
+		t.Fatalf("budgeted diagnostics = %d", len(values[uri]))
+	}
+	if values[uri][0].Message != "important error" || values[uri][len(values[uri])-1].Code != "diagnostics-omitted" {
+		t.Fatalf("budgeted diagnostics lost priority/marker")
+	}
+}
 
 func hostProcessAlive(pid int) bool {
 	process, err := os.FindProcess(pid)
@@ -76,15 +183,19 @@ func TestHostedCompilerMatchesTheOneShotProcess(t *testing.T) {
 	if err != nil {
 		t.Skipf("the compiler host is unavailable here: %v", err)
 	}
-	normalise := func(value []byte) string {
+	// The host answers through the structured message renderer and the
+	// one-shot process through its text layout; the JVM may also print
+	// environment banners (JAVA_TOOL_OPTIONS) on the one-shot's stderr. What
+	// must agree is the diagnostic content each transport yields.
+	normalise := func(value []byte) map[protocol.URI][]protocol.Diagnostic {
 		text := strings.ReplaceAll(string(value), filepath.Join(dir, "cli"), "")
 		text = strings.ReplaceAll(text, filepath.Join(dir, "host"), "")
-		return strings.TrimSpace(text)
+		return parseKotlincDiagnostics(text)
 	}
-	if normalise(direct) != normalise(hosted) {
-		t.Fatalf("hosted and one-shot output differ:\n--- one-shot ---\n%s\n--- hosted ---\n%s", normalise(direct), normalise(hosted))
+	if directParsed, hostedParsed := normalise(direct), normalise(hosted); !reflect.DeepEqual(directParsed, hostedParsed) {
+		t.Fatalf("hosted and one-shot diagnostics differ:\n--- one-shot ---\n%#v\n--- hosted ---\n%#v", directParsed, hostedParsed)
 	}
-	if len(parseKotlincDiagnostics(normalise(hosted))) == 0 {
+	if len(normalise(hosted)) == 0 {
 		t.Fatal("the fixture error was not reported at all, so the comparison proves nothing")
 	}
 }
@@ -117,8 +228,10 @@ func TestCompilerHostIsReused(t *testing.T) {
 	}
 }
 
-// javac runs in the same warm JVM through the tool API. Its output has to match
-// the javac command exactly, since the same parser reads both.
+// javac runs in the same warm JVM through the tool API with the same text
+// formatter as the command. The diagnostics that reach the index from either
+// have to agree; the JVM's own environment banner (JAVA_TOOL_OPTIONS) on the
+// command's stderr is not part of that.
 func TestHostedJavacMatchesTheJavacCommand(t *testing.T) {
 	requireCompilerBackedTest(t)
 	compiler, ok := findKotlinCompiler()
@@ -148,9 +261,12 @@ func TestHostedJavacMatchesTheJavacCommand(t *testing.T) {
 	if !hosted {
 		t.Skip("the compiler host is unavailable here")
 	}
-	if strings.TrimSpace(string(fromCommand)) != strings.TrimSpace(string(fromHost)) {
-		t.Fatalf("hosted javac differs from the command:\n--- command ---\n%s\n--- hosted ---\n%s",
-			strings.TrimSpace(string(fromCommand)), strings.TrimSpace(string(fromHost)))
+	comparable := func(output []byte) map[protocol.URI][]protocol.Diagnostic {
+		return parseJavacDiagnostics(string(output))
+	}
+	if !reflect.DeepEqual(comparable(fromCommand), comparable(fromHost)) {
+		t.Fatalf("hosted javac differs from the command:\n--- command ---\n%#v\n--- hosted ---\n%#v",
+			comparable(fromCommand), comparable(fromHost))
 	}
 	if len(parseJavacDiagnostics(string(fromHost))) == 0 {
 		t.Fatal("the fixture error was not reported, so the comparison proves nothing")

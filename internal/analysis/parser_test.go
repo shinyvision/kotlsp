@@ -50,6 +50,50 @@ data class User(val id: Long, var displayName: String) : Greeter {
 	}
 }
 
+func TestContextualBranchReferencesComeFromSyntaxAncestry(t *testing.T) {
+	fixtures := []struct {
+		uri      protocol.URI
+		language string
+		source   string
+		label    string
+		body     string
+	}{
+		{
+			uri: "file:///Branch.kt", language: "kotlin",
+			source: "enum class Color { RED }\nfun use(c: Color) = when (c) { RED -> bodyName }\nfun outside() = outsideName\n",
+			label:  "RED", body: "bodyName",
+		},
+		{
+			uri: "file:///Branch.java", language: "java",
+			source: "enum Color { RED } class Use { int use(Color c) { return switch (c) { case RED -> bodyName; }; } int outside() { return outsideName; } }",
+			label:  "RED", body: "bodyName",
+		},
+	}
+	for _, fixture := range fixtures {
+		parsed := Parse(context.Background(), textdoc.NewDocument(fixture.uri, fixture.language, 1, fixture.source))
+		seenLabel, seenBody, seenOutside := false, false, false
+		for _, reference := range parsed.References {
+			switch reference.Name {
+			case fixture.label:
+				seenLabel = seenLabel || reference.ContextualBranch
+			case fixture.body:
+				seenBody = true
+				if reference.ContextualBranch {
+					t.Fatalf("%s branch body was marked as a contextual label: %#v", fixture.uri, reference)
+				}
+			case "outsideName":
+				seenOutside = true
+				if reference.ContextualBranch {
+					t.Fatalf("%s unrelated reference was marked as a contextual label: %#v", fixture.uri, reference)
+				}
+			}
+		}
+		if !seenLabel || !seenBody || !seenOutside {
+			t.Fatalf("%s contextual references missing: label=%v body=%v outside=%v; %#v", fixture.uri, seenLabel, seenBody, seenOutside, parsed.References)
+		}
+	}
+}
+
 func TestKotlinDataModifierSurvivesArbitrarilyLongComments(t *testing.T) {
 	source := "data\n/*" + strings.Repeat("x", 4096) + "*/\nclass Person(val name: String)\n"
 	parsed := Parse(context.Background(), textdoc.NewDocument("file:///DataGap.kt", "kotlin", 1, source))
@@ -365,6 +409,62 @@ func TestGeneratedSourceRetainsCompleteSemanticParse(t *testing.T) {
 	if got, want := len(parsed.Symbols), 24001; got != want {
 		t.Fatalf("generated fallback symbols = %d, want %d", got, want)
 	}
+	if parsed.ParseMode != "snapshot" {
+		t.Fatalf("large C-side syntax snapshot was not activated: mode=%q", parsed.ParseMode)
+	}
+}
+
+func TestVeryLargeSourceActivatesBoundedLineParser(t *testing.T) {
+	const declaration = "class VeryLarge\n"
+	padding := strings.Repeat("// generated padding\n", (8<<20)/len("// generated padding\n")+1)
+	parsed := Parse(context.Background(), textdoc.NewDocument("file:///VeryLarge.kt", "kotlin", 1, padding+declaration))
+	if parsed.ParseMode != "large" {
+		t.Fatalf("bounded large-file parser was not activated: mode=%q", parsed.ParseMode)
+	}
+	if !hasSymbol(parsed, "VeryLarge", KindClass) {
+		t.Fatalf("bounded parser lost trailing declaration: %#v", parsed.Symbols)
+	}
+}
+
+func TestLargeJavaParserDoesNotFabricateMethodFromInvocation(t *testing.T) {
+	uri := protocol.URI("file:///LargeInvocation.java")
+	source := "class LargeInvocation {\n    void actual(int value) {}\n    service.run(value);\n}\n"
+	document := textdoc.NewDocument(uri, "java", 1, source)
+	parsed := &ParsedFile{URI: uri, Language: LanguageJava, ParseMode: "large"}
+	parseLargeDeclarations(context.Background(), document, parsed)
+	if hasSymbol(parsed, "run", KindMethod) {
+		t.Fatalf("large parser fabricated service.run(value) as a method: %#v", parsed.Symbols)
+	}
+	if !hasSymbol(parsed, "actual", KindMethod) {
+		t.Fatalf("large parser lost real method declaration: %#v", parsed.Symbols)
+	}
+}
+
+func TestParserObservesCanceledContextBeforeNativeWork(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	parsed := Parse(ctx, textdoc.NewDocument("file:///Canceled.kt", "kotlin", 1, strings.Repeat("class Never\n", 10000)))
+	if len(parsed.Symbols) != 0 || len(parsed.References) != 0 || len(parsed.Tokens) != 0 {
+		t.Fatalf("canceled parse published partial semantics: %#v", parsed)
+	}
+}
+
+func TestParserCancellationCannotOutliveNativeParser(t *testing.T) {
+	// Exercise cancellation while tree-sitter is consuming multiple input
+	// chunks. The former ParseCtx path left a cancellation goroutine racing the
+	// deferred Parser.Close and intermittently crashed the entire test process.
+	source := strings.Repeat("class Box { fun value(input: Int) = input + 1 }\n", 2_000)
+	for iteration := 0; iteration < 64; iteration++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancelled := make(chan struct{})
+		go func() {
+			time.Sleep(time.Duration(iteration%8+1) * time.Microsecond)
+			cancel()
+			close(cancelled)
+		}()
+		_ = Parse(ctx, textdoc.NewDocument("file:///CancellationRace.kt", "kotlin", iteration+1, source))
+		<-cancelled
+	}
 }
 
 func TestLargeCommentPaddedSourceRetainsCompleteSemantics(t *testing.T) {
@@ -427,6 +527,39 @@ func TestJavaFieldDeclarationRetainsIndividualModifiers(t *testing.T) {
 	t.Fatal("missing VALUE field")
 }
 
+func TestLargeParserMasksMultilineProseAndCountsStructuredArguments(t *testing.T) {
+	source := "class Real {\n/*\nclass CommentPhantom\n*/\nval raw = \"\"\"\nclass StringPhantom\n\"\"\"\nfun call() = target(listOf(1, 2), { a, b -> a + b })\n}\n"
+	document := textdoc.NewDocument("file:///Large.kt", "kotlin", 1, source)
+	parsed := &ParsedFile{URI: document.URI, Language: LanguageKotlin, ParseMode: "large"}
+	parseLargeDeclarations(context.Background(), document, parsed)
+	if !hasSymbol(parsed, "Real", KindClass) || !hasSymbol(parsed, "call", KindMethod) {
+		t.Fatalf("real declarations missing: %#v", parsed.Symbols)
+	}
+	if hasSymbol(parsed, "CommentPhantom", KindClass) || hasSymbol(parsed, "StringPhantom", KindClass) {
+		t.Fatalf("comment/string prose became declarations: %#v", parsed.Symbols)
+	}
+	for _, reference := range parsed.References {
+		if reference.Name == "target" {
+			if reference.Role != RoleCall || reference.Arity != 2 {
+				t.Fatalf("target reference = %#v", reference)
+			}
+			return
+		}
+	}
+	t.Fatal("target call reference missing")
+}
+
+func TestKotlinQualifiedCallRetainsNamedCalleeReference(t *testing.T) {
+	source := "class Service { fun save(value: Int) {} }\nfun use(service: Service) { service.save(1) }\n"
+	parsed := Parse(context.Background(), textdoc.NewDocument("file:///QualifiedCall.kt", "kotlin", 1, source))
+	for _, reference := range parsed.References {
+		if reference.Name == "save" && reference.Qualifier == "service" && reference.Role == RoleCall && reference.Arity == 1 {
+			return
+		}
+	}
+	t.Fatalf("qualified named call was lost: %#v", parsed.References)
+}
+
 func integerText(value int) string {
 	if value == 0 {
 		return "0"
@@ -465,4 +598,25 @@ func symbolSummary(symbols []Symbol) string {
 		result += symbol.Name + "/" + symbol.Signature + "; "
 	}
 	return result
+}
+
+func TestOpenDocumentSyntaxStateUsesIncrementalTree(t *testing.T) {
+	doc := textdoc.NewDocument("file:///Incremental.kt", "kotlin", 1, "class Before\nfun value() = Before()\n")
+	state := NewSyntaxState()
+	defer state.Close()
+	first := ParseIncremental(context.Background(), doc, state, nil)
+	if first.ParseMode != "full" || !hasSymbol(first, "Before", KindClass) {
+		t.Fatalf("initial parse mode/symbols = %q %#v", first.ParseMode, first.Symbols)
+	}
+	edits, err := doc.ApplyWithEdits(2, []protocol.TextDocumentContentChangeEvent{{
+		Range: &protocol.Range{Start: protocol.Position{Line: 0, Character: 6}, End: protocol.Position{Line: 0, Character: 12}},
+		Text:  "After",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := ParseIncremental(context.Background(), doc, state, edits)
+	if second.ParseMode != "incremental" || state.IncrementalParses() != 1 || !hasSymbol(second, "After", KindClass) {
+		t.Fatalf("incremental parse mode/count/symbols = %q %d %#v", second.ParseMode, state.IncrementalParses(), second.Symbols)
+	}
 }

@@ -55,7 +55,7 @@ func (r *recordingConn) snapshot() []map[string]any {
 // broken one, so the stream must be created and then closed exactly once.
 func TestIndexingProgressIsCreatedThenEnded(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	recorder := &recordingConn{}
 	created := make(chan string, 1)
 	s.clientCall = func(_ context.Context, method string, params, _ any) error {
@@ -119,7 +119,7 @@ func TestIndexingProgressIsCreatedThenEnded(t *testing.T) {
 // a token the client never created.
 func TestIndexingProgressIsSkippedWithoutClientSupport(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	recorder := &recordingConn{}
 	calls := 0
 	s.clientCall = func(context.Context, string, any, any) error { calls++; return nil }

@@ -31,7 +31,8 @@ func TestExplainUnresolvedNames(t *testing.T) {
 		defer func() { libraryArchiveFilter = nil }()
 	}
 	if os.Getenv("KOTLSP_EXPLAIN_AT_READY") != "" {
-		// Hold the scan at the moment Ready flips, before source attachment.
+		// Hold the scan immediately after the complete declaration/source
+		// barrier flips Ready.
 		release := make(chan struct{})
 		scanDeclarationsCompleteHook = func() { <-release }
 		defer func() { scanDeclarationsCompleteHook = nil }()

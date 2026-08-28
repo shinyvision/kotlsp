@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
+	"github.com/shinyvision/kotlsp/internal/lexical"
 )
 
 // The scope engine decides whether a simple name is provably unresolved at a
@@ -69,9 +70,8 @@ type unresolvedNameContext struct {
 	lambdas       []lambdaSpan
 	anonymous     []anonymousSpan
 	anonymousFuns []span
-	accounted     map[string]bool
-	whenPresent   bool
 	segments      map[string]bool
+	rootSegments  map[string]bool
 	nameStarts    map[int]bool
 }
 
@@ -127,6 +127,25 @@ func (c *unresolvedNameContext) isPackageSegment(i *Index, name string) bool {
 	return c.segments[name]
 }
 
+// isRootPackageSegment reports whether a name begins some indexed package.
+// An unqualified name can only denote a package at its root (`java` in
+// `java.io.File`); `test` being a segment of kotlin.test says nothing about a
+// bare `test` in expression position.
+func (c *unresolvedNameContext) isRootPackageSegment(i *Index, name string) bool {
+	if c.rootSegments == nil {
+		c.rootSegments = make(map[string]bool)
+		for pkg := range i.byPackage {
+			root, _, _ := strings.Cut(pkg, ".")
+			c.rootSegments[root] = true
+		}
+		for pkg := range i.packages {
+			root, _, _ := strings.Cut(pkg, ".")
+			c.rootSegments[root] = true
+		}
+	}
+	return c.rootSegments[name]
+}
+
 type hierarchyResult struct {
 	types    []analysis.Symbol
 	complete bool
@@ -165,7 +184,7 @@ func (i *Index) resolveOneTypeLocked(file *analysis.ParsedFile, typeName string)
 }
 
 func newUnresolvedNameContext(file *analysis.ParsedFile) *unresolvedNameContext {
-	return &unresolvedNameContext{file: file, scopes: map[string]*scopeSet{}, hierarchies: map[string]hierarchyResult{}, accounted: map[string]bool{}}
+	return &unresolvedNameContext{file: file, scopes: map[string]*scopeSet{}, hierarchies: map[string]hierarchyResult{}}
 }
 
 func (c *unresolvedNameContext) prepare(i *Index) {
@@ -175,7 +194,6 @@ func (c *unresolvedNameContext) prepare(i *Index) {
 	c.prepared = true
 	c.text = i.documentTextLocked(c.file.URI)
 	c.mask = codeMask(c.text, c.file.Language == analysis.LanguageKotlin)
-	c.whenPresent = strings.Contains(c.text, "when") || strings.Contains(c.text, "switch") || strings.Contains(c.text, "case")
 	if c.file.Language == analysis.LanguageKotlin {
 		c.lambdas = i.lambdaSpansLocked(c)
 		c.anonymous = kotlinAnonymousObjects(c.text, c.mask)
@@ -187,11 +205,7 @@ func (c *unresolvedNameContext) prepare(i *Index) {
 
 // Names the compiler binds without any declaration the index could hold.
 var scopeEngineSkips = map[string]bool{
-	"it": true, "this": true, "super": true, "field": true, "Companion": true,
-	"copy": true, "equals": true, "hashCode": true, "toString": true, "invoke": true,
-	"values": true, "valueOf": true, "entries": true, "name": true, "ordinal": true,
-	"getClass": true, "wait": true, "notify": true, "notifyAll": true, "clone": true, "finalize": true,
-	"length": true, "class": true, "javaClass": true,
+	"this": true, "super": true,
 }
 
 // nameProvablyUnresolvedLocked is the entry point for an unqualified read,
@@ -205,7 +219,7 @@ func (i *Index) nameProvablyUnresolvedLocked(c *unresolvedNameContext, ref analy
 // for explaining an abstention on a real project; it costs nothing.
 func (i *Index) unresolvedVerdictLocked(c *unresolvedNameContext, ref analysis.Reference) (bool, string) {
 	name := ref.Name
-	if name == "" || scopeEngineSkips[name] || implicitNames[name] || strings.HasPrefix(name, "component") {
+	if name == "" || scopeEngineSkips[name] {
 		return false, "name is bound by the language"
 	}
 	file := c.file
@@ -218,13 +232,19 @@ func (i *Index) unresolvedVerdictLocked(c *unresolvedNameContext, ref analysis.R
 	if c.text == "" {
 		return false, "no text"
 	}
+	if c.contextualBranchLabel(ref) {
+		// Exhaustive enum/sealed labels need selector-aware compiler semantics.
+		// The lexical test is used only as a narrow abstention gate; it never
+		// makes a same-named workspace declaration visible.
+		return false, "branch-label binding is delegated to the compiler"
+	}
 	// The parser reports a member access continued on the next line
 	// (`\n    .member(...)`) with an empty qualifier. What precedes the name
 	// in the text is authoritative: a dot means this is not a bare name.
 	if before := skipBackCode(c.text, c.mask, ref.StartByte-1); before >= 0 && (c.text[before] == '.' || c.text[before] == ':' || c.text[before] == '?') {
 		return false, "qualified access"
 	}
-	if c.isPackageSegment(i, name) {
+	if c.isRootPackageSegment(i, name) {
 		return false, "the name is a package segment"
 	}
 	// The parser emits a reference for some declared names it records under
@@ -232,9 +252,6 @@ func (i *Index) unresolvedVerdictLocked(c *unresolvedNameContext, ref analysis.R
 	// exactly on a declaration's name is that declaration, not a use.
 	if c.isDeclarationName(ref.StartByte) {
 		return false, "the reference is a declaration's own name"
-	}
-	if !c.occurrencesAccounted(name) {
-		return false, "an occurrence of the name is not modelled by the parser"
 	}
 	scope := i.scopeAtLocked(c, ref)
 	if scope == nil || !scope.complete {
@@ -273,15 +290,16 @@ func (i *Index) candidatePossiblyVisibleLocked(c *unresolvedNameContext, scope *
 	if candidate.Synthetic && candidate.InteropLanguage != analysis.LanguageUnknown && candidate.InteropLanguage != file.Language {
 		return false
 	}
-	// A local of this file may be in scope wherever it sits; the parser's
-	// scopes are not trusted to decide that. A local of another file never is.
+	// Lexical declarations are visible only inside the scope recorded by the
+	// parser. If an older parser omitted the scope, keep the conservative
+	// same-file fallback rather than leaking the name between files.
 	if isLexicalSymbol(candidate) {
-		return candidate.URI == file.URI
-	}
-	// Enum entries and sealed subclasses may be named bare in a `when` or
-	// `switch` over their type; K2 also has context-sensitive resolution
-	// behind a flag. Neither is modelled.
-	if c.whenPresent && (candidate.Kind == analysis.KindEnumMember || analysis.IsTypeKind(candidate.Kind)) {
+		if candidate.URI != file.URI {
+			return false
+		}
+		if candidate.ScopeEndByte > candidate.ScopeStartByte {
+			return candidate.ScopeStartByte <= ref.StartByte && ref.StartByte <= candidate.ScopeEndByte
+		}
 		return true
 	}
 	if candidate.Kind == analysis.KindPackage {
@@ -360,46 +378,8 @@ func (i *Index) topLevelVisibleLocked(file *analysis.ParsedFile, symbol analysis
 	return false
 }
 
-// occurrencesAccounted checks that every appearance of the identifier in the
-// file's code is either a reference the parser produced or a declared name.
-// An appearance the parser did not model -- a binding form it does not know,
-// a construct it mis-parsed -- could be a declaration, so it counts as one.
-func (c *unresolvedNameContext) occurrencesAccounted(name string) bool {
-	if accounted, seen := c.accounted[name]; seen {
-		return accounted
-	}
-	positions := make(map[int]bool)
-	for _, reference := range c.file.References {
-		if reference.Name == name {
-			positions[reference.StartByte] = true
-		}
-	}
-	for _, symbol := range c.file.Symbols {
-		if symbol.Name == name {
-			positions[symbol.NameStartByte] = true
-		}
-	}
-	accounted := true
-	text := c.text
-	for at := 0; at < len(text); {
-		found := strings.Index(text[at:], name)
-		if found < 0 {
-			break
-		}
-		start := at + found
-		end := start + len(name)
-		at = end
-		if start > 0 && isIdentifierByteFast(text[start-1]) || end < len(text) && isIdentifierByteFast(text[end]) {
-			continue
-		}
-		if !c.mask[start] || positions[start] || inImportOrPackageLine(text, start) {
-			continue
-		}
-		accounted = false
-		break
-	}
-	c.accounted[name] = accounted
-	return accounted
+func (c *unresolvedNameContext) contextualBranchLabel(ref analysis.Reference) bool {
+	return ref.ContextualBranch
 }
 
 func inImportOrPackageLine(text string, at int) bool {
@@ -444,7 +424,7 @@ func (i *Index) scopeAtLocked(c *unresolvedNameContext, ref analysis.Reference) 
 			}
 			// Companion members are visible bare inside the class and its
 			// subclasses.
-			for _, id := range i.byContainerName[member.Name] {
+			for _, id := range i.byContainerName[member.ID] {
 				nested := i.symbols[id]
 				if nested == nil || nested.ContainerID != member.ID || nested.Kind != analysis.KindObject {
 					continue
@@ -1290,39 +1270,7 @@ func stringStartBackward(text string, closing int) int {
 
 // splitTopLevel splits on a separator outside brackets, braces, and strings.
 func splitTopLevel(list string, separator byte) []string {
-	var out []string
-	depth, start := 0, 0
-	inString := false
-	for at := 0; at < len(list); at++ {
-		value := list[at]
-		if inString {
-			if value == '\\' {
-				at++
-			} else if value == '"' {
-				inString = false
-			}
-			continue
-		}
-		switch value {
-		case '"':
-			inString = true
-		case '(', '[', '{', '<':
-			depth++
-		case ')', ']', '}', '>':
-			if depth > 0 {
-				depth--
-			}
-		default:
-			if value == separator && depth == 0 {
-				out = append(out, list[start:at])
-				start = at + 1
-			}
-		}
-	}
-	if strings.TrimSpace(list[start:]) != "" || len(out) > 0 {
-		out = append(out, list[start:])
-	}
-	return out
+	return lexical.SplitTopLevel(list, string(separator), true)
 }
 
 // isBinarySymbol reports whether a symbol was indexed from a class file

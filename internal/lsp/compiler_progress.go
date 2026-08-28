@@ -27,7 +27,7 @@ func (s *Server) watchCompilerProgress() {
 	if !s.compilerProgressActive.CompareAndSwap(false, true) {
 		return
 	}
-	go func() {
+	if !s.launchBackground(func() {
 		defer s.compilerProgressActive.Store(false)
 		ticker := time.NewTicker(compilerProgressPoll)
 		defer ticker.Stop()
@@ -69,7 +69,9 @@ func (s *Server) watchCompilerProgress() {
 				}
 			}
 		}
-	}()
+	}) {
+		s.compilerProgressActive.Store(false)
+	}
 }
 
 func (s *Server) compilerStatusNow() []index.CompilerPassStatus {

@@ -30,6 +30,30 @@ func TestSourceClassesForJavaAndKotlin(t *testing.T) {
 	}
 }
 
+func TestPathForSourceRejectsTraversalAndSymlinkEscape(t *testing.T) {
+	temporary := t.TempDir()
+	root := filepath.Join(temporary, "root")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(temporary, "secret.kt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := newSession(context.Background(), bufio.NewWriter(io.Discard))
+	defer s.close()
+	s.sourceRoots = []string{root}
+	if path := s.pathForSource(filepath.Join("..", "secret.kt")); path != "" {
+		t.Fatalf("traversal source resolved outside root: %s", path)
+	}
+	link := filepath.Join(root, "linked.kt")
+	if err := os.Symlink(outside, link); err == nil {
+		if path := s.pathForSource("linked.kt"); path != "" {
+			t.Fatalf("symlink source resolved outside root: %s", path)
+		}
+	}
+}
+
 func TestInitializeAdvertisesOnlyImplementedDebuggerFeatures(t *testing.T) {
 	s := newSession(context.Background(), bufio.NewWriter(io.Discard))
 	defer s.close()
@@ -43,13 +67,96 @@ func TestInitializeAdvertisesOnlyImplementedDebuggerFeatures(t *testing.T) {
 			t.Fatalf("missing capability %s: %#v", name, capabilities)
 		}
 	}
-	if capabilities["supportTerminateDebuggee"] != true || capabilities["supportsSetExpression"] != false || capabilities["supportsExceptionInfoRequest"] != false || capabilities["supportsLoadedSourcesRequest"] != false {
+	if capabilities["supportTerminateDebuggee"] != true || capabilities["supportsSetExpression"] != true || capabilities["supportsExceptionInfoRequest"] != true || capabilities["supportsLoadedSourcesRequest"] != true || capabilities["supportsCancelRequest"] != true {
 		t.Fatalf("OpenKotlin capability parity mismatch: %#v", capabilities)
 	}
 	triggers, ok := capabilities["completionTriggerCharacters"].([]string)
 	if !ok || len(triggers) != 1 || triggers[0] != "." {
 		t.Fatalf("completion trigger characters = %#v", capabilities["completionTriggerCharacters"])
 	}
+}
+
+func TestDisconnectCanLeaveLaunchedDebuggeeRunning(t *testing.T) {
+	s := newSession(context.Background(), bufio.NewWriter(io.Discard))
+	s.debugMu.Lock()
+	s.launched = true
+	s.debugMu.Unlock()
+	s.disconnect(json.RawMessage(`{"terminateDebuggee":false}`), false)
+	s.debugMu.Lock()
+	leave := s.leaveDebuggee
+	s.leaveDebuggee = false // restore ordinary cleanup semantics for the test
+	s.debugMu.Unlock()
+	if !leave {
+		t.Fatal("disconnect ignored terminateDebuggee=false")
+	}
+	s.close()
+}
+
+func TestSessionCloseJoinsOwnedWorkers(t *testing.T) {
+	s := newSession(context.Background(), bufio.NewWriter(io.Discard))
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	if !s.startWorker(func() {
+		close(started)
+		<-s.ctx.Done()
+		close(finished)
+	}) {
+		t.Fatal("worker was rejected before close")
+	}
+	<-started
+	s.close()
+	select {
+	case <-finished:
+	default:
+		t.Fatal("session close returned before its worker exited")
+	}
+	if s.startWorker(func() {}) {
+		t.Fatal("session accepted a worker after close")
+	}
+}
+
+func TestCancelledLaunchKillsDebuggeeBeforeJDWPIsReported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a small POSIX test executable")
+	}
+	executable := filepath.Join(t.TempDir(), "fake-java")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nexec sleep 30\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := newSession(ctx, bufio.NewWriter(io.Discard))
+	done := make(chan string, 1)
+	launch := mustRaw(t, map[string]any{"mainClass": "NeverStarts", "javaExec": executable})
+	go func() {
+		_, _, message := s.launch(ctx, launch)
+		done <- message
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.debugMu.Lock()
+		started := s.debuggee != nil && s.debuggee.Process != nil
+		s.debugMu.Unlock()
+		if started || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case message := <-done:
+		if !strings.Contains(message, context.Canceled.Error()) {
+			t.Fatalf("cancelled launch message = %q", message)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled launch did not return")
+	}
+	s.debugMu.Lock()
+	process := s.debuggee.Process
+	s.debugMu.Unlock()
+	if process != nil && process.Kill() == nil {
+		t.Fatal("debuggee survived cancelled launch")
+	}
+	s.close()
 }
 
 func TestBreakpointLocationsReturnsEveryExecutableLine(t *testing.T) {
@@ -159,7 +266,7 @@ func TestBreakpointLocationsIncludeGeneratedNestedClassesOnLaunchClasspath(t *te
 	}
 }
 
-func TestDebuggeeOutputAndJDBRelayDoNotTruncateLongOrNoisyStreams(t *testing.T) {
+func TestDebuggeeOutputAndBridgeBufferDoNotSilentlyTruncate(t *testing.T) {
 	var wire bytes.Buffer
 	writer := bufio.NewWriter(&wire)
 	s := newSession(context.Background(), writer)
@@ -173,27 +280,14 @@ func TestDebuggeeOutputAndJDBRelayDoNotTruncateLongOrNoisyStreams(t *testing.T) 
 		t.Fatalf("debuggee output was incomplete: %d wire bytes", len(output))
 	}
 
-	process := &jdbProcess{incoming: make(chan string), chunks: make(chan string)}
-	go process.relayChunks()
-	go func() {
-		for number := range 700 {
-			process.incoming <- strconv.Itoa(number)
-		}
-		close(process.incoming)
-	}()
-	count := 0
-	for chunk := range process.chunks {
-		if chunk != strconv.Itoa(count) {
-			t.Fatalf("JDB relay chunk %d = %q", count, chunk)
-		}
-		count++
-	}
-	if count != 700 {
-		t.Fatalf("JDB relay returned %d chunks, want 700", count)
+	var bridge boundedBridgeBuffer
+	_, _ = bridge.Write([]byte(strings.Repeat("x", 2<<20)))
+	if !bridge.truncated || !strings.Contains(bridge.String(), "output truncated") {
+		t.Fatal("bounded bridge diagnostics did not disclose truncation")
 	}
 }
 
-func TestJDBBridgeLaunchBreakpointStackAndEvaluate(t *testing.T) {
+func TestJDIBridgeLaunchBreakpointStackAndEvaluate(t *testing.T) {
 	if testing.Short() || runtime.GOOS == "windows" {
 		t.Skip("requires the JDK debugger")
 	}
@@ -202,9 +296,6 @@ func TestJDBBridgeLaunchBreakpointStackAndEvaluate(t *testing.T) {
 	}
 	if _, err := exec.LookPath("javac"); err != nil {
 		t.Skip("javac is unavailable")
-	}
-	if _, err := exec.LookPath("jdb"); err != nil {
-		t.Skip("jdb is unavailable")
 	}
 	classes := t.TempDir()
 	source, err := filepath.Abs(filepath.Join("testdata", "Debuggee.java"))
@@ -286,17 +377,6 @@ func containsString(values []string, expected string) bool {
 	return false
 }
 
-func TestDevtoolsRestartStopDetection(t *testing.T) {
-	restart := `Exception occurred: org.springframework.boot.devtools.restart.SilentExitExceptionHandler$SilentExitException (uncaught)"thread=main", org.springframework.boot.devtools.restart.SilentExitExceptionHandler.exitCurrentThread(), line=94 bci=16`
-	if !isDevtoolsRestartStop(restart) {
-		t.Fatal("devtools restart stop was not detected")
-	}
-	real := `Exception occurred: java.lang.NullPointerException (uncaught)"thread=main", com.acme.Widget.run(), line=3 bci=4`
-	if isDevtoolsRestartStop(real) {
-		t.Fatal("ordinary exception misdetected as devtools restart")
-	}
-}
-
 func findVariable(t *testing.T, variables []map[string]any, name string) map[string]any {
 	t.Helper()
 	for _, variable := range variables {
@@ -321,7 +401,7 @@ func TestVariableInspectionExpandsObjectsCollectionsArraysAndMaps(t *testing.T) 
 	if testing.Short() || runtime.GOOS == "windows" {
 		t.Skip("requires the JDK debugger")
 	}
-	for _, tool := range []string{"java", "javac", "jdb"} {
+	for _, tool := range []string{"java", "javac"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skip(tool + " is unavailable")
 		}
@@ -387,9 +467,8 @@ func TestVariableInspectionExpandsObjectsCollectionsArraysAndMaps(t *testing.T) 
 	if bodyReference == 0 {
 		t.Fatalf("body is not expandable: %#v", body)
 	}
-	// Expandable locals show the toString preview instead of the raw hint.
-	if preview, _ := body["value"].(string); !strings.HasPrefix(preview, `"dapfixture.Inspection$Body@`) {
-		t.Fatalf("body preview = %#v", body["value"])
+	if preview, _ := body["value"].(string); !strings.HasPrefix(preview, "instance of dapfixture.Inspection$Body") {
+		t.Fatalf("body JDI rendering = %#v", body["value"])
 	}
 	text := findVariable(t, locals, "text")
 	if text["value"] != `"scalpel"` || text["variablesReference"] != 0 {
@@ -400,7 +479,7 @@ func TestVariableInspectionExpandsObjectsCollectionsArraysAndMaps(t *testing.T) 
 	if tag := findVariable(t, fields, "tag"); tag["value"] != `"body"` {
 		t.Fatalf("tag field = %#v", tag)
 	}
-	if inherited := findVariable(t, fields, "dapfixture.Inspection$Organ.name"); inherited["value"] != `"heart"` {
+	if inherited := findVariable(t, fields, "name"); inherited["value"] != `"heart"` {
 		t.Fatalf("inherited name field = %#v", inherited)
 	}
 	if missing := findVariable(t, fields, "missing"); missing["value"] != "null" || missing["variablesReference"] != 0 {
@@ -411,42 +490,30 @@ func TestVariableInspectionExpandsObjectsCollectionsArraysAndMaps(t *testing.T) 
 	if parts["type"] != "java.util.ArrayList" || parts["variablesReference"] == 0 {
 		t.Fatalf("parts field = %#v", parts)
 	}
-	elements := fetchVariables(t, s, parts["variablesReference"].(int))
-	if len(elements) != 2 {
-		t.Fatalf("list elements = %#v", elements)
+	partFields := fetchVariables(t, s, parts["variablesReference"].(int))
+	if size := findVariable(t, partFields, "size"); size["value"] != "2" {
+		t.Fatalf("ArrayList size field = %#v", size)
 	}
-	if elements[0]["name"] != "[0]" || elements[0]["value"] != `"arm"` || elements[1]["value"] != `"leg"` {
-		t.Fatalf("list elements = %#v", elements)
+	elementData := findVariable(t, partFields, "elementData")
+	if elementData["variablesReference"] == 0 {
+		t.Fatalf("ArrayList backing array is not expandable: %#v", elementData)
+	}
+	elements := fetchVariables(t, s, elementData["variablesReference"].(int))
+	if len(elements) < 2 || elements[0]["value"] != `"arm"` || elements[1]["value"] != `"leg"` {
+		t.Fatalf("ArrayList backing elements = %#v", elements)
 	}
 
 	sizes := findVariable(t, fields, "sizes")
 	if sizes["type"] != "java.util.HashMap" || sizes["variablesReference"] == 0 {
 		t.Fatalf("sizes field = %#v", sizes)
 	}
-	entries := fetchVariables(t, s, sizes["variablesReference"].(int))
-	if len(entries) != 2 {
-		t.Fatalf("map entries = %#v", entries)
-	}
-	var armEntry map[string]any
-	for _, entry := range entries {
-		if entry["value"] == `"arm=2"` {
-			armEntry = entry
-		}
-	}
-	if armEntry == nil {
-		t.Fatalf("map entries = %#v", entries)
-	}
-	entryReference := armEntry["variablesReference"].(int)
-	if entryReference == 0 {
-		t.Fatalf("map entry is not expandable: %#v", armEntry)
-	}
-	entryFields := fetchVariables(t, s, entryReference)
-	if key := findVariable(t, entryFields, "key"); key["value"] != `"arm"` {
-		t.Fatalf("entry key = %#v", key)
+	mapFields := fetchVariables(t, s, sizes["variablesReference"].(int))
+	if size := findVariable(t, mapFields, "size"); size["value"] != "2" {
+		t.Fatalf("HashMap size field = %#v", size)
 	}
 
 	nums := findVariable(t, locals, "nums")
-	if nums["type"] != "int[3]" || nums["variablesReference"] == 0 {
+	if nums["type"] != "int[]" || nums["variablesReference"] == 0 || nums["indexedVariables"] != 3 {
 		t.Fatalf("nums local = %#v", nums)
 	}
 	arrayElements := fetchVariables(t, s, nums["variablesReference"].(int))
@@ -458,23 +525,23 @@ func TestVariableInspectionExpandsObjectsCollectionsArraysAndMaps(t *testing.T) 
 			t.Fatalf("array element %d = %#v", index, arrayElements[index])
 		}
 	}
-	// An evaluate result is a quoted toString preview; it must still be
-	// expandable in place (hover/watch/REPL).
+	// Explicit evaluation returns a structured object identity without calling
+	// toString, and remains expandable in place.
 	evaluation, ok, message := s.dispatch("evaluate", mustRaw(t, map[string]any{"frameId": frameID, "expression": "body.parts"}))
 	if !ok {
 		t.Fatalf("evaluate failed: %s", message)
 	}
 	evalBody := evaluation.(map[string]any)
-	if evalBody["result"] != `"[arm, leg]"` {
+	if !strings.HasPrefix(evalBody["result"].(string), "instance of java.util.ArrayList") {
 		t.Fatalf("evaluate result = %#v", evalBody["result"])
 	}
 	evalReference := evalBody["variablesReference"].(int)
 	if evalReference == 0 {
 		t.Fatalf("evaluate result is not expandable: %#v", evalBody)
 	}
-	evalElements := fetchVariables(t, s, evalReference)
-	if len(evalElements) != 2 || evalElements[0]["value"] != `"arm"` || evalElements[1]["value"] != `"leg"` {
-		t.Fatalf("evaluate expansion = %#v", evalElements)
+	evalFields := fetchVariables(t, s, evalReference)
+	if size := findVariable(t, evalFields, "size"); size["value"] != "2" {
+		t.Fatalf("evaluate expansion = %#v", evalFields)
 	}
 	s.disconnect(json.RawMessage(`{"terminateDebuggee":true}`), true)
 }

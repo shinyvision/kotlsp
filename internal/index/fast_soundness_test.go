@@ -264,3 +264,22 @@ func TestPredictionsSurviveTheCompilerLanding(t *testing.T) {
 		}
 	}
 }
+
+func TestPredictionReconciliationUsesExactRange(t *testing.T) {
+	first := protocol.Diagnostic{
+		Range: protocol.Range{Start: protocol.Position{Line: 1, Character: 2}, End: protocol.Position{Line: 1, Character: 3}},
+		Code:  "UNRESOLVED_REFERENCE", Message: "Unresolved reference 'T'.",
+	}
+	second := first
+	second.Range.Start.Character = 8
+	second.Range.End.Character = 9
+	compiler := second
+	compiler.Message = "Unresolved reference: T"
+	remainingPredictions, remainingCompiler := reconcilePredictions([]protocol.Diagnostic{first, second}, []protocol.Diagnostic{compiler})
+	if len(remainingPredictions) != 1 || remainingPredictions[0].Range != first.Range {
+		t.Fatalf("predictions after range-local wording drift = %#v", remainingPredictions)
+	}
+	if len(remainingCompiler) != 1 || remainingCompiler[0].Range != second.Range {
+		t.Fatalf("compiler findings after range-local wording drift = %#v", remainingCompiler)
+	}
+}

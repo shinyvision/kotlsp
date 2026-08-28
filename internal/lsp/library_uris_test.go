@@ -65,7 +65,7 @@ func libraryFixture(t *testing.T) (*Server, protocol.URI, protocol.URI) {
 // navigation target must be a file the editor can actually read.
 func TestDefinitionIntoLibraryReturnsAnOpenableFile(t *testing.T) {
 	s, workspaceURI, libraryURI := libraryFixture(t)
-	defer s.index.Close()
+	defer s.Close()
 
 	params, err := json.Marshal(map[string]any{
 		"textDocument": map[string]any{"uri": workspaceURI},
@@ -109,7 +109,7 @@ func TestDefinitionIntoLibraryReturnsAnOpenableFile(t *testing.T) {
 // path. They must reach the index under its own identity.
 func TestRequestsFromAMirroredLibraryFileReachTheIndex(t *testing.T) {
 	s, _, libraryURI := libraryFixture(t)
-	defer s.index.Close()
+	defer s.Close()
 
 	mirrored, ok := s.index.LibraryFileURI(libraryURI)
 	if !ok {
@@ -133,7 +133,7 @@ func TestRequestsFromAMirroredLibraryFileReachTheIndex(t *testing.T) {
 // into the workspace document set, where it would be parsed as project source.
 func TestOpeningAMirroredLibraryFileIsIgnored(t *testing.T) {
 	s, _, libraryURI := libraryFixture(t)
-	defer s.index.Close()
+	defer s.Close()
 
 	mirrored, ok := s.index.LibraryFileURI(libraryURI)
 	if !ok {
@@ -152,5 +152,39 @@ func TestOpeningAMirroredLibraryFileIsIgnored(t *testing.T) {
 	}
 	if strings.Contains(document.Text, "Replaced") {
 		t.Fatal("a didOpen on a mirrored path overwrote the indexed archive entry")
+	}
+}
+
+// An editor keeps buffers open across server restarts, including mirrored
+// library files written by an earlier layout version that no longer exists.
+// Those are still library views: they must be dropped, never indexed as
+// project sources (which handed the compiler a file no module owns).
+func TestOpeningAStaleMirroredLibraryFileIsIgnored(t *testing.T) {
+	s, _, libraryURI := libraryFixture(t)
+	defer s.Close()
+	mirrored, ok := s.index.LibraryFileURI(libraryURI)
+	if !ok {
+		t.Fatal("library entry produced no mirrored file")
+	}
+	stale := protocol.URI(strings.Replace(string(mirrored), "/sources/v2/", "/sources/v1/", 1))
+	if stale == mirrored {
+		t.Fatalf("mirror path has no version segment: %s", mirrored)
+	}
+	params, err := json.Marshal(protocol.DidOpenTextDocumentParams{
+		TextDocument: protocol.TextDocumentItem{URI: stale, LanguageID: "java", Version: 1, Text: "package demo;\nclass Stale {}\n"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Notify(context.Background(), "textDocument/didOpen", params)
+	for _, uri := range s.index.OpenDocuments() {
+		if uri == stale {
+			t.Fatal("a stale mirror path entered the workspace document set")
+		}
+	}
+	for _, file := range s.index.WorkspaceFiles() {
+		if file.URI == stale {
+			t.Fatal("a stale mirror path became a workspace source")
+		}
 	}
 }

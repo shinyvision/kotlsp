@@ -18,7 +18,7 @@ import (
 func completionFixture(t *testing.T) (*Server, protocol.URI, string) {
 	t.Helper()
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	t.Cleanup(func() { s.index.Close() })
+	t.Cleanup(func() { s.Close() })
 	s.initializeReceived.Store(true)
 	s.initialized.Store(true)
 	for n := 0; n < completionCandidateLimit*3; n++ {

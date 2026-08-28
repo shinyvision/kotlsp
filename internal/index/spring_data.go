@@ -44,6 +44,36 @@ type springDataPropertySegment struct {
 	valid      bool
 }
 
+func (i *Index) springDataDiagnosticsLocked(file *analysis.ParsedFile) []protocol.Diagnostic {
+	document := i.documentLocked(file.URI)
+	if document == nil {
+		return nil
+	}
+	var result []protocol.Diagnostic
+	for index := range file.Symbols {
+		method := file.Symbols[index]
+		if !analysis.IsCallableKind(method.Kind) || method.ContainerID == "" {
+			continue
+		}
+		segments, derived := i.springDataMethodSegmentsLocked(file, method)
+		if !derived {
+			continue
+		}
+		for _, segment := range segments {
+			if segment.valid || segment.start < 0 || segment.end <= segment.start || segment.end > len(document.Text) {
+				continue
+			}
+			name := lowerFirst(document.Text[segment.start:segment.end])
+			result = append(result, protocol.Diagnostic{
+				Range: document.Range(segment.start, segment.end), Severity: 1,
+				Code: "spring-data-invalid-property", Source: "kotlsp",
+				Message: "Spring Data cannot resolve derived property '" + name + "'.",
+			})
+		}
+	}
+	return result
+}
+
 func (i *Index) springDataDefinitionLocked(file *analysis.ParsedFile, offset int) ([]analysis.Symbol, bool) {
 	for index := range file.Symbols {
 		method := &file.Symbols[index]
@@ -70,53 +100,18 @@ func (i *Index) springDataDefinitionLocked(file *analysis.ParsedFile, offset int
 	return nil, false
 }
 
-func (i *Index) springDataDiagnosticsLocked(file *analysis.ParsedFile) []protocol.Diagnostic {
-	document := i.docs[file.URI]
-	if document == nil {
-		document = i.indexedDocs[file.URI]
-	}
-	if document == nil {
-		return nil
-	}
-	var result []protocol.Diagnostic
-	for _, method := range file.Symbols {
-		if !analysis.IsCallableKind(method.Kind) || method.ContainerID == "" {
-			continue
-		}
-		segments, derived := i.springDataMethodSegmentsLocked(file, method)
-		if !derived {
-			continue
-		}
-		for _, segment := range segments {
-			if segment.valid || segment.start < 0 || segment.end <= segment.start {
-				continue
-			}
-			name := document.Text[segment.start:segment.end]
-			result = append(result, protocol.Diagnostic{
-				Range:    document.Range(segment.start, segment.end),
-				Severity: 1,
-				Code:     "spring-data-invalid-property",
-				Source:   "kotlsp",
-				Message:  "Cannot resolve property '" + lowerFirst(name) + "' for Spring Data repository query",
-				Data:     map[string]any{"name": lowerFirst(name), "kind": "springDataProperty"},
-			})
-		}
-	}
-	return result
-}
-
 func (i *Index) springDataMethodSegmentsLocked(file *analysis.ParsedFile, method analysis.Symbol) ([]springDataPropertySegment, bool) {
 	container := i.symbols[method.ContainerID]
 	if container == nil || !analysis.IsTypeKind(container.Kind) || i.springDataMethodHasExplicitQueryLocked(file, method) {
 		return nil, false
 	}
-	domainType, repository := i.springDataRepositoryDomainLocked(file, *container)
-	if !repository || domainType == "" {
-		return nil, false
-	}
 	name := method.Name
 	by := springDataSubjectEnd(name)
 	if by < 0 {
+		return nil, false
+	}
+	domainType, repository := i.springDataRepositoryDomainLocked(file, *container)
+	if !repository || domainType == "" {
 		return nil, false
 	}
 	predicateStart := by + len("By")
@@ -289,24 +284,21 @@ func (i *Index) springDataRepositoryDomainLocked(file *analysis.ParsedFile, repo
 			return instantiated.arguments[0], true
 		}
 	}
-	// During incremental library publication the Spring type may not yet have a
-	// symbol.  A direct, well-known repository supertype is still authoritative.
-	for _, supertype := range repository.Supertypes {
-		base, arguments := splitInstantiatedType(supertype)
-		if springDataRepositoryType(base) && len(arguments) > 0 {
-			return arguments[0], true
-		}
-	}
 	return "", false
 }
 
 func springDataRepositoryType(name string) bool {
 	name = strings.TrimSpace(name)
-	if strings.HasPrefix(name, "org.springframework.data.") && strings.HasSuffix(name, "Repository") {
-		return true
-	}
-	switch simpleType(name) {
-	case "Repository", "CrudRepository", "ListCrudRepository", "PagingAndSortingRepository", "ListPagingAndSortingRepository", "ReactiveCrudRepository", "ReactiveSortingRepository", "RxJava3CrudRepository", "JpaRepository":
+	switch name {
+	case "org.springframework.data.repository.Repository",
+		"org.springframework.data.repository.CrudRepository",
+		"org.springframework.data.repository.ListCrudRepository",
+		"org.springframework.data.repository.PagingAndSortingRepository",
+		"org.springframework.data.repository.ListPagingAndSortingRepository",
+		"org.springframework.data.repository.reactive.ReactiveCrudRepository",
+		"org.springframework.data.repository.reactive.ReactiveSortingRepository",
+		"org.springframework.data.repository.rxjava3.RxJava3CrudRepository",
+		"org.springframework.data.jpa.repository.JpaRepository":
 		return true
 	default:
 		return false
@@ -373,7 +365,7 @@ func (i *Index) springDataPropertyLocked(file *analysis.ParsedFile, ownerType, e
 		owner, arguments := instantiated.symbol, instantiated.arguments
 		var getter *analysis.Symbol
 		for _, candidateName := range []string{propertyName, "get" + upperFirst(propertyName), "is" + upperFirst(propertyName)} {
-			for _, id := range i.byContainerMember[memberKey(owner.Name, candidateName)] {
+			for _, id := range i.byContainerMember[memberKey(owner.ID, candidateName)] {
 				member := i.symbols[id]
 				if member == nil || member.ContainerID != owner.ID || !i.accessibleLocked(file, *member, at) {
 					continue

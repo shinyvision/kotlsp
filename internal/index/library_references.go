@@ -23,7 +23,17 @@ const libraryReferenceWorkingSet = 24
 // was indexed without one. The parse happens outside the lock; the result is
 // published only if the file is still present and still bare.
 func (i *Index) ensureLibraryReferences(uri protocol.URI, document *textdoc.Document) {
+	i.ensureLibraryReferencesContext(context.Background(), uri, document)
+}
+
+func (i *Index) ensureLibraryReferencesContext(ctx context.Context, uri protocol.URI, document *textdoc.Document) {
 	if document == nil || !isArchiveURI(uri) {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	i.mu.RLock()
@@ -33,7 +43,10 @@ func (i *Index) ensureLibraryReferences(uri protocol.URI, document *textdoc.Docu
 	if !bare {
 		return
 	}
-	parsed := analysis.Parse(context.Background(), document)
+	parsed := analysis.Parse(ctx, document)
+	if ctx.Err() != nil {
+		return
+	}
 	if len(parsed.References) == 0 {
 		return
 	}
@@ -44,6 +57,7 @@ func (i *Index) ensureLibraryReferences(uri protocol.URI, document *textdoc.Docu
 		return
 	}
 	current.References = parsed.References
+	i.fileCursorSpans[uri] = buildCursorSpans(current)
 	i.libraryReferenceOrder = append(i.libraryReferenceOrder, uri)
 	for len(i.libraryReferenceOrder) > libraryReferenceWorkingSet {
 		oldest := i.libraryReferenceOrder[0]
@@ -53,6 +67,7 @@ func (i *Index) ensureLibraryReferences(uri protocol.URI, document *textdoc.Docu
 		}
 		if evicted := i.files[oldest]; evicted != nil {
 			evicted.References = nil
+			i.fileCursorSpans[oldest] = buildCursorSpans(evicted)
 		}
 	}
 }

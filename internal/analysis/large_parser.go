@@ -1,8 +1,10 @@
 package analysis
 
 import (
+	"context"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/shinyvision/kotlsp/internal/protocol"
 	textdoc "github.com/shinyvision/kotlsp/internal/text"
@@ -13,25 +15,49 @@ type largeContainer struct {
 	depth  int
 }
 
+// maxLargeFileOccurrences bounds the declarations and references the large
+// fallback publishes. Large mode starts at 8 MiB of source, which at ordinary
+// identifier density is on the order of a million occurrences; a cap far
+// below that withheld the very call sites the fallback exists to retain.
+const maxLargeFileOccurrences = 1 << 20
+
+// largeLexState carries the constructs which can cross a line boundary. The
+// large-file parser intentionally recognizes only line-oriented declarations,
+// but it must never recognize declaration-shaped prose inside a block comment
+// or text/raw string as code.
+type largeLexState struct {
+	blockDepth int
+	triple     bool
+}
+
 // parseLargeDeclarations is a bounded-memory, linear fallback for generated
 // Kotlin/Java files. It extracts every line-oriented declaration without an
 // AST timeout, preserving document symbols and name-based navigation while a
 // file is far beyond normal interactive size.
-func parseLargeDeclarations(doc *textdoc.Document, parsed *ParsedFile) {
+func parseLargeDeclarations(ctx context.Context, doc *textdoc.Document, parsed *ParsedFile) {
 	source := doc.Text
 	type lexicalResult struct {
 		references []Reference
 		tokens     []Token
+		exhausted  bool
 	}
 	lexicalDone := make(chan lexicalResult, 1)
 	go func() {
 		lexical := &ParsedFile{URI: parsed.URI, Language: parsed.Language}
-		addLargeReferences(doc, lexical)
-		lexicalDone <- lexicalResult{references: lexical.References, tokens: lexical.Tokens}
+		exhausted := addLargeReferences(ctx, doc, lexical)
+		lexicalDone <- lexicalResult{references: lexical.References, tokens: lexical.Tokens, exhausted: exhausted}
 	}()
 	containers := make([]largeContainer, 0, 8)
 	depth, lineNumber := 0, 0
+	lexical := largeLexState{}
 	for lineStart := 0; lineStart <= len(source); {
+		if ctx != nil && ctx.Err() != nil {
+			break
+		}
+		if len(parsed.Symbols) >= maxLargeFileOccurrences {
+			parsed.Diagnostics = append(parsed.Diagnostics, protocol.Diagnostic{Severity: 1, Source: "kotlsp", Code: "large-file-occurrence-limit", Message: "large-file declarations exceed the 1048576-symbol publication safety limit; remaining analysis was withheld"})
+			break
+		}
 		lineEnd := strings.IndexByte(source[lineStart:], '\n')
 		if lineEnd < 0 {
 			lineEnd = len(source)
@@ -39,16 +65,21 @@ func parseLargeDeclarations(doc *textdoc.Document, parsed *ParsedFile) {
 			lineEnd += lineStart
 		}
 		line := source[lineStart:lineEnd]
+		codeLine := maskLargeCodeLine(line, parsed.Language, &lexical)
 		trimOffset := 0
-		for trimOffset < len(line) && (line[trimOffset] == ' ' || line[trimOffset] == '\t' || line[trimOffset] == '\r') {
+		for trimOffset < len(codeLine) && (codeLine[trimOffset] == ' ' || codeLine[trimOffset] == '\t' || codeLine[trimOffset] == '\r') {
 			trimOffset++
 		}
-		trimmed := line[trimOffset:]
+		trimmed := codeLine[trimOffset:]
 		if parsed.Package == "" && strings.HasPrefix(trimmed, "package ") {
 			value := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "package "), ";"))
 			parsed.Package = value
 			parsed.PackageRange = protocol.Range{Start: protocol.Position{Line: lineNumber, Character: trimOffset}, End: protocol.Position{Line: lineNumber, Character: len(line)}}
 		} else if strings.HasPrefix(trimmed, "import ") {
+			if len(parsed.Imports) >= 100_000 {
+				parsed.Diagnostics = append(parsed.Diagnostics, protocol.Diagnostic{Severity: 1, Source: "kotlsp", Code: "large-file-import-limit", Message: "large-file imports exceed the 100000-import safety limit; remaining analysis was withheld"})
+				break
+			}
 			value := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "import "), ";"))
 			wildcard := strings.HasSuffix(value, ".*")
 			value = strings.TrimSuffix(value, ".*")
@@ -115,7 +146,7 @@ func parseLargeDeclarations(doc *textdoc.Document, parsed *ParsedFile) {
 					ScopeStartByte: callable.StartByte, ScopeEndByte: callable.EndByte, ContainerID: callable.ID, ContainerName: callable.Name, Package: parsed.Package, Type: parameter.Type})
 				parameterRegionStart = relative + len(parameter.Name)
 			}
-		} else if nameStart, nameEnd, typ, initializer, ok := largeVariableDeclaration(trimmed, parsed.Language); ok {
+		} else if nameStart, nameEnd, typ, _, ok := largeVariableDeclaration(trimmed, parsed.Language); ok {
 			absoluteNameStart := lineStart + trimOffset + nameStart
 			absoluteNameEnd := lineStart + trimOffset + nameEnd
 			name := source[absoluteNameStart:absoluteNameEnd]
@@ -135,10 +166,10 @@ func parseLargeDeclarations(doc *textdoc.Document, parsed *ParsedFile) {
 			parsed.Symbols = append(parsed.Symbols, Symbol{ID: SymbolID(doc.URI, lineStart+trimOffset, kind, name), Name: name, FQN: fqn, Kind: kind, Language: parsed.Language, URI: doc.URI,
 				Range: doc.Range(lineStart+trimOffset, lineEnd), SelectionRange: doc.Range(absoluteNameStart, absoluteNameEnd), StartByte: lineStart + trimOffset, EndByte: lineEnd,
 				NameStartByte: absoluteNameStart, NameEndByte: absoluteNameEnd, ScopeStartByte: absoluteNameEnd, ScopeEndByte: lineEnd,
-				ContainerID: containerID, ContainerName: containerName, Package: parsed.Package, Type: typ, Initializer: initializer})
+				ContainerID: containerID, ContainerName: containerName, Package: parsed.Package, Type: typ})
 		}
 
-		depth += largeBraceDelta(line)
+		depth += largeBraceDelta(codeLine)
 		for len(containers) > 0 && depth < containers[len(containers)-1].depth {
 			frame := containers[len(containers)-1]
 			containers = containers[:len(containers)-1]
@@ -168,9 +199,12 @@ func parseLargeDeclarations(doc *textdoc.Document, parsed *ParsedFile) {
 			}
 		}
 	}
-	lexical := <-lexicalDone
+	lexed := <-lexicalDone
+	if lexed.exhausted {
+		parsed.Diagnostics = append(parsed.Diagnostics, protocol.Diagnostic{Severity: 1, Source: "kotlsp", Code: "large-file-occurrence-limit", Message: "large-file references exceed the 1048576-occurrence publication safety limit; remaining analysis was withheld"})
+	}
 	declarationCursor := 0
-	for index, reference := range lexical.references {
+	for index, reference := range lexed.references {
 		for declarationCursor < len(parsed.Symbols) && parsed.Symbols[declarationCursor].NameEndByte <= reference.StartByte &&
 			!(parsed.Symbols[declarationCursor].NameStartByte == reference.StartByte && parsed.Symbols[declarationCursor].NameEndByte == reference.EndByte) {
 			declarationCursor++
@@ -182,12 +216,92 @@ func parseLargeDeclarations(doc *textdoc.Document, parsed *ParsedFile) {
 		// addLargeReferences emits exactly one token with each reference. Pair
 		// them by index instead of allocating and probing a second 60k-entry
 		// byte-range map on every large-file edit.
-		if index < len(lexical.tokens) {
-			parsed.Tokens = append(parsed.Tokens, lexical.tokens[index])
+		if index < len(lexed.tokens) {
+			parsed.Tokens = append(parsed.Tokens, lexed.tokens[index])
 		}
 	}
 	assignLargeReferenceContainers(parsed)
 	sort.SliceStable(parsed.Tokens, func(left, right int) bool { return parsed.Tokens[left].StartByte < parsed.Tokens[right].StartByte })
+}
+
+func maskLargeCodeLine(line string, language Language, state *largeLexState) string {
+	masked := []byte(line)
+	blank := func(start, end int) {
+		for index := start; index < end; index++ {
+			if masked[index] != '\t' && masked[index] != '\r' {
+				masked[index] = ' '
+			}
+		}
+	}
+	for index := 0; index < len(line); {
+		if state.blockDepth > 0 {
+			start := index
+			for index < len(line) && state.blockDepth > 0 {
+				if index+1 < len(line) && line[index] == '/' && line[index+1] == '*' && language == LanguageKotlin {
+					state.blockDepth++
+					index += 2
+					continue
+				}
+				if index+1 < len(line) && line[index] == '*' && line[index+1] == '/' {
+					state.blockDepth--
+					index += 2
+					continue
+				}
+				index++
+			}
+			blank(start, index)
+			continue
+		}
+		if state.triple {
+			start := index
+			if end := strings.Index(line[index:], "\"\"\""); end >= 0 {
+				index += end + 3
+				state.triple = false
+			} else {
+				index = len(line)
+			}
+			blank(start, index)
+			continue
+		}
+		if index+1 < len(line) && line[index] == '/' && line[index+1] == '/' {
+			blank(index, len(line))
+			break
+		}
+		if index+1 < len(line) && line[index] == '/' && line[index+1] == '*' {
+			start := index
+			state.blockDepth = 1
+			index += 2
+			blank(start, index)
+			continue
+		}
+		if index+2 < len(line) && line[index:index+3] == "\"\"\"" {
+			start := index
+			state.triple = true
+			index += 3
+			blank(start, index)
+			continue
+		}
+		if line[index] == '"' || line[index] == '\'' {
+			start, quote := index, line[index]
+			index++
+			escaped := false
+			for index < len(line) {
+				value := line[index]
+				index++
+				if escaped {
+					escaped = false
+				} else if value == '\\' {
+					escaped = true
+				} else if value == quote {
+					break
+				}
+			}
+			blank(start, index)
+			continue
+		}
+		index++
+	}
+	return string(masked)
 }
 
 func assignLargeReferenceContainers(parsed *ParsedFile) {
@@ -215,7 +329,7 @@ func assignLargeReferenceContainers(parsed *ParsedFile) {
 // tree parser without constructing a multi-hundred-megabyte syntax tree. It is
 // a single lexical pass and ignores comments, strings, package/import lines,
 // and declaration name spans.
-func addLargeReferences(doc *textdoc.Document, parsed *ParsedFile) {
+func addLargeReferences(ctx context.Context, doc *textdoc.Document, parsed *ParsedFile) bool {
 	source := doc.Text
 	declarations := make(map[[2]int]bool, len(parsed.Symbols))
 	for _, symbol := range parsed.Symbols {
@@ -227,6 +341,12 @@ func addLargeReferences(doc *textdoc.Document, parsed *ParsedFile) {
 	}
 	lineStart := 0
 	for index := 0; index < len(source); {
+		if index&4095 == 0 && ctx.Err() != nil {
+			return false
+		}
+		if len(parsed.References) >= maxLargeFileOccurrences {
+			return true
+		}
 		if source[index] == '\n' {
 			index++
 			lineStart = index
@@ -248,11 +368,25 @@ func addLargeReferences(doc *textdoc.Document, parsed *ParsedFile) {
 			break
 		}
 		if index+1 < len(source) && source[index] == '/' && source[index+1] == '*' {
-			if end := strings.Index(source[index+2:], "*/"); end >= 0 {
-				index += end + 4
-				continue
+			depth := 1
+			index += 2
+			for index < len(source) && depth > 0 {
+				if index&4095 == 0 && ctx.Err() != nil {
+					return false
+				}
+				if index+1 < len(source) && source[index] == '/' && source[index+1] == '*' {
+					depth++
+					index += 2
+					continue
+				}
+				if index+1 < len(source) && source[index] == '*' && source[index+1] == '/' {
+					depth--
+					index += 2
+					continue
+				}
+				index++
 			}
-			break
+			continue
 		}
 		if source[index] == '"' || source[index] == '\'' {
 			quote := source[index]
@@ -314,8 +448,13 @@ func addLargeReferences(doc *textdoc.Document, parsed *ParsedFile) {
 		var arguments []protocol.Range
 		if after < len(source) && source[after] == '(' {
 			role = RoleCall
-			arguments, after = largeCallArguments(doc, source, after)
-			arity = len(arguments)
+			var complete bool
+			arguments, after, complete = largeCallArguments(ctx, doc, source, after)
+			if complete {
+				arity = len(arguments)
+			} else {
+				arguments = nil
+			}
 		} else if name[0] >= 'A' && name[0] <= 'Z' {
 			role = RoleType
 		}
@@ -330,29 +469,98 @@ func addLargeReferences(doc *textdoc.Document, parsed *ParsedFile) {
 			return 8
 		}()})
 	}
+	return false
 }
 
 func isLargeIdentifierStart(value byte) bool {
 	return value == '_' || value == '$' || value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z'
 }
 
-func largeCallArguments(doc *textdoc.Document, source string, open int) ([]protocol.Range, int) {
-	depth, start := 1, open+1
+func largeCallArguments(ctx context.Context, doc *textdoc.Document, source string, open int) ([]protocol.Range, int, bool) {
+	parenDepth, bracketDepth, braceDepth, start := 1, 0, 0, open+1
 	var arguments []protocol.Range
 	for index := open + 1; index < len(source); index++ {
+		if index&4095 == 0 && ctx.Err() != nil {
+			return nil, open + 1, false
+		}
+		if index+1 < len(source) && source[index] == '/' && source[index+1] == '/' {
+			if newline := strings.IndexByte(source[index+2:], '\n'); newline >= 0 {
+				index += newline + 1
+				continue
+			}
+			return arguments, open + 1, false
+		}
+		if index+1 < len(source) && source[index] == '/' && source[index+1] == '*' {
+			depth := 1
+			index++
+			for index++; index < len(source) && depth > 0; index++ {
+				if index+1 < len(source) && source[index] == '/' && source[index+1] == '*' {
+					depth++
+					index++
+				} else if index+1 < len(source) && source[index] == '*' && source[index+1] == '/' {
+					depth--
+					index++
+				}
+			}
+			if depth > 0 {
+				return arguments, open + 1, false
+			}
+			index--
+			continue
+		}
+		if source[index] == '"' || source[index] == '\'' {
+			quote := source[index]
+			if quote == '"' && index+2 < len(source) && source[index:index+3] == "\"\"\"" {
+				if end := strings.Index(source[index+3:], "\"\"\""); end >= 0 {
+					index += end + 5
+					continue
+				}
+				return arguments, open + 1, false
+			}
+			escaped := false
+			for index++; index < len(source); index++ {
+				value := source[index]
+				if escaped {
+					escaped = false
+				} else if value == '\\' {
+					escaped = true
+				} else if value == quote {
+					break
+				}
+			}
+			if index >= len(source) {
+				return arguments, open + 1, false
+			}
+			continue
+		}
 		switch source[index] {
 		case '(':
-			depth++
+			parenDepth++
 		case ')':
-			depth--
-			if depth == 0 {
+			parenDepth--
+			if parenDepth == 0 {
 				if valueStart, valueEnd := trimByteRange(source, start, index); valueEnd > valueStart {
 					arguments = append(arguments, doc.Range(valueStart, valueEnd))
 				}
-				return arguments, index + 1
+				return arguments, index + 1, true
+			}
+		case '[':
+			bracketDepth++
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case '{':
+			braceDepth++
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
 			}
 		case ',':
-			if depth == 1 {
+			if parenDepth == 1 && bracketDepth == 0 && braceDepth == 0 {
+				if len(arguments) >= 4096 {
+					return nil, open + 1, false
+				}
 				if valueStart, valueEnd := trimByteRange(source, start, index); valueEnd > valueStart {
 					arguments = append(arguments, doc.Range(valueStart, valueEnd))
 				}
@@ -360,7 +568,7 @@ func largeCallArguments(doc *textdoc.Document, source string, open int) ([]proto
 			}
 		}
 	}
-	return arguments, open + 1
+	return arguments, open + 1, false
 }
 
 func trimByteRange(source string, start, end int) (int, int) {
@@ -431,13 +639,40 @@ func largeCallableDeclaration(line string, language Language, container string) 
 		if nameStart == 0 {
 			return 0, 0, nil, "", false
 		}
+		head := strings.TrimSpace(line[:nameStart])
+		// Large mode deliberately prefers a missed complex declaration over an
+		// invented one. Calls such as service.run(value), return run(value), and
+		// result = run(value) used to look like methods because they contain the
+		// same identifier/parenthesis surface. A Java declaration must have a
+		// type-or-constructor head, never an expression operator or statement
+		// keyword immediately before the candidate name.
+		if strings.ContainsAny(head, ".=+*/%!?:|&") {
+			return 0, 0, nil, "", false
+		}
+		headFields := strings.Fields(head)
+		if len(headFields) == 0 {
+			return 0, 0, nil, "", false
+		}
+		lastHead := headFields[len(headFields)-1]
+		if name != container {
+			switch lastHead {
+			case "return", "throw", "new", "case", "yield", "assert", "else", "do":
+				return 0, 0, nil, "", false
+			}
+			if !largeJavaTypeHead(lastHead) {
+				return 0, 0, nil, "", false
+			}
+		}
 	}
 	close := strings.IndexByte(line[open+1:], ')')
 	if close < 0 {
 		return 0, 0, nil, "", false
 	}
 	close += open + 1
-	parameters := largeParameters(line[open+1:close], language)
+	parameters, parametersOK := largeParameters(line[open+1:close], language)
+	if !parametersOK {
+		return 0, 0, nil, "", false
+	}
 	returnType := ""
 	if language == LanguageKotlin {
 		tail := strings.TrimSpace(line[close+1:])
@@ -456,6 +691,28 @@ func largeCallableDeclaration(line string, language Language, container string) 
 		}
 	}
 	return nameStart, nameEnd, parameters, returnType, true
+}
+
+func largeJavaTypeHead(value string) bool {
+	value = strings.TrimSpace(value)
+	for strings.HasSuffix(value, "[]") {
+		value = strings.TrimSuffix(value, "[]")
+	}
+	if value == "" || value == "void" {
+		return value == "void"
+	}
+	for index, r := range value {
+		if index == 0 {
+			if r != '_' && r != '$' && !unicode.IsLetter(r) {
+				return false
+			}
+			continue
+		}
+		if r != '_' && r != '$' && r != '.' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
 }
 
 func largeVariableDeclaration(line string, language Language) (nameStart, nameEnd int, typ, initializer string, ok bool) {
@@ -509,14 +766,23 @@ func largeVariableDeclaration(line string, language Language) (nameStart, nameEn
 	return nameStart, nameEnd, typ, initializer, true
 }
 
-func largeParameters(value string, language Language) []Parameter {
+func largeParameters(value string, language Language) ([]Parameter, bool) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return []Parameter{}
+		return []Parameter{}, true
 	}
-	parts := strings.Split(value, ",")
-	parameters := make([]Parameter, 0, len(parts))
-	for _, part := range parts {
+	parameters := make([]Parameter, 0, 8)
+	for start, parts := 0, 0; start <= len(value); parts++ {
+		if parts >= 4096 || len(parameters) >= 4096 {
+			return nil, false
+		}
+		end := strings.IndexByte(value[start:], ',')
+		if end < 0 {
+			end = len(value)
+		} else {
+			end += start
+		}
+		part := value[start:end]
 		part = strings.TrimSpace(part)
 		if language == LanguageKotlin {
 			name, typ, ok := strings.Cut(part, ":")
@@ -534,8 +800,12 @@ func largeParameters(value string, language Language) []Parameter {
 				parameters = append(parameters, Parameter{Name: fields[len(fields)-1], Type: strings.ReplaceAll(typeName, "...", ""), Variadic: variadic})
 			}
 		}
+		if end == len(value) {
+			break
+		}
+		start = end + 1
 	}
-	return parameters
+	return parameters, true
 }
 
 func wordIndex(value, word string) int {

@@ -15,6 +15,7 @@ import (
 	"github.com/shinyvision/kotlsp/internal/analysis"
 	"github.com/shinyvision/kotlsp/internal/index"
 	"github.com/shinyvision/kotlsp/internal/jsonrpc"
+	"github.com/shinyvision/kotlsp/internal/lexical"
 	"github.com/shinyvision/kotlsp/internal/protocol"
 	textdoc "github.com/shinyvision/kotlsp/internal/text"
 	uriutil "github.com/shinyvision/kotlsp/internal/uri"
@@ -28,7 +29,7 @@ func (s *Server) formatting(ctx context.Context, raw json.RawMessage) (any, *jso
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	doc, ok := s.index.Document(p.TextDocument.URI)
+	doc, ok := s.index.DocumentContext(ctx, p.TextDocument.URI)
 	if !ok {
 		return []protocol.TextEdit{}, nil
 	}
@@ -51,7 +52,7 @@ func (s *Server) rangeFormatting(ctx context.Context, raw json.RawMessage) (any,
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	doc, ok := s.index.Document(p.TextDocument.URI)
+	doc, ok := s.index.DocumentContext(ctx, p.TextDocument.URI)
 	if !ok {
 		return []protocol.TextEdit{}, nil
 	}
@@ -80,12 +81,21 @@ func (s *Server) rangeFormatting(ctx context.Context, raw json.RawMessage) (any,
 		originalEnd = originalStarts[endExclusive]
 	}
 	kotlin := strings.HasSuffix(strings.ToLower(string(p.TextDocument.URI)), ".kt") || strings.HasSuffix(strings.ToLower(string(p.TextDocument.URI)), ".kts")
-	segment := doc.Text[originalStart:originalEnd]
-	newText, completed := formatSourceContext(ctx, segment, p.Options, kotlin)
+	if rangeTouchesProtectedLexicalRegion(doc.Text, originalStart, originalEnd, kotlin) {
+		return []protocol.TextEdit{}, nil
+	}
+	depth, lexicalState, completed := formatterContextBeforeContext(ctx, doc.Text[:originalStart], kotlin)
 	if !completed {
 		return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestCanceled, Message: "request cancelled"}
 	}
-	depth, completed := formatterDepthBeforeContext(ctx, doc.Text[:originalStart])
+	// A line range beginning inside literal/comment content cannot be formatted
+	// independently. Returning no edit is safer than treating that content as
+	// code; a later AST formatter can expand to the enclosing construct.
+	if lexicalState.Triple || lexicalState.BlockCommentDepth > 0 {
+		return []protocol.TextEdit{}, nil
+	}
+	segment := doc.Text[originalStart:originalEnd]
+	newText, completed := formatSourceContext(ctx, segment, p.Options, kotlin)
 	if !completed {
 		return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestCanceled, Message: "request cancelled"}
 	}
@@ -93,7 +103,31 @@ func (s *Server) rangeFormatting(ctx context.Context, raw json.RawMessage) (any,
 	if segment == newText {
 		return []protocol.TextEdit{}, nil
 	}
+	language := analysis.LanguageJava
+	if kotlin {
+		language = analysis.LanguageKotlin
+	}
+	before, beforeOK := analysis.SyntaxFingerprint(ctx, doc.Text, language)
+	updated := doc.Text[:originalStart] + newText + doc.Text[originalEnd:]
+	after, afterOK := analysis.SyntaxFingerprint(ctx, updated, language)
+	if !beforeOK || !afterOK || before != after {
+		return []protocol.TextEdit{}, nil
+	}
 	return []protocol.TextEdit{{Range: doc.Range(originalStart, originalEnd), NewText: newText}}, nil
+}
+
+func rangeTouchesProtectedLexicalRegion(source string, start, end int, kotlin bool) bool {
+	touches := false
+	complete := lexical.ScanRegionsBounded(source, kotlin, 100_000, func(region lexical.Region) {
+		if touches || region.Kind == lexical.Code {
+			return
+		}
+		if region.OuterStart < end && start < region.OuterEnd {
+			touches = true
+		}
+	})
+	// An incomplete lexical model cannot prove that the selection is code.
+	return !complete || touches
 }
 
 func formatterDepthBefore(source string) int {
@@ -102,19 +136,24 @@ func formatterDepthBefore(source string) int {
 }
 
 func formatterDepthBeforeContext(ctx context.Context, source string) (int, bool) {
+	depth, _, completed := formatterContextBeforeContext(ctx, source, true)
+	return depth, completed
+}
+
+func formatterContextBeforeContext(ctx context.Context, source string, kotlin bool) (int, formatLexState, bool) {
 	depth := 0
 	state := formatLexState{}
 	for index, line := range strings.Split(source, "\n") {
 		if index&127 == 0 && ctx.Err() != nil {
-			return 0, false
+			return 0, formatLexState{}, false
 		}
-		opens, closes, _ := scanStructure(line, &state)
+		opens, closes, _ := scanStructureLanguage(line, &state, kotlin)
 		depth += opens - closes
 		if depth < 0 {
 			depth = 0
 		}
 	}
-	return depth, ctx.Err() == nil
+	return depth, state, ctx.Err() == nil
 }
 
 func indentFormattedRange(formatted string, depth int, opts protocol.FormattingOptions) string {
@@ -148,7 +187,8 @@ func sourceLineStarts(source string) []int {
 	return starts
 }
 
-func (s *Server) codeActions(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) codeActions(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
+	ctx := operationContext(contexts)
 	var p struct {
 		TextDocument protocol.TextDocumentIdentifier `json:"textDocument"`
 		Range        protocol.Range                  `json:"range"`
@@ -160,9 +200,12 @@ func (s *Server) codeActions(raw json.RawMessage) (any, *jsonrpc.ResponseError) 
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	doc, ok := s.index.Document(p.TextDocument.URI)
+	doc, ok := s.index.DocumentContext(ctx, p.TextDocument.URI)
 	if !ok {
 		return []protocol.CodeAction{}, nil
+	}
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
 	}
 	actions := make([]protocol.CodeAction, 0, 8)
 	if edit, ok := organizeImports(doc.Text, doc.Range(0, len(doc.Text)), p.TextDocument.URI, s.index.UsedImports(p.TextDocument.URI)); ok {
@@ -170,7 +213,7 @@ func (s *Server) codeActions(raw json.RawMessage) (any, *jsonrpc.ResponseError) 
 	}
 	selected := doc.Slice(p.Range)
 	if strings.TrimSpace(selected) != "" {
-		for _, action := range s.extractActions(p.TextDocument.URI, p.Range, doc, selected) {
+		for _, action := range s.extractActions(p.TextDocument.URI, p.Range, doc, selected, ctx) {
 			// OpenKotlin's extract providers deliberately use commands rather than
 			// embedding edits.  The second argument is its sealed Payload.Data
 			// DTO; keeping that wire shape matters to clients which persist or
@@ -186,14 +229,20 @@ func (s *Server) codeActions(raw json.RawMessage) (any, *jsonrpc.ResponseError) 
 			actions = append(actions, action)
 		}
 	}
-	if action, ok := s.inlineVariableAction(p.TextDocument.URI, p.Range, doc); ok {
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
+	}
+	if action, ok := s.inlineVariableAction(p.TextDocument.URI, p.Range, doc, ctx); ok {
 		actions = append(actions, action)
 	}
 	for _, diagnostic := range p.Context.Diagnostics {
+		if responseErr := canceledResponse(ctx); responseErr != nil {
+			return nil, responseErr
+		}
 		if action, ok := diagnosticQuickFix(p.TextDocument.URI, doc.Text, diagnostic); ok {
 			actions = append(actions, action)
 		}
-		if action, ok := s.createJavaMethodQuickFix(p.TextDocument.URI, doc, diagnostic); ok {
+		if action, ok := s.createJavaMethodQuickFixContext(ctx, p.TextDocument.URI, doc, diagnostic); ok {
 			actions = append(actions, action)
 		}
 		candidates := diagnosticCandidates(diagnostic)
@@ -241,6 +290,10 @@ func (s *Server) codeActions(raw json.RawMessage) (any, *jsonrpc.ResponseError) 
 }
 
 func (s *Server) createJavaMethodQuickFix(uri protocol.URI, doc *textdoc.Document, diagnostic protocol.Diagnostic) (protocol.CodeAction, bool) {
+	return s.createJavaMethodQuickFixContext(context.Background(), uri, doc, diagnostic)
+}
+
+func (s *Server) createJavaMethodQuickFixContext(ctx context.Context, uri protocol.URI, doc *textdoc.Document, diagnostic protocol.Diagnostic) (protocol.CodeAction, bool) {
 	if !strings.HasSuffix(strings.ToLower(string(uri)), ".java") {
 		return protocol.CodeAction{}, false
 	}
@@ -269,10 +322,33 @@ func (s *Server) createJavaMethodQuickFix(uri protocol.URI, doc *textdoc.Documen
 	if close < 0 {
 		return protocol.CodeAction{}, false
 	}
+	// Code-action diagnostics can be stale (and compiler diagnostics may not
+	// be mirrored in the index yet). The current parse is the authority:
+	// require exactly one unqualified call reference at the diagnostic's name
+	// that still resolves to nothing before an edit is fabricated.
+	file, parsed := s.index.Parsed(uri)
+	if !parsed {
+		return protocol.CodeAction{}, false
+	}
+	matchingReferences := 0
+	for _, reference := range file.References {
+		if reference.Role == analysis.RoleCall && reference.Name == name && reference.StartByte == nameStart && reference.EndByte == nameEnd && (reference.Qualifier == "" || reference.Qualifier == "this") {
+			matchingReferences++
+		}
+	}
+	if matchingReferences != 1 || len(s.index.DefinitionsContext(ctx, uri, doc.Position(nameStart))) != 0 || ctx.Err() != nil {
+		return protocol.CodeAction{}, false
+	}
 
 	symbols := s.index.SymbolsInFile(uri)
 	owner, ok := innermostJavaType(symbols, nameStart)
-	if !ok {
+	if !ok || owner.Kind == analysis.KindInterface || owner.Kind == analysis.KindAnnotation {
+		return protocol.CodeAction{}, false
+	}
+	// Creating a member on a textually guessed receiver can put it in the
+	// wrong class. This implementation is intentionally limited to an
+	// unqualified invocation (or explicit this) in the enclosing type.
+	if receiver := javaCallReceiver(source, nameStart); receiver != "" && receiver != "this" {
 		return protocol.CodeAction{}, false
 	}
 	insert := owner.EndByte
@@ -286,12 +362,18 @@ func (s *Server) createJavaMethodQuickFix(uri protocol.URI, doc *textdoc.Documen
 	}
 	callable, inCallable := innermostJavaCallable(symbols, nameStart)
 	static := inCallable && hasModifier(callable, "static")
-	returnType := inferredJavaCreatedReturnType(source, nameStart, close, callable, inCallable, symbols, s.index, uri)
+	returnType, returnKnown := inferredJavaCreatedReturnType(source, nameStart, close, callable, inCallable, symbols, s.index, uri)
+	if !returnKnown {
+		return protocol.CodeAction{}, false
+	}
 	arguments := splitJavaCallArguments(source[open+1 : close])
 	parameters := make([]string, 0, len(arguments))
 	usedNames := make(map[string]bool, len(arguments))
 	for argumentIndex, argument := range arguments {
-		typ, parameterName := inferredJavaCreatedParameter(argument, nameStart, symbols, s.index, uri)
+		typ, parameterName, known := inferredJavaCreatedParameter(argument, nameStart, symbols, s.index, uri)
+		if !known {
+			return protocol.CodeAction{}, false
+		}
 		if parameterName == "" || javaKeyword(parameterName) {
 			parameterName = "value"
 		}
@@ -310,11 +392,6 @@ func (s *Server) createJavaMethodQuickFix(uri protocol.URI, doc *textdoc.Documen
 	methodIndent := closingIndent + "    "
 	visibility := "private "
 	body := " {\n" + methodIndent + "    throw new UnsupportedOperationException(\"TODO\");\n" + methodIndent + "}"
-	if owner.Kind == analysis.KindInterface || owner.Kind == analysis.KindAnnotation {
-		visibility = ""
-		static = false
-		body = ";"
-	}
 	staticText := ""
 	if static {
 		staticText = "static "
@@ -328,6 +405,22 @@ func (s *Server) createJavaMethodQuickFix(uri protocol.URI, doc *textdoc.Documen
 		IsPreferred: true,
 		Edit:        &protocol.WorkspaceEdit{Changes: map[protocol.URI][]protocol.TextEdit{uri: {edit}}},
 	}, true
+}
+
+func javaCallReceiver(source string, nameStart int) string {
+	at := nameStart - 1
+	for at >= 0 && unicode.IsSpace(rune(source[at])) {
+		at--
+	}
+	if at < 0 || source[at] != '.' {
+		return ""
+	}
+	end := at
+	at--
+	for at >= 0 && (source[at] == '_' || source[at] == '$' || source[at] >= 'a' && source[at] <= 'z' || source[at] >= 'A' && source[at] <= 'Z' || source[at] >= '0' && source[at] <= '9') {
+		at--
+	}
+	return source[at+1 : end]
 }
 
 func javaIdentifierAt(source string, offset int) (int, int) {
@@ -410,113 +503,11 @@ func skipJavaSpaceAndComments(source string, offset int) int {
 }
 
 func matchingJavaDelimiter(source string, open int, opening, closing byte) int {
-	depth := 0
-	quote := byte(0)
-	escaped := false
-	lineComment, blockComment := false, false
-	for offset := open; offset < len(source); offset++ {
-		value := source[offset]
-		if lineComment {
-			if value == '\n' {
-				lineComment = false
-			}
-			continue
-		}
-		if blockComment {
-			if value == '*' && offset+1 < len(source) && source[offset+1] == '/' {
-				blockComment = false
-				offset++
-			}
-			continue
-		}
-		if quote != 0 {
-			if escaped {
-				escaped = false
-			} else if value == '\\' {
-				escaped = true
-			} else if value == quote {
-				quote = 0
-			}
-			continue
-		}
-		if value == '/' && offset+1 < len(source) {
-			if source[offset+1] == '/' {
-				lineComment = true
-				offset++
-				continue
-			}
-			if source[offset+1] == '*' {
-				blockComment = true
-				offset++
-				continue
-			}
-		}
-		if value == '\'' || value == '"' {
-			quote = value
-			continue
-		}
-		if value == opening {
-			depth++
-		} else if value == closing {
-			depth--
-			if depth == 0 {
-				return offset
-			}
-		}
-	}
-	return -1
+	return lexical.MatchingDelimiter(source, open, string(opening), string(closing), false)
 }
 
 func splitJavaCallArguments(value string) []string {
-	var result []string
-	start, parens, brackets, braces := 0, 0, 0, 0
-	quote := byte(0)
-	escaped := false
-	for offset := 0; offset <= len(value); offset++ {
-		if offset == len(value) {
-			if argument := strings.TrimSpace(value[start:]); argument != "" {
-				result = append(result, argument)
-			}
-			break
-		}
-		current := value[offset]
-		if quote != 0 {
-			if escaped {
-				escaped = false
-			} else if current == '\\' {
-				escaped = true
-			} else if current == quote {
-				quote = 0
-			}
-			continue
-		}
-		if current == '\'' || current == '"' {
-			quote = current
-			continue
-		}
-		switch current {
-		case '(':
-			parens++
-		case ')':
-			parens--
-		case '[':
-			brackets++
-		case ']':
-			brackets--
-		case '{':
-			braces++
-		case '}':
-			braces--
-		case ',':
-			if parens == 0 && brackets == 0 && braces == 0 {
-				if argument := strings.TrimSpace(value[start:offset]); argument != "" {
-					result = append(result, argument)
-				}
-				start = offset + 1
-			}
-		}
-	}
-	return result
+	return lexical.SplitTopLevel(value, ",", false)
 }
 
 func innermostJavaType(symbols []analysis.Symbol, at int) (analysis.Symbol, bool) {
@@ -547,19 +538,22 @@ func innermostJavaCallable(symbols []analysis.Symbol, at int) (analysis.Symbol, 
 	return best, found
 }
 
-func inferredJavaCreatedReturnType(source string, callStart, callEnd int, callable analysis.Symbol, inCallable bool, symbols []analysis.Symbol, idx *index.Index, uri protocol.URI) string {
+func inferredJavaCreatedReturnType(source string, callStart, callEnd int, callable analysis.Symbol, inCallable bool, symbols []analysis.Symbol, idx *index.Index, uri protocol.URI) (string, bool) {
 	statementStart := strings.LastIndexAny(source[:callStart], ";{}") + 1
 	prefix := strings.TrimSpace(source[statementStart:callStart])
 	after := skipJavaSpaceAndComments(source, callEnd+1)
 	if prefix == "" && after < len(source) && source[after] == ';' {
-		return "void"
+		return "void", true
 	}
 	if strings.HasSuffix(prefix, "return") && inCallable && callable.Type != "" {
-		return callable.Type
+		return callable.Type, true
 	}
 	declaration := regexp.MustCompile(`(?s)([A-Za-z_$][A-Za-z0-9_$.<>?\[\], ]*)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*$`)
 	if match := declaration.FindStringSubmatch(prefix); len(match) == 2 {
-		return strings.TrimSpace(match[1])
+		typ := strings.TrimSpace(match[1])
+		if typ != "var" {
+			return typ, true
+		}
 	}
 	if equals := strings.LastIndex(prefix, "="); equals >= 0 {
 		name := strings.TrimSpace(prefix[:equals])
@@ -567,48 +561,48 @@ func inferredJavaCreatedReturnType(source string, callStart, callEnd int, callab
 			name = name[at+1:]
 		}
 		if typ := javaSymbolType(name, callStart, symbols, idx, uri); typ != "" {
-			return typ
+			return typ, true
 		}
 	}
-	return "Object"
+	return "", false
 }
 
-func inferredJavaCreatedParameter(argument string, at int, symbols []analysis.Symbol, idx *index.Index, uri protocol.URI) (string, string) {
+func inferredJavaCreatedParameter(argument string, at int, symbols []analysis.Symbol, idx *index.Index, uri protocol.URI) (string, string, bool) {
 	argument = strings.TrimSpace(argument)
 	if argument == "true" || argument == "false" {
-		return "boolean", "value"
+		return "boolean", "value", true
 	}
 	if argument == "null" {
-		return "Object", "value"
+		return "", "", false
 	}
 	if strings.HasPrefix(argument, "\"") {
-		return "String", "value"
+		return "String", "value", true
 	}
 	if strings.HasPrefix(argument, "'") {
-		return "char", "value"
+		return "char", "value", true
 	}
 	if regexp.MustCompile(`^[+-]?(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|[0-9][0-9_]*)[lL]$`).MatchString(argument) {
-		return "long", "value"
+		return "long", "value", true
 	}
 	if regexp.MustCompile(`^[+-]?(?:[0-9][0-9_]*\.[0-9_]*|\.[0-9][0-9_]*|[0-9][0-9_]*[eE][+-]?[0-9_]+)[fF]$`).MatchString(argument) {
-		return "float", "value"
+		return "float", "value", true
 	}
 	if regexp.MustCompile(`^[+-]?(?:[0-9][0-9_]*\.[0-9_]*|\.[0-9][0-9_]*|[0-9][0-9_]*[eE][+-]?[0-9_]+)[dD]?$`).MatchString(argument) {
-		return "double", "value"
+		return "double", "value", true
 	}
 	if regexp.MustCompile(`^[+-]?(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|[0-9][0-9_]*)$`).MatchString(argument) {
-		return "int", "value"
+		return "int", "value", true
 	}
 	if match := regexp.MustCompile(`^new\s+([A-Za-z_$][A-Za-z0-9_$.<>?\[\]]*)`).FindStringSubmatch(argument); len(match) == 2 {
-		return match[1], "value"
+		return match[1], "value", true
 	}
 	if match := regexp.MustCompile(`^([A-Za-z_$][A-Za-z0-9_$]*)$`).FindStringSubmatch(argument); len(match) == 2 {
 		if typ := javaSymbolType(match[1], at, symbols, idx, uri); typ != "" {
-			return typ, match[1]
+			return typ, match[1], true
 		}
-		return "Object", match[1]
+		return "", match[1], false
 	}
-	return "Object", "value"
+	return "", "value", false
 }
 
 func javaSymbolType(name string, at int, symbols []analysis.Symbol, idx *index.Index, uri protocol.URI) string {
@@ -718,7 +712,7 @@ func utf16Len(text string) int {
 	return n
 }
 
-func (s *Server) codeLens(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) codeLens(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p struct {
 		TextDocument protocol.TextDocumentIdentifier `json:"textDocument"`
 	}
@@ -728,9 +722,15 @@ func (s *Server) codeLens(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	if !s.runMainCodeLens.Load() {
 		return []protocol.CodeLens{}, nil
 	}
+	ctx := operationContext(contexts)
 	symbols := s.index.SymbolsInFile(p.TextDocument.URI)
 	out := make([]protocol.CodeLens, 0)
-	for _, sym := range symbols {
+	for index, sym := range symbols {
+		if index&255 == 0 {
+			if responseErr := canceledResponse(ctx); responseErr != nil {
+				return nil, responseErr
+			}
+		}
 		if !s.isRunnableMain(sym) {
 			continue
 		}
@@ -876,7 +876,8 @@ func sanitizeJVMIdentifier(value string) string {
 	return out.String()
 }
 
-func (s *Server) inlayHints(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) inlayHints(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
+	ctx := operationContext(contexts)
 	var p struct {
 		TextDocument protocol.TextDocumentIdentifier `json:"textDocument"`
 		Range        protocol.Range                  `json:"range"`
@@ -884,7 +885,7 @@ func (s *Server) inlayHints(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	doc, ok := s.index.Document(p.TextDocument.URI)
+	_, ok := s.index.DocumentContext(ctx, p.TextDocument.URI)
 	if !ok {
 		return []protocol.InlayHint{}, nil
 	}
@@ -894,6 +895,9 @@ func (s *Server) inlayHints(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	}
 	out := make([]protocol.InlayHint, 0)
 	for _, sym := range file.Symbols {
+		if responseErr := canceledResponse(ctx); responseErr != nil {
+			return nil, responseErr
+		}
 		if sym.Type != "" && sym.Type != "var" || sym.Kind != analysis.KindVariable && sym.Kind != analysis.KindProperty {
 			continue
 		}
@@ -901,27 +905,30 @@ func (s *Server) inlayHints(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 			continue
 		}
 		value := s.index.InferredType(p.TextDocument.URI, sym.ID)
-		if value == "" {
-			value = inferInitializerType(doc.Text, sym.EndByte)
-		}
 		if value != "" {
 			out = append(out, protocol.InlayHint{Position: sym.SelectionRange.End, Label: ": " + value, Kind: 1, PaddingLeft: false, PaddingRight: true, Data: map[string]string{"symbolId": sym.ID}})
 		}
 	}
-	for _, parameter := range s.index.ParameterHints(p.TextDocument.URI, p.Range) {
+	for _, parameter := range s.index.ParameterHintsContext(ctx, p.TextDocument.URI, p.Range) {
 		out = append(out, protocol.InlayHint{
 			Position: parameter.Position, Label: parameter.Label, Kind: 2, PaddingRight: true,
 			Data: map[string]any{"symbolId": parameter.Callable.ID, "parameter": parameter.ParameterIndex},
 		})
 	}
 	if file.Language == analysis.LanguageJava {
-		out = append(out, javaLambdaParameterHints(s.index, p.TextDocument.URI, doc, p.Range)...)
+		for _, parameter := range s.index.JavaLambdaParameterHintsContext(ctx, p.TextDocument.URI, p.Range) {
+			out = append(out, protocol.InlayHint{Position: parameter.Position, Label: parameter.Label, Kind: 1, PaddingRight: true,
+				Data: map[string]any{"symbolId": parameter.Callable.ID, "javaLambdaParameter": parameter.ParameterIndex}})
+		}
 		for _, reference := range file.References {
+			if responseErr := canceledResponse(ctx); responseErr != nil {
+				return nil, responseErr
+			}
 			if reference.Role != analysis.RoleCall || reference.Qualifier == "" || !strings.Contains(reference.Qualifier, "\n") || before(reference.Range.End, p.Range.Start) || before(p.Range.End, reference.Range.Start) {
 				continue
 			}
-			definitions := s.index.Definitions(p.TextDocument.URI, reference.Range.Start)
-			if len(definitions) > 0 && definitions[0].Type != "" && definitions[0].Type != "void" {
+			definitions := s.index.DefinitionsContext(ctx, p.TextDocument.URI, reference.Range.Start)
+			if len(definitions) == 1 && definitions[0].Type != "" && definitions[0].Type != "void" {
 				out = append(out, protocol.InlayHint{Position: reference.Range.End, Label: ": " + definitions[0].Type, Kind: 1, PaddingLeft: true, Data: map[string]any{"symbolId": definitions[0].ID, "methodChain": true}})
 			}
 		}
@@ -930,93 +937,8 @@ func (s *Server) inlayHints(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	return out, nil
 }
 
-var javaLambdaAssignmentPattern = regexp.MustCompile(`(?m)(?:^|[;{}]\s*)(?:final\s+)?([A-Za-z_$][A-Za-z0-9_$.,<>?\[\] ]*)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*(\([^\n)]*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*->`)
-
-func javaLambdaParameterHints(idx *index.Index, uri protocol.URI, doc *textdoc.Document, requested protocol.Range) []protocol.InlayHint {
-	var out []protocol.InlayHint
-	for _, match := range javaLambdaAssignmentPattern.FindAllStringSubmatchIndex(doc.Text, -1) {
-		if len(match) < 6 {
-			continue
-		}
-		target := strings.TrimSpace(doc.Text[match[2]:match[3]])
-		lambdaText := strings.TrimSpace(doc.Text[match[4]:match[5]])
-		parameterTypes := javaFunctionalParameterTypes(idx, uri, target)
-		if len(parameterTypes) == 0 {
-			continue
-		}
-		body := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(lambdaText, "("), ")"))
-		names := splitCommaTypes(body)
-		if len(names) != len(parameterTypes) {
-			continue
-		}
-		search := match[4]
-		for index, name := range names {
-			name = strings.TrimSpace(name)
-			if name == "" || strings.ContainsAny(name, " \t") {
-				continue // explicitly typed lambda parameter
-			}
-			relative := strings.Index(doc.Text[search:match[5]], name)
-			if relative < 0 {
-				continue
-			}
-			start := search + relative
-			position := doc.Position(start + len(name))
-			search = start + len(name)
-			if before(position, requested.Start) || before(requested.End, doc.Position(start)) {
-				continue
-			}
-			out = append(out, protocol.InlayHint{Position: position, Label: ": " + parameterTypes[index], Kind: 1, PaddingRight: true, Data: map[string]any{"javaLambdaParameter": index}})
-		}
-	}
-	return out
-}
-
-func javaFunctionalParameterTypes(idx *index.Index, uri protocol.URI, target string) []string {
-	base, arguments := target, []string(nil)
-	if open := strings.IndexByte(target, '<'); open >= 0 && strings.HasSuffix(strings.TrimSpace(target), ">") {
-		base = strings.TrimSpace(target[:open])
-		arguments = splitCommaTypes(strings.TrimSpace(target)[open+1 : len(strings.TrimSpace(target))-1])
-	}
-	if dot := strings.LastIndexByte(base, '.'); dot >= 0 {
-		base = base[dot+1:]
-	}
-	switch base {
-	case "Function", "Consumer", "Predicate", "UnaryOperator":
-		if len(arguments) >= 1 {
-			return arguments[:1]
-		}
-	case "BiFunction", "BiConsumer", "BiPredicate", "BinaryOperator":
-		if len(arguments) >= 2 {
-			return arguments[:2]
-		}
-	case "Comparator":
-		if len(arguments) >= 1 {
-			return []string{arguments[0], arguments[0]}
-		}
-	}
-	return idx.FunctionalParameterTypes(uri, target)
-}
-
 func splitCommaTypes(value string) []string {
-	if strings.TrimSpace(value) == "" {
-		return nil
-	}
-	depth, start := 0, 0
-	var out []string
-	for index := 0; index <= len(value); index++ {
-		if index == len(value) || value[index] == ',' && depth == 0 {
-			out = append(out, strings.TrimSpace(value[start:index]))
-			start = index + 1
-			continue
-		}
-		switch value[index] {
-		case '<', '(', '[':
-			depth++
-		case '>', ')', ']':
-			depth--
-		}
-	}
-	return out
+	return lexical.SplitTopLevelTypes(value, ",", true)
 }
 
 func (s *Server) resolveInlayHint(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
@@ -1039,12 +961,13 @@ func (s *Server) resolveInlayHint(raw json.RawMessage) (any, *jsonrpc.ResponseEr
 	return hint, nil
 }
 
-func (s *Server) signatureHelp(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) signatureHelp(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
+	ctx := operationContext(contexts)
 	var p protocol.TextDocumentPositionParams
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	doc, ok := s.index.Document(p.TextDocument.URI)
+	doc, ok := s.index.DocumentContext(ctx, p.TextDocument.URI)
 	if !ok {
 		return nil, nil
 	}
@@ -1053,17 +976,23 @@ func (s *Server) signatureHelp(raw json.RawMessage) (any, *jsonrpc.ResponseError
 	if name == "" {
 		return nil, nil
 	}
-	symbols, activeSignature := s.index.CallSignatures(p.TextDocument.URI, doc.Position(namePos))
+	symbols, activeSignature := s.index.CallSignaturesContext(ctx, p.TextDocument.URI, doc.Position(namePos))
 	if len(symbols) == 0 {
-		symbols = s.index.Definitions(p.TextDocument.URI, doc.Position(namePos))
+		symbols = s.index.DefinitionsContext(ctx, p.TextDocument.URI, doc.Position(namePos))
 	}
 	if len(symbols) == 0 {
-		symbols = s.index.WorkspaceSymbols(name, 0)
+		symbols = s.index.CallablesNamedContext(ctx, p.TextDocument.URI, doc.Position(namePos), name, 64)
+	}
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
 	}
 	sigs := make([]protocol.SignatureInformation, 0)
 	activeName := namedArgumentNameAt(doc.Text, namePos+len(name), offset)
 	mappedActive := false
 	for _, sym := range symbols {
+		if responseErr := canceledResponse(ctx); responseErr != nil {
+			return nil, responseErr
+		}
 		if sym.Name != name || !analysis.IsCallableKind(sym.Kind) {
 			continue
 		}
@@ -1155,29 +1084,47 @@ func kotlinJavaSignatureLabel(symbol analysis.Symbol) string {
 	return label.String()
 }
 
-func (s *Server) prepareHierarchy(raw json.RawMessage, typeHierarchy bool) (any, *jsonrpc.ResponseError) {
+func (s *Server) prepareHierarchy(raw json.RawMessage, typeHierarchy bool, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p protocol.TextDocumentPositionParams
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	sym, _, ok := s.index.SymbolAt(p.TextDocument.URI, p.Position)
+	ctx := operationContext(contexts)
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
+	}
+	sym, _, ok := s.index.SymbolAtContext(ctx, p.TextDocument.URI, p.Position)
 	if !ok {
 		return nil, nil
 	}
 	if typeHierarchy && !analysis.IsTypeKind(sym.Kind) {
-		defs := s.index.TypeDefinitions(p.TextDocument.URI, p.Position)
+		defs := s.index.TypeDefinitionsContext(ctx, p.TextDocument.URI, p.Position)
+		if responseErr := canceledResponse(ctx); responseErr != nil {
+			return nil, responseErr
+		}
 		if len(defs) == 0 {
 			return nil, nil
 		}
-		sym = defs[0]
+		items := make([]protocol.CallHierarchyItem, 0, len(defs))
+		seen := make(map[string]bool, len(defs))
+		for _, definition := range defs {
+			if analysis.IsTypeKind(definition.Kind) && !seen[definition.ID] {
+				seen[definition.ID] = true
+				items = append(items, s.hierarchyItemContext(ctx, definition))
+			}
+		}
+		if len(items) == 0 {
+			return nil, nil
+		}
+		return items, nil
 	}
 	if !typeHierarchy && !analysis.IsCallableKind(sym.Kind) && !analysis.IsTypeKind(sym.Kind) {
 		return nil, nil
 	}
-	return []protocol.CallHierarchyItem{s.hierarchyItem(sym)}, nil
+	return []protocol.CallHierarchyItem{s.hierarchyItemContext(ctx, sym)}, nil
 }
 
-func (s *Server) incomingCalls(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) incomingCalls(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p struct {
 		Item protocol.CallHierarchyItem `json:"item"`
 	}
@@ -1188,9 +1135,13 @@ func (s *Server) incomingCalls(raw json.RawMessage) (any, *jsonrpc.ResponseError
 	if !ok {
 		return []protocol.CallHierarchyIncomingCall{}, nil
 	}
-	calls := s.index.CallsTo(target)
+	ctx := operationContext(contexts)
+	calls := s.index.CallsToContext(ctx, target)
 	out := make([]protocol.CallHierarchyIncomingCall, 0, len(calls))
 	for id, refs := range calls {
+		if responseErr := canceledResponse(ctx); responseErr != nil {
+			return nil, responseErr
+		}
 		caller, ok := s.index.Symbol(id)
 		if !ok {
 			continue
@@ -1199,13 +1150,13 @@ func (s *Server) incomingCalls(raw json.RawMessage) (any, *jsonrpc.ResponseError
 		for n := range refs {
 			ranges[n] = refs[n].Range
 		}
-		out = append(out, protocol.CallHierarchyIncomingCall{From: s.hierarchyItem(caller), FromRanges: ranges})
+		out = append(out, protocol.CallHierarchyIncomingCall{From: s.hierarchyItemContext(ctx, caller), FromRanges: ranges})
 	}
 	sort.Slice(out, func(a, b int) bool { return out[a].From.Name < out[b].From.Name })
 	return out, nil
 }
 
-func (s *Server) outgoingCalls(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) outgoingCalls(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p struct {
 		Item protocol.CallHierarchyItem `json:"item"`
 	}
@@ -1216,9 +1167,13 @@ func (s *Server) outgoingCalls(raw json.RawMessage) (any, *jsonrpc.ResponseError
 	if !ok {
 		return []protocol.CallHierarchyOutgoingCall{}, nil
 	}
-	calls := s.index.CallsFrom(caller)
+	ctx := operationContext(contexts)
+	calls := s.index.CallsFromContext(ctx, caller)
 	out := make([]protocol.CallHierarchyOutgoingCall, 0, len(calls))
 	for id, refs := range calls {
+		if responseErr := canceledResponse(ctx); responseErr != nil {
+			return nil, responseErr
+		}
 		target, ok := s.index.Symbol(id)
 		if !ok {
 			continue
@@ -1227,13 +1182,13 @@ func (s *Server) outgoingCalls(raw json.RawMessage) (any, *jsonrpc.ResponseError
 		for n := range refs {
 			ranges[n] = refs[n].Range
 		}
-		out = append(out, protocol.CallHierarchyOutgoingCall{To: s.hierarchyItem(target), FromRanges: ranges})
+		out = append(out, protocol.CallHierarchyOutgoingCall{To: s.hierarchyItemContext(ctx, target), FromRanges: ranges})
 	}
 	sort.Slice(out, func(a, b int) bool { return out[a].To.Name < out[b].To.Name })
 	return out, nil
 }
 
-func (s *Server) typeHierarchy(raw json.RawMessage, supertypes bool) (any, *jsonrpc.ResponseError) {
+func (s *Server) typeHierarchy(raw json.RawMessage, supertypes bool, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p struct {
 		Item protocol.TypeHierarchyItem `json:"item"`
 	}
@@ -1245,30 +1200,49 @@ func (s *Server) typeHierarchy(raw json.RawMessage, supertypes bool) (any, *json
 		return []protocol.TypeHierarchyItem{}, nil
 	}
 	var symbols []analysis.Symbol
+	ctx := operationContext(contexts)
 	if supertypes {
-		symbols = s.index.Supertypes(sym)
+		symbols = s.index.SupertypesContext(ctx, sym)
 	} else {
-		symbols = s.index.Subtypes(sym)
+		symbols = s.index.SubtypesContext(ctx, sym)
+	}
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
 	}
 	out := make([]protocol.TypeHierarchyItem, 0, len(symbols))
 	for _, x := range symbols {
-		out = append(out, s.hierarchyItem(x))
+		out = append(out, s.hierarchyItemContext(ctx, x))
 	}
 	return out, nil
 }
 
-func (s *Server) willRenameFiles(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) willRenameFiles(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p struct {
 		Files []protocol.FileRename `json:"files"`
 	}
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
+	ctx := operationContext(contexts)
 	combined := protocol.WorkspaceEdit{Changes: make(map[protocol.URI][]protocol.TextEdit)}
 	type packageMove struct{ oldPackage, newPackage string }
 	packageMoves := make([]packageMove, 0)
 	packageMoveSeen := make(map[packageMove]bool)
 	var workspaceFiles []*analysis.ParsedFile
+	loadWorkspaceFiles := func() *jsonrpc.ResponseError {
+		if workspaceFiles != nil {
+			return nil
+		}
+		var truncated bool
+		workspaceFiles, truncated = s.index.WorkspaceFilesContext(ctx, 10_000)
+		if responseErr := canceledResponse(ctx); responseErr != nil {
+			return responseErr
+		}
+		if truncated {
+			return &jsonrpc.ResponseError{Code: jsonrpc.RequestCanceled, Message: "file-rename analysis exceeds its 10000-file safety limit"}
+		}
+		return nil
+	}
 	addPackageEdit := func(file *analysis.ParsedFile, relocatedPath string) {
 		newPackage := relocatedPackage(mustFilePath(file.URI), relocatedPath, file.Package)
 		if newPackage == file.Package {
@@ -1288,14 +1262,17 @@ func (s *Server) willRenameFiles(raw json.RawMessage) (any, *jsonrpc.ResponseErr
 		}
 	}
 	for _, f := range p.Files {
+		if responseErr := canceledResponse(ctx); responseErr != nil {
+			return nil, responseErr
+		}
 		oldPath, oldOK := uriutil.Path(f.OldURI)
 		newPath, newOK := uriutil.Path(f.NewURI)
 		if oldOK && newOK {
 			if file, exists := s.index.Parsed(f.OldURI); exists {
 				addPackageEdit(file, newPath)
 			} else {
-				if workspaceFiles == nil {
-					workspaceFiles = s.index.WorkspaceFiles()
+				if responseErr := loadWorkspaceFiles(); responseErr != nil {
+					return nil, responseErr
 				}
 				for _, file := range workspaceFiles {
 					filePath, ok := uriutil.Path(file.URI)
@@ -1314,7 +1291,7 @@ func (s *Server) willRenameFiles(raw json.RawMessage) (any, *jsonrpc.ResponseErr
 		symbols := s.index.SymbolsInFile(f.OldURI)
 		for _, sym := range symbols {
 			if sym.Name == oldBase && analysis.IsTypeKind(sym.Kind) {
-				edit := s.index.Rename(f.OldURI, sym.SelectionRange.Start, newBase)
+				edit := s.index.RenameContext(ctx, f.OldURI, sym.SelectionRange.Start, newBase)
 				for u, edits := range edit.Changes {
 					combined.Changes[u] = append(combined.Changes[u], edits...)
 				}
@@ -1322,10 +1299,17 @@ func (s *Server) willRenameFiles(raw json.RawMessage) (any, *jsonrpc.ResponseErr
 		}
 	}
 	for _, moved := range packageMoves {
+		if responseErr := canceledResponse(ctx); responseErr != nil {
+			return nil, responseErr
+		}
 		if moved.oldPackage == "" {
 			continue
 		}
-		for _, file := range s.index.FilesImportingPrefix(moved.oldPackage) {
+		importing, truncated := s.index.FilesImportingPrefixContext(ctx, moved.oldPackage, 10_000)
+		if truncated {
+			return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestCanceled, Message: "file-rename importer analysis exceeds its 10000-file safety limit"}
+		}
+		for _, file := range importing {
 			for _, imported := range file.Imports {
 				if moved.oldPackage == "" || imported.Path != moved.oldPackage && !strings.HasPrefix(imported.Path, moved.oldPackage+".") {
 					continue
@@ -1334,19 +1318,30 @@ func (s *Server) willRenameFiles(raw json.RawMessage) (any, *jsonrpc.ResponseErr
 				combined.Changes[file.URI] = append(combined.Changes[file.URI], protocol.TextEdit{Range: imported.Range, NewText: renderImport(path, imported, file.Language)})
 			}
 		}
-		if workspaceFiles == nil {
-			workspaceFiles = s.index.WorkspaceFiles()
+		if responseErr := loadWorkspaceFiles(); responseErr != nil {
+			return nil, responseErr
 		}
 		for _, file := range workspaceFiles {
-			doc, ok := s.index.Document(file.URI)
+			if responseErr := canceledResponse(ctx); responseErr != nil {
+				return nil, responseErr
+			}
+			doc, ok := s.index.DocumentContext(ctx, file.URI)
 			if !ok {
 				continue
 			}
-			for _, reference := range file.References {
+			if len(file.References) > 500_000 {
+				return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestCanceled, Message: "file-rename reference analysis exceeds its per-file safety limit"}
+			}
+			for referenceIndex, reference := range file.References {
+				if referenceIndex&255 == 0 {
+					if responseErr := canceledResponse(ctx); responseErr != nil {
+						return nil, responseErr
+					}
+				}
 				if reference.Role == analysis.RoleImport {
 					continue
 				}
-				target, _, resolved := s.index.SymbolAt(file.URI, reference.Range.Start)
+				target, _, resolved := s.index.SymbolAtContext(ctx, file.URI, reference.Range.Start)
 				if !resolved || target.Package != moved.oldPackage && !strings.HasPrefix(target.Package, moved.oldPackage+".") {
 					continue
 				}
@@ -1456,11 +1451,11 @@ func (s *Server) executeCommand(ctx context.Context, raw json.RawMessage) (any, 
 	}
 	switch p.Command {
 	case "decompile":
-		return s.decompileCommand(p.Arguments)
+		return s.decompileCommand(ctx, p.Arguments)
 	case "intellij.java.resolveClassDocument":
 		return s.resolveClassDocumentCommand(p.Arguments)
 	case "java.organize.imports", "kotlin.organize.imports":
-		return s.organizeImportsCommand(p.Arguments)
+		return s.organizeImportsCommand(ctx, p.Arguments)
 	case "intellij.java.resolveJavaExecutable":
 		javaExec := ""
 		if len(p.Arguments) > 0 {
@@ -1547,7 +1542,7 @@ func (s *Server) executeCommand(ctx context.Context, raw json.RawMessage) (any, 
 		}
 		return nil, nil
 	case "exportWorkspace":
-		return s.exportWorkspace(p.Arguments)
+		return s.exportWorkspace(ctx, p.Arguments)
 	case "applyModCommand":
 		return s.applyModCommand(ctx, p.Arguments)
 	case "chooseModCommandAction":
@@ -1627,7 +1622,7 @@ func (s *Server) extractRefactorCommand(ctx context.Context, command string, arg
 	default:
 		return nil, invalidParams(fmt.Errorf("expected document URI and refactoring payload"))
 	}
-	doc, ok := s.index.Document(payload.URI)
+	doc, ok := s.index.DocumentContext(ctx, payload.URI)
 	if !ok || payload.Range.Start == payload.Range.End {
 		return nil, invalidParams(fmt.Errorf("refactoring requires a document URI and non-empty range"))
 	}
@@ -1635,7 +1630,7 @@ func (s *Server) extractRefactorCommand(ctx context.Context, command string, arg
 	if start < 0 || end <= start || end > len(doc.Text) {
 		return nil, invalidParams(fmt.Errorf("refactoring range is outside the document"))
 	}
-	for _, action := range s.extractActions(payload.URI, payload.Range, doc, doc.Text[start:end]) {
+	for _, action := range s.extractActions(payload.URI, payload.Range, doc, doc.Text[start:end], ctx) {
 		if action.Kind == command && action.Edit != nil && (choice == "" || choice == action.Title) {
 			if err := s.applyWorkspaceEdit(ctx, action.Title, *action.Edit); err != nil {
 				return nil, &jsonrpc.ResponseError{Code: jsonrpc.InternalError, Message: err.Error()}
@@ -1712,7 +1707,7 @@ func (s *Server) resolveClassDocumentCommand(args []json.RawMessage) (any, *json
 	return map[string]any{"uri": uris[0]}, nil
 }
 
-func (s *Server) organizeImportsCommand(args []json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) organizeImportsCommand(ctx context.Context, args []json.RawMessage) (any, *jsonrpc.ResponseError) {
 	if len(args) == 0 {
 		return nil, invalidParams(fmt.Errorf("missing document URI"))
 	}
@@ -1726,7 +1721,7 @@ func (s *Server) organizeImportsCommand(args []json.RawMessage) (any, *jsonrpc.R
 		}
 		uri = obj.URI
 	}
-	doc, ok := s.index.Document(uri)
+	doc, ok := s.index.DocumentContext(ctx, uri)
 	if !ok {
 		return nil, nil
 	}
@@ -1737,7 +1732,7 @@ func (s *Server) organizeImportsCommand(args []json.RawMessage) (any, *jsonrpc.R
 	return protocol.WorkspaceEdit{Changes: map[protocol.URI][]protocol.TextEdit{uri: {edit}}}, nil
 }
 
-func (s *Server) decompileCommand(args []json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) decompileCommand(ctx context.Context, args []json.RawMessage) (any, *jsonrpc.ResponseError) {
 	if len(args) == 0 {
 		return nil, invalidParams(fmt.Errorf("missing URI"))
 	}
@@ -1748,7 +1743,7 @@ func (s *Server) decompileCommand(args []json.RawMessage) (any, *jsonrpc.Respons
 	if !strings.HasPrefix(uri, "jar:") && !strings.HasPrefix(uri, "jrt:") {
 		return nil, invalidParams(fmt.Errorf("unsupported URI scheme; expected jar or jrt"))
 	}
-	if doc, ok := s.index.Document(protocol.URI(uri)); ok {
+	if doc, ok := s.index.DocumentContext(ctx, protocol.URI(uri)); ok {
 		return map[string]any{"code": doc.Text, "language": doc.LanguageID}, nil
 	}
 	return nil, &jsonrpc.ResponseError{Code: jsonrpc.InvalidParams, Message: "library URI is not indexed: " + uri}
@@ -1769,7 +1764,11 @@ func (s *Server) symbolFromHierarchy(item protocol.CallHierarchyItem) (analysis.
 	return analysis.Symbol{}, false
 }
 func (s *Server) hierarchyItem(sym analysis.Symbol) protocol.CallHierarchyItem {
-	return protocol.CallHierarchyItem{Name: sym.Name, Kind: sym.Kind.LSP(), Tags: deprecatedTags(sym), Detail: sym.DisplaySignature(), URI: s.externalURI(sym.Location().URI), Range: sym.Range, SelectionRange: sym.Location().Range, Data: map[string]string{"symbolId": sym.ID}}
+	return s.hierarchyItemContext(context.Background(), sym)
+}
+
+func (s *Server) hierarchyItemContext(ctx context.Context, sym analysis.Symbol) protocol.CallHierarchyItem {
+	return protocol.CallHierarchyItem{Name: sym.Name, Kind: sym.Kind.LSP(), Tags: deprecatedTags(sym), Detail: sym.DisplaySignature(), URI: s.externalURIContext(ctx, sym.Location().URI), Range: sym.Range, SelectionRange: sym.Location().Range, Data: map[string]string{"symbolId": sym.ID}}
 }
 
 func organizeImports(text string, full protocol.Range, uri protocol.URI, semanticUsage ...map[string]bool) (protocol.TextEdit, bool) {
@@ -1842,7 +1841,9 @@ func organizeImports(text string, full protocol.Range, uri protocol.URI, semanti
 		for _, entry := range chunk {
 			live := used[entry.local]
 			if usedPaths != nil {
-				live = usedPaths[entry.path]
+				// Semantic evidence can add liveness but may not subtract lexical
+				// evidence while the fast resolver is intentionally incomplete.
+				live = live || usedPaths[entry.path]
 			}
 			if live && !seen[entry.text] {
 				seen[entry.text] = true
@@ -1951,6 +1952,11 @@ func formatSource(source string, opts protocol.FormattingOptions, kotlin bool) s
 }
 
 func formatSourceContext(ctx context.Context, source string, opts protocol.FormattingOptions, kotlin bool) (string, bool) {
+	// This is deliberately a minimal whitespace formatter, not a style engine.
+	// Its hard contract is conservative: preserve lexical content, prove the
+	// concrete syntax fingerprint unchanged, and abstain if either parse cannot
+	// establish that proof.
+	original := source
 	if ctx.Err() != nil {
 		return "", false
 	}
@@ -1979,11 +1985,11 @@ func formatSourceContext(ctx context.Context, source string, opts protocol.Forma
 			return "", false
 		}
 		stateAtStart := state
-		opens, closes, parenDelta := scanStructure(line, &state)
+		opens, closes, parenDelta := scanStructureLanguage(line, &state, kotlin)
 		// Raw strings and the body of block comments are content, not layout.
 		// Preserve their leading whitespace byte-for-byte.
-		if stateAtStart.triple || stateAtStart.blockComment {
-			if opts.TrimTrailingWhitespace && !stateAtStart.triple {
+		if stateAtStart.Triple || stateAtStart.BlockCommentDepth > 0 {
+			if opts.TrimTrailingWhitespace && !stateAtStart.Triple {
 				lines[n] = strings.TrimRightFunc(line, unicode.IsSpace)
 			}
 			continuation += parenDelta
@@ -2033,6 +2039,15 @@ func formatSourceContext(ctx context.Context, source string, opts protocol.Forma
 	}
 	if opts.InsertFinalNewline && !strings.HasSuffix(result, lineSeparator) {
 		result += lineSeparator
+	}
+	language := analysis.LanguageJava
+	if kotlin {
+		language = analysis.LanguageKotlin
+	}
+	before, beforeOK := analysis.SyntaxFingerprint(ctx, original, language)
+	after, afterOK := analysis.SyntaxFingerprint(ctx, result, language)
+	if !beforeOK || !afterOK || before != after {
+		return original, ctx.Err() == nil
 	}
 	return result, ctx.Err() == nil
 }
@@ -2234,23 +2249,27 @@ func expandFormatterBlocksContext(ctx context.Context, source string, kotlin boo
 			return "", false
 		}
 		value := source[index]
-		if state.blockComment {
+		if state.BlockCommentDepth > 0 {
 			out.WriteByte(value)
-			if value == '*' && index+1 < len(source) && source[index+1] == '/' {
+			if kotlin && value == '/' && index+1 < len(source) && source[index+1] == '*' {
+				index++
+				out.WriteByte('*')
+				state.BlockCommentDepth++
+			} else if value == '*' && index+1 < len(source) && source[index+1] == '/' {
 				index++
 				out.WriteByte('/')
-				state.blockComment = false
+				state.BlockCommentDepth--
 			}
 			if value == '\n' {
 				lineStart = index + 1
 			}
 			continue
 		}
-		if state.triple {
+		if state.Triple {
 			if index+2 < len(source) && source[index:index+3] == `"""` {
 				out.WriteString(`"""`)
 				index += 2
-				state.triple = false
+				state.Triple = false
 			} else {
 				out.WriteByte(value)
 				if value == '\n' {
@@ -2259,21 +2278,21 @@ func expandFormatterBlocksContext(ctx context.Context, source string, kotlin boo
 			}
 			continue
 		}
-		if state.quote != 0 {
+		if state.Quote != 0 {
 			out.WriteByte(value)
-			if state.escaped {
-				state.escaped = false
+			if state.Escaped {
+				state.Escaped = false
 			} else if value == '\\' {
-				state.escaped = true
-			} else if value == state.quote {
-				state.quote = 0
+				state.Escaped = true
+			} else if value == state.Quote {
+				state.Quote = 0
 			}
 			continue
 		}
-		if index+2 < len(source) && source[index:index+3] == `"""` {
+		if kotlin && index+2 < len(source) && source[index:index+3] == `"""` {
 			out.WriteString(`"""`)
 			index += 2
-			state.triple = true
+			state.Triple = true
 			continue
 		}
 		if index+1 < len(source) && source[index:index+2] == "//" {
@@ -2290,11 +2309,11 @@ func expandFormatterBlocksContext(ctx context.Context, source string, kotlin boo
 		if index+1 < len(source) && source[index:index+2] == "/*" {
 			out.WriteString("/*")
 			index++
-			state.blockComment = true
+			state.BlockCommentDepth = 1
 			continue
 		}
 		if value == '\'' || value == '"' {
-			state.quote = value
+			state.Quote = value
 			out.WriteByte(value)
 			continue
 		}
@@ -2544,75 +2563,14 @@ func lastByte(value string) byte {
 	return value[len(value)-1]
 }
 
-type formatLexState struct {
-	blockComment bool
-	triple       bool
-	quote        byte
-	escaped      bool
-}
+type formatLexState = lexical.State
 
 func scanStructure(line string, state *formatLexState) (opens, closes, parenDelta int) {
-	for n := 0; n < len(line); n++ {
-		if state.blockComment {
-			if n+1 < len(line) && line[n] == '*' && line[n+1] == '/' {
-				state.blockComment = false
-				n++
-			}
-			continue
-		}
-		if state.triple {
-			if n+2 < len(line) && line[n:n+3] == `"""` {
-				state.triple = false
-				n += 2
-			}
-			continue
-		}
-		if state.quote != 0 {
-			if state.escaped {
-				state.escaped = false
-				continue
-			}
-			if line[n] == '\\' {
-				state.escaped = true
-				continue
-			}
-			if line[n] == state.quote {
-				state.quote = 0
-			}
-			continue
-		}
-		if n+2 < len(line) && line[n:n+3] == `"""` {
-			state.triple = true
-			n += 2
-			continue
-		}
-		if n+1 < len(line) && line[n:n+2] == "//" {
-			break
-		}
-		if n+1 < len(line) && line[n:n+2] == "/*" {
-			state.blockComment = true
-			n++
-			continue
-		}
-		if line[n] == '\'' || line[n] == '"' {
-			state.quote = line[n]
-			continue
-		}
-		switch line[n] {
-		case '{':
-			opens++
-		case '}':
-			closes++
-		case '(', '[':
-			parenDelta++
-		case ')', ']':
-			parenDelta--
-		}
-	}
-	// Java/Kotlin quoted strings cannot continue to the next physical line.
-	state.quote = 0
-	state.escaped = false
-	return opens, closes, parenDelta
+	return scanStructureLanguage(line, state, true)
+}
+
+func scanStructureLanguage(line string, state *formatLexState, kotlin bool) (opens, closes, parenDelta int) {
+	return state.ScanStructure(line, kotlin)
 }
 
 func leadingCloseCount(line string) int {
@@ -2643,42 +2601,6 @@ func indentAt(text string, offset int) string {
 		end++
 	}
 	return text[start:end]
-}
-func inferInitializerType(text string, after int) string {
-	if after > len(text) {
-		after = len(text)
-	}
-	end := after + 160
-	if end > len(text) {
-		end = len(text)
-	}
-	chunk := text[after:end]
-	at := strings.IndexByte(chunk, '=')
-	if at < 0 {
-		return ""
-	}
-	value := strings.TrimSpace(chunk[at+1:])
-	if i := strings.IndexAny(value, "\n;,}"); i >= 0 {
-		value = value[:i]
-	}
-	switch {
-	case strings.HasPrefix(value, "\""):
-		return "String"
-	case value == "true" || value == "false":
-		return "Boolean"
-	case strings.HasSuffix(value, "L"):
-		return "Long"
-	case strings.Contains(value, ".") && allNumeric(value):
-		return "Double"
-	case allNumeric(value):
-		return "Int"
-	case strings.HasPrefix(value, "listOf("):
-		return "List"
-	case strings.HasPrefix(value, "mapOf("):
-		return "Map"
-	default:
-		return ""
-	}
 }
 func allNumeric(s string) bool {
 	s = strings.TrimSpace(strings.TrimSuffix(s, "L"))

@@ -35,10 +35,12 @@ func (s *Server) reportIndexingProgress() {
 	if !s.progressActive.CompareAndSwap(false, true) {
 		return
 	}
-	go func() {
+	if !s.launchBackground(func() {
 		defer s.progressActive.Store(false)
 		s.streamIndexingProgress()
-	}()
+	}) {
+		s.progressActive.Store(false)
+	}
 }
 
 // indexProgressNow reads the warm-up state the stream reports on.
@@ -85,6 +87,10 @@ func (s *Server) streamIndexingProgress() {
 }
 
 func (s *Server) notifyProgress(token string, value map[string]any) {
+	s.notifyProgressValue(token, value)
+}
+
+func (s *Server) notifyProgressValue(token, value any) {
 	params := map[string]any{"token": token, "value": value}
 	if s.notify != nil {
 		s.notify("$/progress", params)

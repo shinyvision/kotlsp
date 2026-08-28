@@ -20,8 +20,9 @@ func init() {
 			"INAPPLICABLE_LATEINIT_MODIFIER", "MANY_COMPANION_OBJECTS",
 			"DATA_CLASS_WITHOUT_PARAMETERS", "DATA_CLASS_NOT_PROPERTY_PARAMETER",
 		},
-		languages: []analysis.Language{analysis.LanguageKotlin},
-		apply:     kotlinClassShapes,
+		languages:          []analysis.Language{analysis.LanguageKotlin},
+		usesWorkspaceIndex: true,
+		apply:              kotlinClassShapes,
 	})
 }
 
@@ -178,6 +179,10 @@ func (i *Index) supertypeShapes(c *unresolvedNameContext, document interface {
 	if hasAnyModifier(owner, "enum", "annotation", "sealed", "inline", "value") {
 		return nil
 	}
+	entries := supertypeEntries(c, owner)
+	if len(entries) == 0 {
+		return nil
+	}
 	// A secondary constructor may initialise the supertype itself.
 	hasSecondaryConstructor := false
 	for _, member := range c.file.Symbols {
@@ -186,7 +191,7 @@ func (i *Index) supertypeShapes(c *unresolvedNameContext, document interface {
 		}
 	}
 	var out []protocol.Diagnostic
-	for _, entry := range supertypeEntries(c, owner) {
+	for _, entry := range entries {
 		if entry.delegated {
 			continue
 		}
@@ -280,7 +285,7 @@ func (i *Index) hiddenAndFinalMembers(c *unresolvedNameContext, document interfa
 	}
 	var out []protocol.Diagnostic
 	for _, member := range i.typeMembersLocked(*owner) {
-		if member.URI != c.file.URI || member.ReceiverType != "" || anyMembers[member.Name] || hasAnyModifier(member, "expect", "actual", "external", "private") {
+		if member.URI != c.file.URI || member.ReceiverType != "" || overridesAnyMember(*member) || hasAnyModifier(member, "expect", "actual", "external", "private") {
 			continue
 		}
 		key := "property"
@@ -333,6 +338,9 @@ func (i *Index) hiddenAndFinalMembers(c *unresolvedNameContext, document interfa
 func manyCompanions(c *unresolvedNameContext, document interface {
 	Range(start, end int) protocol.Range
 }, owner *analysis.Symbol) []protocol.Diagnostic {
+	if !strings.Contains(declarationText(c.text, owner), "companion") {
+		return nil
+	}
 	var companions []*analysis.Symbol
 	for index := range c.file.Symbols {
 		member := &c.file.Symbols[index]

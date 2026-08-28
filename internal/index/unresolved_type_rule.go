@@ -25,9 +25,10 @@ import (
 //     so nothing about the names in that file is known.
 func init() {
 	registerFastRule(fastRule{
-		codes:     []string{"UNRESOLVED_REFERENCE"},
-		languages: []analysis.Language{analysis.LanguageKotlin},
-		apply:     unresolvedTypeReferences,
+		codes:              []string{"UNRESOLVED_REFERENCE"},
+		languages:          []analysis.Language{analysis.LanguageKotlin},
+		usesWorkspaceIndex: true,
+		apply:              unresolvedTypeReferences,
 	})
 }
 
@@ -36,18 +37,15 @@ func unresolvedTypeReferences(i *Index, file *analysis.ParsedFile) []protocol.Di
 	// times, and resolution is the expensive part. Every answer is a function
 	// of the name alone within this pass, so each is computed once.
 	inScope := make(map[string]bool)
-	resolvesInScope := func(name string) bool {
-		if answer, known := inScope[name]; known {
+	resolvesInScope := func(name string, at int) bool {
+		key := name + "\x00" + i.containerIDAtLocked(file, at)
+		if answer, known := inScope[key]; known {
 			return answer
 		}
-		answer := len(i.resolveTypeSymbolsLocked(file, name)) > 0
-		inScope[name] = answer
+		answer := len(i.resolveTypeSymbolsAtLocked(file, name, at)) > 0
+		inScope[key] = answer
 		return answer
 	}
-	if fileHasUnresolvedSupertypeLocked(file, resolvesInScope) {
-		return nil
-	}
-	shadowed := typeParameterNamesLocked(file)
 	candidateCache := make(map[string][]string)
 	var out []protocol.Diagnostic
 	for index := range file.References {
@@ -55,7 +53,7 @@ func unresolvedTypeReferences(i *Index, file *analysis.ParsedFile) []protocol.Di
 		if reference.Role != analysis.RoleType || reference.Qualifier != "" || reference.ArgumentLabel {
 			continue
 		}
-		if shadowed[reference.Name] {
+		if typeParameterShadowsReference(file, *reference) || referenceInsideUnresolvedSupertypeOwner(file, *reference, resolvesInScope) {
 			continue
 		}
 		// Cheapest first: a name the index knows no type for is a different
@@ -69,7 +67,7 @@ func unresolvedTypeReferences(i *Index, file *analysis.ParsedFile) []protocol.Di
 		if len(candidates) == 0 {
 			continue
 		}
-		if resolvesInScope(reference.Name) {
+		if resolvesInScope(reference.Name, reference.StartByte) {
 			continue
 		}
 		if len(i.resolveLocked(file, *reference)) > 0 {
@@ -103,31 +101,41 @@ func importableTypeCandidatesLocked(i *Index, name string) []string {
 	return out
 }
 
-// typeParameterNamesLocked collects every type parameter declared anywhere in
-// the file. A type parameter shadows a type of the same name, and the reference
-// records no binding to tell them apart, so the whole file abstains on that
-// name rather than guess.
-func typeParameterNamesLocked(file *analysis.ParsedFile) map[string]bool {
-	names := make(map[string]bool)
+// A type parameter only shadows references within its owning scope. Treating
+// the spelling as shadowed across the file hides unrelated missing imports.
+func typeParameterShadowsReference(file *analysis.ParsedFile, reference analysis.Reference) bool {
 	for index := range file.Symbols {
 		symbol := &file.Symbols[index]
-		if symbol.Kind == analysis.KindTypeParameter {
-			names[symbol.Name] = true
+		start, end := symbol.ScopeStartByte, symbol.ScopeEndByte
+		if end <= start {
+			start, end = symbol.StartByte, symbol.EndByte
+		}
+		if reference.StartByte < start || reference.StartByte > end {
+			continue
+		}
+		if symbol.Kind == analysis.KindTypeParameter && symbol.Name == reference.Name {
+			return true
 		}
 		for _, parameter := range symbol.TypeParameters {
-			names[parameter] = true
+			if parameter == reference.Name {
+				return true
+			}
 		}
 	}
-	return names
+	return false
 }
 
-// fileHasUnresolvedSupertypeLocked reports whether any declaration in the file
-// extends something the index could not find. Nothing can be concluded about
-// the names available in such a file.
-func fileHasUnresolvedSupertypeLocked(file *analysis.ParsedFile, resolves func(string) bool) bool {
+// An unresolved supertype can contribute names only inside the declaration
+// that inherits it; independent declarations in the same file remain safe to
+// diagnose.
+func referenceInsideUnresolvedSupertypeOwner(file *analysis.ParsedFile, reference analysis.Reference, resolves func(string, int) bool) bool {
 	for index := range file.Symbols {
-		for _, supertype := range file.Symbols[index].Supertypes {
-			if !resolves(supertype) {
+		symbol := &file.Symbols[index]
+		if !analysis.IsTypeKind(symbol.Kind) || reference.StartByte < symbol.StartByte || reference.StartByte > symbol.EndByte {
+			continue
+		}
+		for _, supertype := range symbol.Supertypes {
+			if !resolves(supertype, reference.StartByte) {
 				return true
 			}
 		}

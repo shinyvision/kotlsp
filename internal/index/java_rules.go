@@ -44,7 +44,8 @@ func init() {
 			javaAbstractNew, javaMissingReturn, javaUnreachable, javaUnreported, javaDereferenced,
 			javaAlreadyDefined, javaDuplicateClass, javaCannotFindSymbol,
 		},
-		apply: javaShapes,
+		usesWorkspaceIndex: true,
+		apply:              javaShapes,
 	})
 }
 
@@ -185,7 +186,7 @@ func (i *Index) javaAbstractNotImplemented(c *unresolvedNameContext, document in
 	}
 	var missing []abstractMethod
 	for _, key := range order {
-		if !concrete[key] && !anyMembers[strings.Split(key, "/")[0]] {
+		if !concrete[key] && !overridesAnyMember(*abstracts[key].method) {
 			missing = append(missing, abstracts[key])
 		}
 	}

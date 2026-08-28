@@ -6,14 +6,19 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/shinyvision/kotlsp/internal/analysis"
+	"github.com/shinyvision/kotlsp/internal/archiveio"
 	"github.com/shinyvision/kotlsp/internal/classfile"
 	"github.com/shinyvision/kotlsp/internal/protocol"
 	uriutil "github.com/shinyvision/kotlsp/internal/uri"
@@ -27,16 +32,18 @@ import (
 // file:// URI is handed to the client. The jar://jrt:// URI stays the index
 // identity, so incoming requests against a mirrored path are mapped back before
 // anything else looks at them.
-const librarySourceCacheVersion = 1
+const librarySourceCacheVersion = 2
 
 // LibrarySourceMarker appears in every mirrored file URI. It exists so the LSP
 // layer can reject the overwhelming majority of request payloads with one byte
 // scan instead of decoding them twice.
-const LibrarySourceMarker = "kotlsp/sources/v1/"
+const LibrarySourceMarker = "kotlsp/sources/v2/"
 
-// The marker spells the version out so it stays a constant. This fails to
-// compile if librarySourceCacheVersion moves without the marker following it.
-const _ = uint(librarySourceCacheVersion - 1)
+// LibrarySourceBaseMarker matches a mirror path from any layout version.
+const LibrarySourceBaseMarker = "kotlsp/sources/"
+
+// Keep the marker literal in sync with librarySourceCacheVersion: clients use
+// the stable substring as a cheap pre-decode filter for mirrored URIs.
 
 // librarySourceTTL drops mirrors for archives that no longer participate in any
 // build. Dependency upgrades would otherwise retain every superseded version.
@@ -57,28 +64,21 @@ type archiveOrigin struct {
 }
 
 func cleanupObsoleteSourceMirrors(base, currentVersion string) {
-	entries, err := os.ReadDir(base)
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
+	forEachBoundedDirectoryEntry(base, 10_000, func(entry os.DirEntry) {
 		path := filepath.Join(base, entry.Name())
 		if !entry.IsDir() {
 			_ = os.Remove(path)
-			continue
+			return
 		}
 		if entry.Name() != currentVersion {
 			_ = os.RemoveAll(path)
 		}
-	}
-	current, err := os.ReadDir(filepath.Join(base, currentVersion))
-	if err != nil {
-		return
-	}
+	})
 	deadline := time.Now().Add(-librarySourceTTL)
-	for _, entry := range current {
+	forEachBoundedDirectoryEntry(filepath.Join(base, currentVersion), 10_000, func(entry os.DirEntry) {
 		path := filepath.Join(base, currentVersion, entry.Name())
-		info, statErr := os.Stat(filepath.Join(path, sourceCompleteName))
+		marker := filepath.Join(path, sourceCompleteName)
+		info, statErr := os.Lstat(marker)
 		if statErr != nil {
 			// An interrupted extraction is resumable but never authoritative,
 			// so it is only discarded once it is older than the retention
@@ -86,22 +86,96 @@ func cleanupObsoleteSourceMirrors(base, currentVersion string) {
 			if dirInfo, dirErr := entry.Info(); dirErr == nil && dirInfo.ModTime().Before(deadline) {
 				_ = os.RemoveAll(path)
 			}
-			continue
+			return
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return
 		}
 		if info.ModTime().Before(deadline) {
 			_ = os.RemoveAll(path)
 		}
+	})
+}
+
+func forEachBoundedDirectoryEntry(path string, limit int, visit func(os.DirEntry)) bool {
+	directory, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer directory.Close()
+	seen := 0
+	for {
+		entries, readErr := directory.ReadDir(256)
+		for _, entry := range entries {
+			seen++
+			if seen > limit {
+				return false
+			}
+			visit(entry)
+		}
+		if readErr == io.EOF {
+			return true
+		}
+		if readErr != nil {
+			return false
+		}
 	}
 }
 
-func archiveMirrorName(archivePath string) (string, bool) {
-	info, err := os.Stat(archivePath)
-	if err != nil {
-		return "", false
+func archiveMirrorName(archivePath string, known ...[sha256.Size]byte) (string, bool) {
+	var digest [sha256.Size]byte
+	if len(known) > 0 {
+		digest = known[0]
+	} else {
+		var err error
+		digest, err = digestArchive(archivePath)
+		if err != nil {
+			return "", false
+		}
 	}
-	key := strings.Join([]string{archivePath, info.ModTime().UTC().Format(time.RFC3339Nano), itoa64(info.Size())}, "\x00")
+	key := archivePath + "\x00" + hex.EncodeToString(digest[:])
 	sum := sha256.Sum256([]byte(key))
 	return sanitizeMirrorBase(filepath.Base(archivePath)) + "-" + hex.EncodeToString(sum[:6]), true
+}
+
+// archiveDigest reuses the content identity established by archive metadata
+// scanning. A library is hashed at most once per observed archive generation;
+// watched replacement refreshes overwrite this entry before materialization.
+func (i *Index) archiveDigest(archivePath string) ([sha256.Size]byte, bool) {
+	return i.archiveDigestContext(context.Background(), archivePath)
+}
+
+func (i *Index) archiveDigestContext(ctx context.Context, archivePath string) ([sha256.Size]byte, bool) {
+	clean := filepath.Clean(archivePath)
+	i.mu.RLock()
+	digest, ok := i.archiveDigests[clean]
+	i.mu.RUnlock()
+	if ok {
+		return digest, true
+	}
+	computed, err := digestArchiveContext(ctx, clean)
+	if err != nil {
+		return [sha256.Size]byte{}, false
+	}
+	i.mu.Lock()
+	if existing, exists := i.archiveDigests[clean]; exists {
+		computed = existing
+	} else {
+		i.storeArchiveDigestLocked(clean, computed)
+	}
+	i.mu.Unlock()
+	return computed, true
+}
+
+func (i *Index) storeArchiveDigestLocked(path string, digest [sha256.Size]byte) {
+	path = filepath.Clean(path)
+	if _, exists := i.archiveDigests[path]; !exists && len(i.archiveDigests) >= 8192 {
+		for victim := range i.archiveDigests {
+			delete(i.archiveDigests, victim)
+			break
+		}
+	}
+	i.archiveDigests[path] = digest
 }
 
 func sanitizeMirrorBase(name string) string {
@@ -124,11 +198,107 @@ func sanitizeMirrorBase(name string) string {
 // files are mirrored as the rendered Java stub the index already parses, so the
 // editor opens them with a Java file type instead of a binary buffer.
 func mirrorEntryName(entry string, binary bool) string {
-	name := strings.TrimPrefix(filepath.ToSlash(entry), "/")
+	name := strings.ReplaceAll(entry, "\\", "/")
+	if name == "" || strings.HasPrefix(name, "/") || strings.ContainsRune(name, 0) {
+		return ""
+	}
+	if first := strings.SplitN(name, "/", 2)[0]; strings.Contains(first, ":") {
+		return ""
+	}
+	name = pathpkg.Clean(name)
+	if name == "." || name == ".." || strings.HasPrefix(name, "../") {
+		return ""
+	}
 	if binary && strings.HasSuffix(name, ".class") {
 		name = strings.TrimSuffix(name, ".class") + ".java"
 	}
 	return name
+}
+
+// mirrorEntryPath resolves one archive member below root and proves the
+// canonical result remains contained. Name validation and post-join
+// containment are both required: filepath rules differ across platforms.
+func mirrorEntryPath(root, entry string, binary bool) (string, bool) {
+	name := mirrorEntryName(entry, binary)
+	if root == "" || name == "" {
+		return "", false
+	}
+	candidate := filepath.Join(root, filepath.FromSlash(name))
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return "", false
+	}
+	return candidate, true
+}
+
+// secureMirrorDirectory validates every component below a known cache root.
+// ZIP names are checked lexically as well, but a stale cache containing a
+// symlink must not turn a later safe-looking entry into an out-of-root write or
+// metadata read. The cache is user-owned, so this is a fail-closed integrity
+// check; it does not claim to be a cross-process openat-style sandbox.
+func secureMirrorDirectory(root, directory string, create bool) error {
+	root, directory = filepath.Clean(root), filepath.Clean(directory)
+	relative, err := filepath.Rel(root, directory)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return fmt.Errorf("mirror directory escapes cache root")
+	}
+	rootInfo, err := os.Lstat(root)
+	if err != nil || rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("mirror root is not a real directory")
+	}
+	current := root
+	if relative == "." {
+		return nil
+	}
+	for _, component := range strings.Split(filepath.ToSlash(relative), "/") {
+		if component == "" || component == "." || component == ".." {
+			return fmt.Errorf("invalid mirror directory component")
+		}
+		current = filepath.Join(current, filepath.FromSlash(component))
+		info, statErr := os.Lstat(current)
+		if os.IsNotExist(statErr) && create {
+			if makeErr := os.Mkdir(current, 0o700); makeErr != nil && !os.IsExist(makeErr) {
+				return makeErr
+			}
+			info, statErr = os.Lstat(current)
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("mirror path contains a non-directory or symlink")
+		}
+	}
+	return nil
+}
+
+// secureMirrorLeaf rejects planted symlinks and non-regular leaf nodes after
+// the full parent chain has been validated. Callers use allowMissing only
+// immediately before an atomic create; existing leaves are never followed or
+// silently replaced.
+func secureMirrorLeaf(root, path string, allowMissing bool) error {
+	root, path = filepath.Clean(root), filepath.Clean(path)
+	if err := secureMirrorDirectory(root, filepath.Dir(path), false); err != nil {
+		return err
+	}
+	relative, err := filepath.Rel(root, path)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return fmt.Errorf("mirror leaf escapes cache root")
+	}
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) && allowMissing {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("mirror leaf is not a regular file")
+	}
+	return nil
 }
 
 func archiveEntryName(mirrored string, binary bool) string {
@@ -144,12 +314,11 @@ func isArchiveURI(uri protocol.URI) bool {
 }
 
 type librarySourceMirror struct {
-	rootOnce  sync.Once
-	rootDir   string
-	mu        sync.Mutex
-	dirs      map[string]string
-	extracted map[string]bool
-	origins   map[string]*archiveOrigin
+	rootOnce sync.Once
+	rootDir  string
+	mu       sync.Mutex
+	dirs     map[string]string
+	origins  map[string]*archiveOrigin
 }
 
 // root resolves the mirror directory once per index. Superseded layouts are
@@ -164,7 +333,7 @@ func (m *librarySourceMirror) root() string {
 		base := filepath.Join(cacheRoot, "kotlsp", "sources")
 		version := "v" + strconv.Itoa(librarySourceCacheVersion)
 		dir := filepath.Join(base, version)
-		if err := os.MkdirAll(dir, 0o700); err != nil {
+		if err := secureMirrorDirectory(cacheRoot, dir, true); err != nil {
 			return
 		}
 		cleanupObsoleteSourceMirrors(base, version)
@@ -173,60 +342,42 @@ func (m *librarySourceMirror) root() string {
 	return m.rootDir
 }
 
-func (m *librarySourceMirror) dir(archivePath string) (string, bool) {
+func (m *librarySourceMirror) dir(archivePath string, digest ...[sha256.Size]byte) (string, bool) {
 	root := m.root()
 	if root == "" || archivePath == "" {
 		return "", false
 	}
-	m.mu.Lock()
-	if dir, ok := m.dirs[archivePath]; ok {
-		m.mu.Unlock()
-		return dir, dir != ""
-	}
-	m.mu.Unlock()
-	name, ok := archiveMirrorName(archivePath)
+	name, ok := archiveMirrorName(archivePath, digest...)
 	dir := ""
 	if ok {
 		dir = filepath.Join(root, name)
 	}
+	key := archivePath + "\x00" + name
 	m.mu.Lock()
 	if m.dirs == nil {
 		m.dirs = make(map[string]string)
 	}
-	m.dirs[archivePath] = dir
+	if cached, exists := m.dirs[key]; exists {
+		m.mu.Unlock()
+		return cached, cached != ""
+	}
+	m.dirs[key] = dir
 	m.mu.Unlock()
 	return dir, dir != ""
 }
 
-// complete reports whether the whole archive has already been mirrored. Only a
-// positive answer is cached: a mirror that is still being written must be
-// re-checked, while a finished one must never cost a syscall again.
+// complete reports whether the whole archive has already been mirrored. It
+// deliberately revalidates the marker leaf on every call: caching a positive
+// answer would allow a later symlink replacement to bypass the leaf check.
 func (m *librarySourceMirror) complete(dir string) bool {
-	m.mu.Lock()
-	done := m.extracted[dir]
-	m.mu.Unlock()
-	if done {
-		return true
-	}
-	marker := filepath.Join(dir, sourceCompleteName)
-	if _, err := os.Stat(marker); err != nil {
+	if secureMirrorDirectory(filepath.Dir(dir), dir, false) != nil {
 		return false
 	}
-	// Touching the marker keeps an archive that is still in use outside the
-	// retention sweep even when its mirror was written long ago.
-	now := time.Now()
-	_ = os.Chtimes(marker, now, now)
-	m.markComplete(dir)
-	return true
-}
-
-func (m *librarySourceMirror) markComplete(dir string) {
-	m.mu.Lock()
-	if m.extracted == nil {
-		m.extracted = make(map[string]bool)
+	marker := filepath.Join(dir, sourceCompleteName)
+	if err := secureMirrorLeaf(dir, marker, false); err != nil {
+		return false
 	}
-	m.extracted[dir] = true
-	m.mu.Unlock()
+	return true
 }
 
 func (m *librarySourceMirror) origin(dir string) (archiveOrigin, bool) {
@@ -241,8 +392,12 @@ func (m *librarySourceMirror) origin(dir string) (archiveOrigin, bool) {
 	}
 	var origin archiveOrigin
 	loaded := false
-	if data, err := os.ReadFile(filepath.Join(dir, sourceOriginName)); err == nil {
-		loaded = json.Unmarshal(data, &origin) == nil
+	originPath := filepath.Join(dir, sourceOriginName)
+	if leafErr := secureMirrorLeaf(dir, originPath, false); leafErr == nil {
+		data, err := readFileBounded(originPath, 1<<20, "source mirror origin")
+		if err == nil {
+			loaded = json.Unmarshal(data, &origin) == nil
+		}
 	}
 	m.mu.Lock()
 	if m.origins == nil {
@@ -262,6 +417,9 @@ func (m *librarySourceMirror) origin(dir string) (archiveOrigin, bool) {
 // back, for mirrors that were written one entry at a time rather than by a full
 // archive pass.
 func (m *librarySourceMirror) ensureOrigin(dir string, origin archiveOrigin) {
+	if err := secureMirrorDirectory(filepath.Dir(dir), dir, true); err != nil {
+		return
+	}
 	if _, ok := m.origin(dir); ok {
 		return
 	}
@@ -269,10 +427,7 @@ func (m *librarySourceMirror) ensureOrigin(dir string, origin archiveOrigin) {
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return
-	}
-	if err := os.WriteFile(filepath.Join(dir, sourceOriginName), encoded, 0o600); err != nil {
+	if err := writeMirrorMetadata(dir, filepath.Join(dir, sourceOriginName), encoded, 0o600); err != nil {
 		return
 	}
 	m.mu.Lock()
@@ -304,6 +459,10 @@ func originForURI(uri protocol.URI, source LibrarySource) archiveOrigin {
 // LibraryFileURI returns the mirrored file:// URI for a library URI, writing
 // the single entry on demand when the archive has not finished mirroring yet.
 func (i *Index) LibraryFileURI(uri protocol.URI) (protocol.URI, bool) {
+	return i.LibraryFileURIContext(context.Background(), uri)
+}
+
+func (i *Index) LibraryFileURIContext(ctx context.Context, uri protocol.URI) (protocol.URI, bool) {
 	if !isArchiveURI(uri) {
 		return "", false
 	}
@@ -313,29 +472,161 @@ func (i *Index) LibraryFileURI(uri protocol.URI) (protocol.URI, bool) {
 	if !known || source.Archive == "" || source.Entry == "" {
 		return "", false
 	}
-	dir, ok := i.sourceMirror.dir(source.Archive)
+	digest, digestOK := i.archiveDigestContext(ctx, source.Archive)
+	if !digestOK {
+		return "", false
+	}
+	dir, ok := i.sourceMirror.dir(source.Archive, digest)
 	if !ok {
 		return "", false
 	}
-	path := filepath.Join(dir, filepath.FromSlash(mirrorEntryName(source.Entry, source.Binary)))
+	path, ok := mirrorEntryPath(dir, source.Entry, source.Binary)
+	if !ok {
+		return "", false
+	}
 	if !i.sourceMirror.complete(dir) {
 		i.sourceMirror.ensureOrigin(dir, originForURI(uri, source))
-		if _, err := os.Stat(path); err != nil {
-			document, found := i.Document(uri)
+		// A cold, on-demand mirror has no package directories yet. Validate and
+		// create that parent chain before checking the leaf; secureMirrorLeaf is
+		// deliberately read-only and therefore rejects a missing parent.
+		if dirErr := secureMirrorDirectory(dir, filepath.Dir(path), true); dirErr != nil {
+			return "", false
+		}
+		if leafErr := secureMirrorLeaf(dir, path, true); leafErr != nil {
+			return "", false
+		} else if _, err := os.Lstat(path); os.IsNotExist(err) {
+			document, found := i.DocumentContext(ctx, uri)
 			if !found {
 				return "", false
 			}
-			if writeMirroredFile(path, document.Text) != nil {
+			if writeMirroredFile(dir, path, document.Text) != nil {
 				return "", false
 			}
 		}
 	}
+	if secureMirrorLeaf(dir, path, false) != nil {
+		return "", false
+	}
 	return uriutil.File(path), true
+}
+
+// DebugSourcePath maps a loaded JVM class to the same exact workspace or
+// attached-library source used by definition navigation.
+func (i *Index) DebugSourcePath(ctx context.Context, classPaths []string, className, sourceName string) (string, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	className = strings.TrimSuffix(className, ".")
+	if dollar := strings.IndexByte(className, '$'); dollar >= 0 {
+		className = className[:dollar]
+	}
+	type sourceCandidate struct {
+		uri           protocol.URI
+		binaryArchive string
+		moduleDir     string
+	}
+	i.mu.RLock()
+	ids := i.byFQN[className]
+	if len(ids) > maxResolutionCandidates {
+		i.mu.RUnlock()
+		i.recordHealth("debug-source", className, "exact source candidate inventory exceeded its 512-symbol safety limit and was withheld")
+		return "", false
+	}
+	candidates := make([]sourceCandidate, 0, len(ids))
+	for _, id := range ids {
+		symbol := i.symbols[id]
+		if symbol == nil || !analysis.IsTypeKind(symbol.Kind) || symbol.Synthetic {
+			continue
+		}
+		candidate := sourceCandidate{uri: symbol.URI}
+		if symbol.SourceURI != "" {
+			candidate.uri = symbol.SourceURI
+		}
+		if source, ok := i.librarySources[symbol.URI]; ok && source.Binary {
+			candidate.binaryArchive = filepath.Clean(source.Archive)
+		} else if module, unique := moduleForURIInModules(symbol.URI, i.modules); unique {
+			candidate.moduleDir = filepath.Clean(module.Dir)
+		}
+		candidates = append(candidates, candidate)
+	}
+	i.mu.RUnlock()
+	bestRank := len(classPaths) + 1
+	paths := make(map[string]bool)
+	for _, candidate := range candidates {
+		if ctx.Err() != nil {
+			return "", false
+		}
+		rank := len(classPaths)
+		matchedIdentity := len(classPaths) == 0
+		for index, classPath := range classPaths {
+			clean := filepath.Clean(classPath)
+			if candidate.binaryArchive != "" && clean == candidate.binaryArchive {
+				rank, matchedIdentity = index, true
+				break
+			}
+			if candidate.binaryArchive == "" && candidate.moduleDir != "" && pathWithin(clean, candidate.moduleDir) {
+				if info, err := os.Stat(clean); err == nil && info.IsDir() {
+					rank, matchedIdentity = index, true
+					break
+				}
+			}
+		}
+		if !matchedIdentity || rank > bestRank {
+			continue
+		}
+		uri := candidate.uri
+		if mirrored, ok := i.LibraryFileURIContext(ctx, uri); ok {
+			uri = mirrored
+		}
+		path, ok := uriutil.Path(uri)
+		if !ok || sourceName != "" && filepath.Base(path) != sourceName {
+			continue
+		}
+		path = filepath.Clean(path)
+		if rank < bestRank {
+			bestRank = rank
+			paths = make(map[string]bool)
+		}
+		paths[path] = true
+	}
+	if len(paths) != 1 {
+		return "", false
+	}
+	for path := range paths {
+		return path, true
+	}
+	return "", false
 }
 
 // LibraryURIForFile maps a mirrored file:// URI back onto the jar://jrt:// URI
 // the index is keyed by. It reads the mirror's own metadata rather than live
 // index state so buffers left open across a server restart keep working.
+// base is the version-independent mirror directory. A path beneath it that
+// the current layout cannot map (a mirror written by an earlier build that the
+// editor still has open) is still a library view, never project source.
+func (m *librarySourceMirror) base() string {
+	cacheRoot, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(cacheRoot, "kotlsp", "sources")
+}
+
+// IsLibraryMirrorFile reports whether a file URI lies under the library
+// source mirror, whichever layout version wrote it.
+func (i *Index) IsLibraryMirrorFile(uri protocol.URI) bool {
+	if !strings.Contains(string(uri), LibrarySourceBaseMarker) {
+		return false
+	}
+	base := i.sourceMirror.base()
+	path, ok := uriutil.Path(uri)
+	if base == "" || !ok {
+		return false
+	}
+	relative, err := filepath.Rel(base, filepath.Clean(path))
+	return err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
+}
+
 func (i *Index) LibraryURIForFile(uri protocol.URI) (protocol.URI, bool) {
 	root := i.sourceMirror.root()
 	if root == "" || !strings.Contains(string(uri), LibrarySourceMarker) {
@@ -355,6 +646,12 @@ func (i *Index) LibraryURIForFile(uri protocol.URI) (protocol.URI, bool) {
 		return "", false
 	}
 	dir := filepath.Join(root, slashed[:cut])
+	if secureMirrorDirectory(root, dir, false) != nil {
+		return "", false
+	}
+	if secureMirrorLeaf(dir, path, false) != nil || secureMirrorLeaf(dir, filepath.Join(dir, sourceOriginName), false) != nil {
+		return "", false
+	}
 	origin, ok := i.sourceMirror.origin(dir)
 	if !ok {
 		return "", false
@@ -366,9 +663,16 @@ func (i *Index) LibraryURIForFile(uri protocol.URI) (protocol.URI, bool) {
 	return entry.URI(), true
 }
 
-func writeMirroredFile(path, content string) error {
+func writeMirroredFile(root, path, content string) error {
+	return writeMirrorMetadata(root, path, []byte(content), 0o444)
+}
+
+func writeMirrorMetadata(root, path string, content []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := secureMirrorDirectory(root, dir, true); err != nil {
+		return err
+	}
+	if err := secureMirrorLeaf(root, path, true); err != nil {
 		return err
 	}
 	temp, err := os.CreateTemp(dir, ".kotlsp-*")
@@ -376,7 +680,7 @@ func writeMirroredFile(path, content string) error {
 		return err
 	}
 	name := temp.Name()
-	if _, err := io.WriteString(temp, content); err != nil {
+	if _, err := temp.Write(content); err != nil {
 		_ = temp.Close()
 		_ = os.Remove(name)
 		return err
@@ -385,10 +689,7 @@ func writeMirroredFile(path, content string) error {
 		_ = os.Remove(name)
 		return err
 	}
-	// Library sources are navigation targets, never edit targets. A read-only
-	// mode keeps an accidental editor write from diverging the mirror from the
-	// archive it represents.
-	if err := os.Chmod(name, 0o444); err != nil {
+	if err := os.Chmod(name, mode); err != nil {
 		_ = os.Remove(name)
 		return err
 	}
@@ -396,63 +697,70 @@ func writeMirroredFile(path, content string) error {
 		_ = os.Remove(name)
 		return err
 	}
-	return nil
+	return secureMirrorLeaf(root, path, false)
 }
 
 // archiveMirror writes one archive's mirror during background indexing, where
 // the rendered content of every entry is already in hand.
 type archiveMirror struct {
-	index *Index
-	dir   string
-	dirs  map[string]bool
+	dir  string
+	dirs map[string]bool
 }
 
-// newArchiveMirror returns nil when the archive needs no mirroring: either it
-// is already complete, or the pass is a partial one whose coverage must never
-// be recorded as authoritative.
+// newArchiveMirror returns nil when the archive is already mirrored.
 func (i *Index) newArchiveMirror(archive sourceArchive) *archiveMirror {
-	if archive.noCache || len(archive.onlyTargets) > 0 {
-		return nil
+	digest := archive.digest
+	if !archive.digestOK {
+		var ok bool
+		digest, ok = i.archiveDigest(archive.path)
+		if !ok {
+			return nil
+		}
 	}
-	dir, ok := i.sourceMirror.dir(archive.path)
+	dir, ok := i.sourceMirror.dir(archive.path, digest)
 	if !ok || i.sourceMirror.complete(dir) {
 		return nil
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := secureMirrorDirectory(filepath.Dir(dir), dir, true); err != nil {
 		return nil
 	}
 	origin, err := json.Marshal(archiveOrigin{Archive: archive.path, JDK: archive.jdk, Module: archive.module, Binary: archive.binary})
 	if err != nil {
 		return nil
 	}
-	if err := os.WriteFile(filepath.Join(dir, sourceOriginName), origin, 0o600); err != nil {
+	if err := writeMirrorMetadata(dir, filepath.Join(dir, sourceOriginName), origin, 0o600); err != nil {
 		return nil
 	}
-	return &archiveMirror{index: i, dir: dir, dirs: make(map[string]bool)}
+	return &archiveMirror{dir: dir, dirs: make(map[string]bool)}
 }
 
-func (m *archiveMirror) write(entry, content string, binary bool) {
+func (m *archiveMirror) write(entry, content string, binary bool) bool {
 	if m == nil {
-		return
+		return true
 	}
-	path := filepath.Join(m.dir, filepath.FromSlash(mirrorEntryName(entry, binary)))
+	path, ok := mirrorEntryPath(m.dir, entry, binary)
+	if !ok {
+		return false
+	}
 	if dir := filepath.Dir(path); !m.dirs[dir] {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return
+		if err := secureMirrorDirectory(m.dir, dir, true); err != nil {
+			return false
 		}
 		m.dirs[dir] = true
 	}
-	_ = writeMirroredFile(path, content)
+	return writeMirroredFile(m.dir, path, content) == nil
 }
 
 func (m *archiveMirror) finish() {
 	if m == nil {
 		return
 	}
-	if err := os.WriteFile(filepath.Join(m.dir, sourceCompleteName), nil, 0o600); err != nil {
+	if secureMirrorDirectory(filepath.Dir(m.dir), m.dir, false) != nil {
 		return
 	}
-	m.index.sourceMirror.markComplete(m.dir)
+	if err := writeMirrorMetadata(m.dir, filepath.Join(m.dir, sourceCompleteName), nil, 0o600); err != nil {
+		return
+	}
 }
 
 // mirrorArchive writes a mirror for an archive whose parse came from the
@@ -467,7 +775,18 @@ func (i *Index) mirrorArchive(ctx context.Context, archive sourceArchive, mirror
 		return
 	}
 	defer reader.Close()
-	for _, file := range selectedArchiveFiles(archive, reader.File) {
+	budget, err := archiveio.NewBudget(archiveSemanticBudgetFiles(archive, reader.File))
+	if err != nil {
+		i.recordHealth("library-mirror", archive.path, err.Error())
+		return
+	}
+	selected, err := selectedArchiveFilesWithBudgetContext(ctx, archive, reader.File, budget)
+	if err != nil {
+		i.recordHealth("library-mirror", archive.path, err.Error())
+		return
+	}
+	complete := true
+	for _, file := range selected {
 		select {
 		case <-ctx.Done():
 			return
@@ -476,24 +795,31 @@ func (i *Index) mirrorArchive(ctx context.Context, archive sourceArchive, mirror
 		if !archiveAccepts(archive, file) {
 			continue
 		}
-		entry, openErr := file.Open()
-		if openErr != nil {
+		if kotlinBuiltinSourceArchive(archive) && !kotlinBuiltinSourceEntry(file.Name) {
 			continue
 		}
-		data, readErr := io.ReadAll(entry)
-		_ = entry.Close()
+		data, readErr := budget.ReadContext(ctx, file, archiveio.MaxEntryBytes)
 		if readErr != nil {
+			complete = false
+			if errors.Is(readErr, archiveio.ErrArchiveBudget) {
+				break
+			}
 			continue
 		}
 		content := string(data)
 		if archive.binary {
 			parsed, parseErr := classfile.Parse(data)
 			if parseErr != nil {
+				complete = false
 				continue
 			}
 			content = classfile.RenderJava(parsed)
 		}
-		mirror.write(file.Name, content, archive.binary)
+		if !mirror.write(file.Name, content, archive.binary) {
+			complete = false
+		}
 	}
-	mirror.finish()
+	if complete && ctx.Err() == nil {
+		mirror.finish()
+	}
 }

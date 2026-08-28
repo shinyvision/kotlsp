@@ -17,7 +17,7 @@ import (
 func qualifiedFixture(t *testing.T, capabilities map[string]any) (*Server, protocol.URI, int) {
 	t.Helper()
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	t.Cleanup(func() { s.index.Close() })
+	t.Cleanup(func() { s.Close() })
 	s.initializeReceived.Store(true)
 	s.initialized.Store(true)
 	s.rootMu.Lock()

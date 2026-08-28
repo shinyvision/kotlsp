@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"unicode"
@@ -10,7 +11,11 @@ import (
 	textdoc "github.com/shinyvision/kotlsp/internal/text"
 )
 
-func (s *Server) extractActions(uri protocol.URI, selectedRange protocol.Range, doc *textdoc.Document, selected string) []protocol.CodeAction {
+func (s *Server) extractActions(uri protocol.URI, selectedRange protocol.Range, doc *textdoc.Document, selected string, contexts ...context.Context) []protocol.CodeAction {
+	ctx := operationContext(contexts)
+	if ctx.Err() != nil {
+		return nil
+	}
 	file, ok := s.index.Parsed(uri)
 	if !ok {
 		return nil
@@ -22,6 +27,8 @@ func (s *Server) extractActions(uri protocol.URI, selectedRange protocol.Range, 
 		return nil
 	}
 	trimmed := strings.TrimSpace(selected)
+	parameters := extractionParameters(file.Symbols, startOffset, endOffset, trimmed)
+	evidence := s.index.ExpressionEvidence(uri, trimmed, startOffset)
 	statementOffset := lineStart(doc.Text, startOffset)
 	indent := indentAt(doc.Text, startOffset)
 	name := uniqueSymbolName(file.Symbols, "extractedValue")
@@ -29,7 +36,7 @@ func (s *Server) extractActions(uri protocol.URI, selectedRange protocol.Range, 
 	if kotlin {
 		variableDeclaration += "val " + name + " = " + trimmed + "\n"
 	} else {
-		variableDeclaration += "var " + name + " = " + strings.TrimSuffix(trimmed, ";") + ";\n"
+		variableDeclaration += evidence.Type + " " + name + " = " + strings.TrimSuffix(trimmed, ";") + ";\n"
 	}
 	variable := refactorAction("Extract variable", "refactor.extract.variable", uri,
 		protocol.TextEdit{Range: doc.Range(statementOffset, statementOffset), NewText: variableDeclaration},
@@ -38,10 +45,9 @@ func (s *Server) extractActions(uri protocol.URI, selectedRange protocol.Range, 
 
 	functionName := uniqueSymbolName(file.Symbols, "extractedFunction")
 	functionInsert, functionIndent, owner := extractionInsertion(doc, file.Symbols, startOffset)
-	returnType := expressionType(trimmed, kotlin)
+	returnType := evidence.Type
 	expression := isExpressionSelection(trimmed)
 	static := owner.ID != "" && containingCallableHasModifier(file.Symbols, startOffset, "static")
-	parameters := extractionParameters(file.Symbols, startOffset, endOffset, trimmed)
 	if (returnType == "Any" || returnType == "Object") && len(parameters) > 0 {
 		candidate := extractionParameterType(parameters[0], kotlin)
 		if candidate != "" {
@@ -78,21 +84,27 @@ func (s *Server) extractActions(uri protocol.URI, selectedRange protocol.Range, 
 			functionText = "\n" + functionIndent + modifier + "void " + functionName + "(" + parameterDeclaration + ") {\n" + body + "\n" + functionIndent + "}\n"
 		}
 	}
-	actions := []protocol.CodeAction{variable}
+	actions := make([]protocol.CodeAction, 0, 4)
+	// Moving a potentially throwing or side-effecting subexpression to the
+	// beginning of its line changes short-circuit/evaluation order. The fast
+	// extractor therefore offers a variable only for proven constants.
+	if evidence.Constant && evidence.Type != "" {
+		actions = append(actions, variable)
+	}
 	// A local or parameter is passed by value. Moving an assignment/inc/dec of
 	// that binding into a new function would mutate only the extracted
 	// function's copy (and Kotlin postfix expressions can also become invalid).
 	// Keep refactoring complete for expressions and referent mutations, but do
 	// not advertise or execute a semantics-changing extraction.
-	if !selectionMutatesExtractionParameter(trimmed, parameters) {
+	if evidence.RefactoringSafe && extractionFunctionSemanticallySafe(ctx, s, uri, file, doc, startOffset, endOffset, trimmed, parameters, returnType) {
 		actions = append(actions, refactorAction("Extract function", "refactor.extract.function", uri,
 			protocol.TextEdit{Range: doc.Range(functionInsert, functionInsert), NewText: functionText},
 			protocol.TextEdit{Range: selectedRange, NewText: functionName + "(" + arguments + ")" + statementTerminator(trimmed, kotlin)},
 		))
 	}
-	if (owner.ID != "" || kotlin) && len(parameters) == 0 {
+	if (owner.ID != "" || kotlin) && len(parameters) == 0 && evidence.Constant && evidence.Type != "" {
 		fieldName := uniqueSymbolName(file.Symbols, "extractedField")
-		fieldType := expressionType(trimmed, kotlin)
+		fieldType := evidence.Type
 		var fieldText string
 		if kotlin {
 			fieldText = "\n" + functionIndent + "private val " + fieldName + ": " + fieldType + " = " + trimmed + "\n"
@@ -104,18 +116,18 @@ func (s *Server) extractActions(uri protocol.URI, selectedRange protocol.Range, 
 			protocol.TextEdit{Range: selectedRange, NewText: fieldName},
 		))
 
-		if isConstantExpression(trimmed) {
+		if evidence.Constant {
 			constantName := uniqueSymbolName(file.Symbols, "EXTRACTED_CONSTANT")
 			var constantText string
 			if kotlin {
-				declaration := "private const val " + constantName + ": " + expressionType(trimmed, true) + " = " + trimmed
+				declaration := "private const val " + constantName + ": " + evidence.Type + " = " + trimmed
 				if owner.ID != "" && owner.Kind != analysis.KindObject {
 					constantText = "\n" + functionIndent + "companion object {\n" + functionIndent + "    " + declaration + "\n" + functionIndent + "}\n"
 				} else {
 					constantText = "\n" + functionIndent + declaration + "\n"
 				}
 			} else {
-				constantText = "\n" + functionIndent + "private static final " + expressionType(trimmed, false) + " " + constantName + " = " + strings.TrimSuffix(trimmed, ";") + ";\n"
+				constantText = "\n" + functionIndent + "private static final " + evidence.Type + " " + constantName + " = " + strings.TrimSuffix(trimmed, ";") + ";\n"
 			}
 			actions = append(actions, refactorAction("Extract constant", "refactor.extract.constant", uri,
 				protocol.TextEdit{Range: doc.Range(functionInsert, functionInsert), NewText: constantText},
@@ -165,6 +177,85 @@ func selectionMutatesExtractionParameter(selected string, parameters []analysis.
 	return false
 }
 
+// extractionFunctionSemanticallySafe defines the deliberately narrow proof
+// boundary for the fast refactoring. A pure expression over uniquely bound
+// locals/parameters is safe to move; calls, fields/properties, writes, control
+// flow, unknown types, and incomplete bindings are delegated to a future
+// compiler-backed refactoring service by withholding the action.
+func extractionFunctionSemanticallySafe(ctx context.Context, s *Server, uri protocol.URI, file *analysis.ParsedFile, doc *textdoc.Document, start, end int, selected string, parameters []analysis.Symbol, returnType string) bool {
+	if !isExpressionSelection(selected) || returnType == "" || returnType == "Any" || returnType == "Object" || selectionMutatesExtractionParameter(selected, parameters) {
+		return false
+	}
+	for _, token := range []string{"return", "throw", "break", "continue", "this", "super", "new", "++", "--", "=", "::", "->"} {
+		if token == "=" {
+			if strings.Contains(selected, "=") {
+				return false
+			}
+			continue
+		}
+		if strings.Contains(selected, token) {
+			return false
+		}
+	}
+	unaccounted := codeIdentifierSet(selected)
+	for _, keyword := range []string{"true", "false", "null"} {
+		delete(unaccounted, keyword)
+	}
+	resolvedByName := make(map[string]string)
+	for _, reference := range file.References {
+		if ctx.Err() != nil {
+			return false
+		}
+		if reference.StartByte < start || reference.EndByte > end {
+			continue
+		}
+		if reference.EndByte > len(doc.Text) || !isSimpleIdentifierText(strings.Trim(doc.Text[reference.StartByte:reference.EndByte], "`")) {
+			// Kotlin operator conventions (`a + b` referencing `plus`) are not
+			// bindings the extracted function must carry: the operand
+			// references decide, and the operator keeps resolving against the
+			// same operand types inside the new function.
+			continue
+		}
+		definitions := s.index.DefinitionsContext(ctx, uri, reference.Range.Start)
+		if len(definitions) != 1 {
+			return false
+		}
+		definition := definitions[0]
+		if definition.Kind != analysis.KindParameter && definition.Kind != analysis.KindVariable {
+			return false
+		}
+		if definition.URI != uri || definition.StartByte >= start || definition.ScopeStartByte > start || definition.ScopeEndByte < end {
+			return false
+		}
+		if extractionParameterType(definition, file.Language == analysis.LanguageKotlin) == "" {
+			return false
+		}
+		if previous := resolvedByName[reference.Name]; previous != "" && previous != definition.ID {
+			// Two different bindings with the same spelling cannot be represented
+			// by one extracted-function parameter without changing semantics.
+			return false
+		}
+		resolvedByName[reference.Name] = definition.ID
+		delete(unaccounted, reference.Name)
+	}
+	parameterByName := make(map[string]string, len(parameters))
+	for _, parameter := range parameters {
+		if previous := parameterByName[parameter.Name]; previous != "" && previous != parameter.ID {
+			return false
+		}
+		parameterByName[parameter.Name] = parameter.ID
+		if resolvedByName[parameter.Name] != parameter.ID {
+			return false
+		}
+	}
+	for name, id := range resolvedByName {
+		if parameterByName[name] != id {
+			return false
+		}
+	}
+	return len(unaccounted) == 0 && doc.Offset(doc.Position(start)) == start
+}
+
 func isIdentifierByte(value byte) bool {
 	return value == '_' || value == '$' || value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
 }
@@ -187,10 +278,10 @@ func nextNonSpaceIndex(value string, after int) int {
 }
 
 func extractionParameters(symbols []analysis.Symbol, start, end int, selected string) []analysis.Symbol {
-	candidates := make([]analysis.Symbol, 0)
+	byName := make(map[string]analysis.Symbol)
 	identifiers := codeIdentifierSet(selected)
 	for _, symbol := range symbols {
-		if symbol.StartByte >= start {
+		if symbol.StartByte >= start || symbol.ScopeStartByte > start || symbol.ScopeEndByte < end {
 			continue
 		}
 		if symbol.Kind != analysis.KindParameter && symbol.Kind != analysis.KindVariable {
@@ -199,6 +290,13 @@ func extractionParameters(symbols []analysis.Symbol, start, end int, selected st
 		if !identifiers[symbol.Name] {
 			continue
 		}
+		previous, exists := byName[symbol.Name]
+		if !exists || symbol.ScopeStartByte > previous.ScopeStartByte || symbol.ScopeStartByte == previous.ScopeStartByte && symbol.StartByte > previous.StartByte {
+			byName[symbol.Name] = symbol
+		}
+	}
+	candidates := make([]analysis.Symbol, 0, len(byName))
+	for _, symbol := range byName {
 		candidates = append(candidates, symbol)
 	}
 	sort.SliceStable(candidates, func(a, b int) bool {
@@ -242,7 +340,11 @@ func extractionParameterType(parameter analysis.Symbol, kotlin bool) string {
 	return typeName
 }
 
-func (s *Server) inlineVariableAction(uri protocol.URI, requested protocol.Range, doc *textdoc.Document) (protocol.CodeAction, bool) {
+func (s *Server) inlineVariableAction(uri protocol.URI, requested protocol.Range, doc *textdoc.Document, contexts ...context.Context) (protocol.CodeAction, bool) {
+	ctx := operationContext(contexts)
+	if ctx.Err() != nil {
+		return protocol.CodeAction{}, false
+	}
 	file, ok := s.index.Parsed(uri)
 	if !ok {
 		return protocol.CodeAction{}, false
@@ -261,11 +363,12 @@ func (s *Server) inlineVariableAction(uri protocol.URI, requested protocol.Range
 			return protocol.CodeAction{}, false
 		}
 		initializer := strings.TrimSpace(strings.TrimSuffix(declaration[equals+1:], ";"))
-		if initializer == "" || strings.Contains(initializer, "\n") {
+		evidence := s.index.ExpressionEvidence(uri, initializer, symbol.StartByte)
+		if initializer == "" || strings.Contains(initializer, "\n") || !evidence.Constant || evidence.Type == "" {
 			return protocol.CodeAction{}, false
 		}
-		locations := s.index.References(uri, symbol.SelectionRange.Start, false)
-		if len(locations) == 0 || len(locations) > 1 && !pureInlineInitializer(initializer) {
+		locations := s.index.ReferencesContext(ctx, uri, symbol.SelectionRange.Start, false)
+		if len(locations) == 0 {
 			return protocol.CodeAction{}, false
 		}
 		for _, reference := range file.References {
@@ -314,19 +417,6 @@ func inlineDeclarationRemoval(text string, start, end int) (int, int) {
 		start--
 	}
 	return start, end
-}
-
-func pureInlineInitializer(value string) bool {
-	value = strings.TrimSpace(value)
-	if isConstantExpression(value) {
-		return true
-	}
-	for _, r := range value {
-		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '$' || r == '.' || unicode.IsSpace(r)) {
-			return false
-		}
-	}
-	return value != ""
 }
 
 func refactorAction(title, kind string, uri protocol.URI, edits ...protocol.TextEdit) protocol.CodeAction {
@@ -397,21 +487,13 @@ func expressionType(expression string, kotlin bool) string {
 		}
 		return "int"
 	default:
-		if kotlin {
-			return "Any"
-		}
-		return "Object"
+		return ""
 	}
 }
 
 func isExpressionSelection(value string) bool {
 	value = strings.TrimSpace(value)
 	return !strings.Contains(value, "\n") && !strings.HasSuffix(value, ";") && !strings.HasPrefix(value, "return ") && !strings.HasPrefix(value, "throw ")
-}
-
-func isConstantExpression(value string) bool {
-	value = strings.TrimSpace(strings.TrimSuffix(value, ";"))
-	return strings.HasPrefix(value, "\"") || value == "true" || value == "false" || allNumeric(strings.TrimSuffix(value, "L"))
 }
 
 func statementTerminator(selected string, kotlin bool) string {
@@ -511,4 +593,17 @@ func lineEndIncludingNewline(text string, offset int) int {
 		return offset + end + 1
 	}
 	return len(text)
+}
+
+func isSimpleIdentifierText(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index, r := range value {
+		if r == '_' || r == '$' || unicode.IsLetter(r) || index > 0 && unicode.IsDigit(r) {
+			continue
+		}
+		return false
+	}
+	return true
 }

@@ -2,6 +2,7 @@ package classfile
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -48,6 +49,28 @@ type Class struct {
 	InnerClasses    []InnerClass
 	Fields          []Field
 	Methods         []Method
+	Module          *ModuleDescriptor
+}
+
+type ModuleDescriptor struct {
+	Name     string
+	Open     bool
+	Requires []ModuleRequirement
+	Exports  []ModuleExport
+	Opens    []ModuleExport
+	Uses     []string
+	Provides map[string][]string
+}
+
+type ModuleRequirement struct {
+	Name       string
+	Transitive bool
+	Static     bool
+}
+
+type ModuleExport struct {
+	Package string
+	Targets []string
 }
 
 type KotlinMetadata struct {
@@ -122,6 +145,12 @@ type Method struct {
 	LineNumbers          []int
 }
 
+type localVariableName struct {
+	startPC int
+	slot    int
+	name    string
+}
+
 type constant struct {
 	tag       byte
 	text      string
@@ -193,6 +222,18 @@ func Parse(data []byte) (*Class, error) {
 		}
 		return utf8(pool[index].nameIndex)
 	}
+	moduleName := func(index uint16) string {
+		if int(index) >= len(pool) || index == 0 || pool[index].tag != 19 {
+			return ""
+		}
+		return strings.ReplaceAll(utf8(pool[index].nameIndex), "/", ".")
+	}
+	packageName := func(index uint16) string {
+		if int(index) >= len(pool) || index == 0 || pool[index].tag != 20 {
+			return ""
+		}
+		return strings.ReplaceAll(utf8(pool[index].nameIndex), "/", ".")
+	}
 	annotations := func(payload []byte) []string { return parseAnnotations(payload, pool, utf8) }
 	parameterAnnotations := func(payload []byte) [][]string { return parseParameterAnnotations(payload, pool, utf8) }
 	typeAnnotations := func(payload []byte) []TypeAnnotation { return parseTypeAnnotations(payload, pool, utf8) }
@@ -240,6 +281,7 @@ func Parse(data []byte) (*Class, error) {
 	result.Methods = make([]Method, 0, methods)
 	for range methods {
 		method := Method{Access: r.u2(), Name: utf8(r.u2()), Descriptor: utf8(r.u2())}
+		var localNames []localVariableName
 		readAttributes(r, utf8, func(name string, payload []byte) {
 			switch name {
 			case "Signature":
@@ -277,16 +319,27 @@ func Parse(data []byte) (*Class, error) {
 				code.skip(int(code.u4()))
 				code.skip(int(code.u2()) * 8)
 				readAttributes(code, utf8, func(codeAttribute string, codePayload []byte) {
-					if codeAttribute != "LineNumberTable" || len(codePayload) < 2 {
+					if len(codePayload) < 2 {
 						return
 					}
 					count := int(binary.BigEndian.Uint16(codePayload))
-					seen := make(map[int]bool, count)
-					for offset := 2; count > 0 && offset+3 < len(codePayload); count, offset = count-1, offset+4 {
-						line := int(binary.BigEndian.Uint16(codePayload[offset+2 : offset+4]))
-						if line > 0 && !seen[line] {
-							seen[line] = true
-							method.LineNumbers = append(method.LineNumbers, line)
+					switch codeAttribute {
+					case "LineNumberTable":
+						seen := make(map[int]bool, count)
+						for offset := 2; count > 0 && offset+3 < len(codePayload); count, offset = count-1, offset+4 {
+							line := int(binary.BigEndian.Uint16(codePayload[offset+2 : offset+4]))
+							if line > 0 && !seen[line] {
+								seen[line] = true
+								method.LineNumbers = append(method.LineNumbers, line)
+							}
+						}
+					case "LocalVariableTable":
+						for offset := 2; count > 0 && offset+9 < len(codePayload); count, offset = count-1, offset+10 {
+							localNames = append(localNames, localVariableName{
+								startPC: int(binary.BigEndian.Uint16(codePayload[offset : offset+2])),
+								name:    utf8(binary.BigEndian.Uint16(codePayload[offset+4 : offset+6])),
+								slot:    int(binary.BigEndian.Uint16(codePayload[offset+8 : offset+10])),
+							})
 						}
 					}
 				})
@@ -296,6 +349,7 @@ func Parse(data []byte) (*Class, error) {
 			}
 		})
 		method.ParameterTypes, method.ResultType, _ = parseMethodDescriptor(method.Descriptor)
+		method.ParameterNames = recoverParameterNames(method, localNames)
 		if _, parameters, resultType, _, ok := parseMethodSignature(method.Signature); ok && len(parameters) == len(method.ParameterTypes) {
 			method.ParameterTypes, method.ResultType = parameters, resultType
 		}
@@ -376,6 +430,47 @@ func Parse(data []byte) (*Class, error) {
 					result.NestMembers = append(result.NestMembers, className(binary.BigEndian.Uint16(payload[offset:offset+2])))
 				}
 			}
+		case "Module":
+			moduleReader := &reader{data: payload}
+			module := &ModuleDescriptor{Name: moduleName(moduleReader.u2()), Provides: make(map[string][]string)}
+			moduleFlags := moduleReader.u2()
+			module.Open = moduleFlags&0x0020 != 0
+			_ = moduleReader.u2() // module_version_index
+			for count := int(moduleReader.u2()); count > 0; count-- {
+				name := moduleName(moduleReader.u2())
+				flags := moduleReader.u2()
+				_ = moduleReader.u2()
+				module.Requires = append(module.Requires, ModuleRequirement{Name: name, Transitive: flags&0x0020 != 0, Static: flags&0x0040 != 0})
+			}
+			readExports := func() []ModuleExport {
+				count := int(moduleReader.u2())
+				values := make([]ModuleExport, 0, count)
+				for ; count > 0; count-- {
+					exported := ModuleExport{Package: packageName(moduleReader.u2())}
+					_ = moduleReader.u2()
+					for targets := int(moduleReader.u2()); targets > 0; targets-- {
+						exported.Targets = append(exported.Targets, moduleName(moduleReader.u2()))
+					}
+					values = append(values, exported)
+				}
+				return values
+			}
+			module.Exports = readExports()
+			module.Opens = readExports()
+			for count := int(moduleReader.u2()); count > 0; count-- {
+				module.Uses = append(module.Uses, strings.ReplaceAll(className(moduleReader.u2()), "/", "."))
+			}
+			for count := int(moduleReader.u2()); count > 0; count-- {
+				service := strings.ReplaceAll(className(moduleReader.u2()), "/", ".")
+				for implementations := int(moduleReader.u2()); implementations > 0; implementations-- {
+					module.Provides[service] = append(module.Provides[service], strings.ReplaceAll(className(moduleReader.u2()), "/", "."))
+				}
+			}
+			if moduleReader.err != nil {
+				r.err = moduleReader.err
+			} else if module.Name != "" {
+				result.Module = module
+			}
 		}
 	})
 	if r.err != nil {
@@ -385,6 +480,74 @@ func Parse(data []byte) (*Class, error) {
 		return nil, errors.New("class file has no class name")
 	}
 	return result, nil
+}
+
+func recoverParameterNames(method Method, locals []localVariableName) []string {
+	count := len(method.ParameterTypes)
+	if len(method.ParameterNames) > count {
+		method.ParameterNames = method.ParameterNames[:count]
+	}
+	if len(method.ParameterNames) < count {
+		names := make([]string, count)
+		copy(names, method.ParameterNames)
+		method.ParameterNames = names
+	}
+	if count == 0 || len(locals) == 0 {
+		return method.ParameterNames
+	}
+	slots := methodParameterSlots(method.Descriptor, method.Access&accStatic != 0)
+	for parameter, slot := range slots {
+		if parameter >= len(method.ParameterNames) || method.ParameterNames[parameter] != "" {
+			continue
+		}
+		bestStart := int(^uint(0) >> 1)
+		for _, local := range locals {
+			if local.slot == slot && local.name != "" && local.name != "this" && local.startPC < bestStart {
+				method.ParameterNames[parameter], bestStart = local.name, local.startPC
+			}
+		}
+	}
+	return method.ParameterNames
+}
+
+func methodParameterSlots(descriptor string, static bool) []int {
+	if len(descriptor) == 0 || descriptor[0] != '(' {
+		return nil
+	}
+	slot := 0
+	if !static {
+		slot = 1
+	}
+	var slots []int
+	for at := 1; at < len(descriptor) && descriptor[at] != ')'; {
+		slots = append(slots, slot)
+		array := false
+		for at < len(descriptor) && descriptor[at] == '[' {
+			array = true
+			at++
+		}
+		if at >= len(descriptor) {
+			return nil
+		}
+		width := 1
+		switch descriptor[at] {
+		case 'J', 'D':
+			if !array {
+				width = 2
+			}
+			at++
+		case 'L':
+			semicolon := strings.IndexByte(descriptor[at:], ';')
+			if semicolon < 0 {
+				return nil
+			}
+			at += semicolon + 1
+		default:
+			at++
+		}
+		slot += width
+	}
+	return slots
 }
 
 func decodeModifiedUTF8(data []byte) string {
@@ -742,6 +905,10 @@ func (r *reader) skip(length int) { _ = r.bytes(length) }
 
 func RenderJava(class *Class) string {
 	packageName, nestedNames, nestingAccess := classNesting(class)
+	packageName = sourceJavaQualifiedName(packageName)
+	for index := range nestedNames {
+		nestedNames[index] = SourceJavaIdentifier(nestedNames[index])
+	}
 	simpleName := nestedNames[len(nestedNames)-1]
 	outerNames := nestedNames[:len(nestedNames)-1]
 	indent := strings.Repeat("    ", len(outerNames))
@@ -816,7 +983,7 @@ func RenderJava(class *Class) string {
 			}
 			out.WriteString(typ)
 			out.WriteByte(' ')
-			out.WriteString(component.Name)
+			out.WriteString(SourceJavaIdentifier(component.Name))
 		}
 		out.WriteByte(')')
 	}
@@ -856,7 +1023,7 @@ func RenderJava(class *Class) string {
 		out.WriteString("    ;\n")
 	}
 	for _, field := range class.Fields {
-		if field.Access&accSynthetic != 0 || !validJavaIdentifier(field.Name) {
+		if field.Access&accSynthetic != 0 {
 			continue
 		}
 		if class.Record && recordComponent(class.Components, field.Name, field.Descriptor) {
@@ -879,7 +1046,7 @@ func RenderJava(class *Class) string {
 		}
 		out.WriteString(typ)
 		out.WriteByte(' ')
-		out.WriteString(field.Name)
+		out.WriteString(SourceJavaIdentifier(field.Name))
 		if field.Constant != "" {
 			out.WriteString(" = ")
 			out.WriteString(field.Constant)
@@ -892,9 +1059,6 @@ func RenderJava(class *Class) string {
 		}
 		constructor := method.Name == "<init>"
 		if class.Record && (constructor && method.Descriptor == canonicalRecordConstructorDescriptor(class.Components) || recordAccessor(class.Components, method.Name, method.Descriptor)) {
-			continue
-		}
-		if !constructor && !validJavaIdentifier(method.Name) {
 			continue
 		}
 		parameters, result, ok := parseMethodDescriptor(method.Descriptor)
@@ -928,7 +1092,7 @@ func RenderJava(class *Class) string {
 		} else {
 			out.WriteString(result)
 			out.WriteByte(' ')
-			out.WriteString(method.Name)
+			out.WriteString(SourceJavaIdentifier(method.Name))
 		}
 		out.WriteByte('(')
 		for index, parameter := range parameters {
@@ -948,10 +1112,10 @@ func RenderJava(class *Class) string {
 			if index < len(method.ParameterNames) {
 				name = method.ParameterNames[index]
 			}
-			if !validJavaIdentifier(name) {
+			if name == "" {
 				name = fmt.Sprintf("arg%d", index)
 			}
-			out.WriteString(name)
+			out.WriteString(SourceJavaIdentifier(name))
 		}
 		out.WriteByte(')')
 		if class.Access&accAnnotation != 0 && method.DefaultValue != "" {
@@ -984,6 +1148,359 @@ func RenderJava(class *Class) string {
 		out.WriteString("}\n")
 	}
 	return out.String()
+}
+
+// JavaDeclaration is the semantic source view of a classfile declaration.
+// It lets dependency indexing consume bytecode directly; RenderJava remains a
+// navigation artifact, not an intermediate language which must be reparsed.
+type JavaDeclaration struct {
+	Name                string
+	JVMName             string
+	JVMDescriptor       string
+	FQN                 string
+	ContainerFQN        string
+	Kind                string
+	Type                string
+	Initializer         string
+	Signature           string
+	Parameters          []JavaParameter
+	TypeParameters      []string
+	TypeParameterBounds map[string][]string
+	Supertypes          []string
+	Modifiers           []string
+	Deprecated          bool
+	NameStart           int
+	NameEnd             int
+}
+
+type JavaParameter struct {
+	Name     string
+	Type     string
+	Variadic bool
+}
+
+// JavaDeclarations derives the public semantic model from descriptors,
+// signatures, flags, and debug parameter tables. Name offsets point into the
+// supplied rendered navigation text. Missing synthetic source locations fall
+// back to their owning type; identity and overload matching never depend on
+// those offsets.
+func JavaDeclarations(class *Class, rendered string) []JavaDeclaration {
+	if class == nil {
+		return nil
+	}
+	packageName, nestedNames, nestingAccess := classNesting(class)
+	packageName = sourceJavaQualifiedName(packageName)
+	for index := range nestedNames {
+		nestedNames[index] = SourceJavaIdentifier(nestedNames[index])
+	}
+	declarations := make([]JavaDeclaration, 0, len(class.Fields)+len(class.Methods)+len(nestedNames))
+	containerFQN := ""
+	cursor := 0
+	if packageName != "" {
+		if semicolon := strings.IndexByte(rendered, ';'); semicolon >= 0 {
+			cursor = semicolon + 1
+		}
+	}
+	ownerOffset := 0
+	for index, name := range nestedNames {
+		fqn := name
+		if containerFQN != "" {
+			fqn = containerFQN + "." + name
+		} else if packageName != "" {
+			fqn = packageName + "." + name
+		}
+		access := uint16(0)
+		if index < len(nestingAccess) {
+			access = nestingAccess[index]
+		}
+		kind := "class"
+		var typeParameters []string
+		var bounds map[string][]string
+		var supertypes []string
+		if index == len(nestedNames)-1 {
+			access |= class.Access
+			kind = javaDeclarationClassKind(class)
+			typeParameterText, supertype, interfaces, generic := parseClassSignature(class.Signature)
+			if generic {
+				typeParameters, bounds = splitJavaTypeParameters(typeParameterText)
+			}
+			if !generic {
+				supertype = javaClassName(class.SuperName)
+				interfaces = make([]string, len(class.Interfaces))
+				for implemented := range class.Interfaces {
+					interfaces[implemented] = javaClassName(class.Interfaces[implemented])
+				}
+			}
+			if supertype != "" && supertype != "java.lang.Object" && class.Access&(accInterface|accAnnotation|accEnum) == 0 && !class.Record {
+				supertypes = append(supertypes, supertype)
+			}
+			for _, implemented := range interfaces {
+				if class.Access&accAnnotation == 0 || implemented != "java.lang.annotation.Annotation" {
+					supertypes = append(supertypes, implemented)
+				}
+			}
+		}
+		start, end := findRenderedIdentifier(rendered, name, cursor)
+		if start >= 0 {
+			cursor, ownerOffset = end, start
+		} else {
+			start, end = ownerOffset, ownerOffset+len(name)
+		}
+		declaration := JavaDeclaration{
+			Name: name, JVMName: name, FQN: fqn, ContainerFQN: containerFQN, Kind: kind,
+			TypeParameters: typeParameters, TypeParameterBounds: bounds,
+			Supertypes: supertypes, Modifiers: javaModifierWords(access, true),
+			Deprecated: index == len(nestedNames)-1 && class.Deprecated,
+			NameStart:  start, NameEnd: end,
+		}
+		declaration.Signature = javaDeclarationSignature(declaration)
+		declarations = append(declarations, declaration)
+		containerFQN = fqn
+	}
+	if len(nestedNames) == 0 {
+		return declarations
+	}
+	ownerName := nestedNames[len(nestedNames)-1]
+	ownerFQN := containerFQN
+	for _, field := range class.Fields {
+		if field.Access&accSynthetic != 0 {
+			continue
+		}
+		typ, _, ok := parseType(field.Descriptor, 0)
+		if generic, genericOK := parseFieldSignature(field.Signature); genericOK {
+			typ, ok = generic, true
+		}
+		if !ok {
+			typ = "java.lang.Object"
+		}
+		name := SourceJavaIdentifier(field.Name)
+		start, end := findRenderedIdentifier(rendered, name, cursor)
+		if start >= 0 && !(class.Record && recordComponent(class.Components, field.Name, field.Descriptor)) {
+			cursor = end
+		} else {
+			start, end = recordComponentOffset(rendered, class, field.Name, ownerOffset)
+		}
+		kind := "field"
+		if field.Access&accEnum != 0 {
+			kind = "enumMember"
+		}
+		declaration := JavaDeclaration{
+			Name: name, JVMName: field.Name, FQN: ownerFQN + "." + name, ContainerFQN: ownerFQN,
+			JVMDescriptor: field.Descriptor,
+			Kind:          kind, Type: typ, Initializer: field.Constant, Modifiers: javaModifierWords(field.Access, false),
+			Deprecated: field.Deprecated, NameStart: start, NameEnd: end,
+		}
+		declaration.Signature = javaDeclarationSignature(declaration)
+		declarations = append(declarations, declaration)
+	}
+	for _, method := range class.Methods {
+		if method.Name == "<clinit>" || method.Access&(accSynthetic|accBridge) != 0 {
+			continue
+		}
+		parameters, result, ok := parseMethodDescriptor(method.Descriptor)
+		if !ok {
+			continue
+		}
+		typeParameterText := ""
+		if genericTypes, genericParameters, genericResult, _, genericOK := parseMethodSignature(method.Signature); genericOK && len(genericParameters) == len(parameters) {
+			typeParameterText, parameters, result = genericTypes, genericParameters, genericResult
+		}
+		typeParameters, bounds := splitJavaTypeParameters(typeParameterText)
+		constructor := method.Name == "<init>"
+		name, kind := SourceJavaIdentifier(method.Name), "method"
+		if constructor {
+			name, kind, result = ownerName, "constructor", ""
+		}
+		values := make([]JavaParameter, len(parameters))
+		for parameter, typ := range parameters {
+			parameterName := ""
+			if parameter < len(method.ParameterNames) {
+				parameterName = method.ParameterNames[parameter]
+			}
+			if parameterName == "" {
+				parameterName = fmt.Sprintf("arg%d", parameter)
+			}
+			variadic := method.Access&0x0080 != 0 && parameter == len(parameters)-1 && strings.HasSuffix(typ, "[]")
+			if variadic {
+				typ = strings.TrimSuffix(typ, "[]") + "..."
+			}
+			values[parameter] = JavaParameter{Name: SourceJavaIdentifier(parameterName), Type: typ, Variadic: variadic}
+		}
+		filteredRecordMethod := class.Record && (constructor && method.Descriptor == canonicalRecordConstructorDescriptor(class.Components) || recordAccessor(class.Components, method.Name, method.Descriptor))
+		start, end := -1, -1
+		if !filteredRecordMethod {
+			start, end = findRenderedIdentifier(rendered, name, cursor)
+		}
+		if start >= 0 {
+			cursor = end
+		} else if recordAccessor(class.Components, method.Name, method.Descriptor) {
+			start, end = recordComponentOffset(rendered, class, method.Name, ownerOffset)
+		} else {
+			start, end = ownerOffset, ownerOffset+len(ownerName)
+		}
+		declaration := JavaDeclaration{
+			Name: name, JVMName: method.Name, FQN: ownerFQN + "." + name, ContainerFQN: ownerFQN,
+			JVMDescriptor: method.Descriptor,
+			Kind:          kind, Type: result, Parameters: values, TypeParameters: typeParameters,
+			TypeParameterBounds: bounds, Modifiers: javaModifierWords(method.Access, false),
+			Deprecated: method.Deprecated, NameStart: start, NameEnd: end,
+		}
+		declaration.Signature = javaDeclarationSignature(declaration)
+		declarations = append(declarations, declaration)
+	}
+	return declarations
+}
+
+func javaDeclarationClassKind(class *Class) string {
+	switch {
+	case class.Access&accAnnotation != 0:
+		return "annotation"
+	case class.Access&accEnum != 0:
+		return "enum"
+	case class.Access&accInterface != 0:
+		return "interface"
+	case class.Record:
+		return "record"
+	default:
+		return "class"
+	}
+}
+
+func javaModifierWords(access uint16, class bool) []string {
+	return strings.Fields(modifiers(access, class))
+}
+
+func splitJavaTypeParameters(value string) ([]string, map[string][]string) {
+	value = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(value), "<"), ">"))
+	if value == "" {
+		return nil, nil
+	}
+	parts := splitGenericList(value)
+	names := make([]string, 0, len(parts))
+	bounds := make(map[string][]string)
+	for _, part := range parts {
+		name, constraints, found := strings.Cut(strings.TrimSpace(part), " extends ")
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		names = append(names, name)
+		if found {
+			for _, bound := range strings.Split(constraints, " & ") {
+				if bound = strings.TrimSpace(bound); bound != "" {
+					bounds[name] = append(bounds[name], bound)
+				}
+			}
+		}
+	}
+	if len(bounds) == 0 {
+		bounds = nil
+	}
+	return names, bounds
+}
+
+func splitGenericList(value string) []string {
+	var result []string
+	start, depth := 0, 0
+	for index, character := range value {
+		switch character {
+		case '<':
+			depth++
+		case '>':
+			depth--
+		case ',':
+			if depth == 0 {
+				result = append(result, value[start:index])
+				start = index + 1
+			}
+		}
+	}
+	return append(result, value[start:])
+}
+
+func findRenderedIdentifier(source, name string, start int) (int, int) {
+	for start <= len(source)-len(name) {
+		relative := strings.Index(source[start:], name)
+		if relative < 0 {
+			break
+		}
+		at := start + relative
+		beforeOK := at == 0 || !isJavaIdentifierByte(source[at-1])
+		after := at + len(name)
+		afterOK := after == len(source) || !isJavaIdentifierByte(source[after])
+		if beforeOK && afterOK {
+			return at, after
+		}
+		start = at + len(name)
+	}
+	return -1, -1
+}
+
+func isJavaIdentifierByte(value byte) bool {
+	return value == '_' || value == '$' || value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
+}
+
+func recordComponentOffset(rendered string, class *Class, name string, fallback int) (int, int) {
+	owner := SourceJavaIdentifier(classNestingName(class))
+	start, _ := findRenderedIdentifier(rendered, owner, 0)
+	if start >= 0 {
+		if component, end := findRenderedIdentifier(rendered, SourceJavaIdentifier(name), start+len(owner)); component >= 0 {
+			return component, end
+		}
+	}
+	return fallback, fallback + len(owner)
+}
+
+func classNestingName(class *Class) string {
+	_, names, _ := classNesting(class)
+	if len(names) == 0 {
+		return ""
+	}
+	return names[len(names)-1]
+}
+
+func javaDeclarationSignature(declaration JavaDeclaration) string {
+	var signature strings.Builder
+	if declaration.Kind != "constructor" && declaration.Type != "" {
+		signature.WriteString(declaration.Type)
+		signature.WriteByte(' ')
+	}
+	if declaration.Kind == "class" || declaration.Kind == "interface" || declaration.Kind == "enum" || declaration.Kind == "annotation" || declaration.Kind == "record" {
+		signature.WriteString(declaration.Kind)
+		signature.WriteByte(' ')
+	}
+	signature.WriteString(declaration.Name)
+	if len(declaration.TypeParameters) > 0 {
+		signature.WriteByte('<')
+		for index, parameter := range declaration.TypeParameters {
+			if index > 0 {
+				signature.WriteString(", ")
+			}
+			signature.WriteString(parameter)
+			if bounds := declaration.TypeParameterBounds[parameter]; len(bounds) > 0 {
+				signature.WriteString(" extends ")
+				signature.WriteString(strings.Join(bounds, " & "))
+			}
+		}
+		signature.WriteByte('>')
+	}
+	if declaration.Kind == "method" || declaration.Kind == "constructor" {
+		signature.WriteByte('(')
+		for index, parameter := range declaration.Parameters {
+			if index > 0 {
+				signature.WriteString(", ")
+			}
+			signature.WriteString(parameter.Type)
+			signature.WriteByte(' ')
+			signature.WriteString(parameter.Name)
+		}
+		signature.WriteByte(')')
+	}
+	if len(declaration.Supertypes) > 0 {
+		signature.WriteString(" : ")
+		signature.WriteString(strings.Join(declaration.Supertypes, ", "))
+	}
+	return signature.String()
 }
 
 func writeAnnotations(out *strings.Builder, annotations []string, indent string) {
@@ -1075,7 +1592,7 @@ func splitBinaryClassName(qualified string) (string, []string) {
 }
 
 func javaClassName(internal string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(internal, "/", "."), "$", ".")
+	return sourceJavaQualifiedName(strings.ReplaceAll(strings.ReplaceAll(internal, "/", "."), "$", "."))
 }
 
 type signatureReader struct {
@@ -1411,7 +1928,7 @@ func defaultValue(typ string) string {
 }
 
 func validJavaIdentifier(name string) bool {
-	if name == "" {
+	if name == "" || javaKeywords[name] || strings.HasPrefix(name, "$kotlsp$") {
 		return false
 	}
 	for index, r := range name {
@@ -1424,4 +1941,77 @@ func validJavaIdentifier(name string) bool {
 		}
 	}
 	return true
+}
+
+var javaKeywords = map[string]bool{
+	"abstract": true, "assert": true, "boolean": true, "break": true, "byte": true,
+	"case": true, "catch": true, "char": true, "class": true, "const": true,
+	"continue": true, "default": true, "do": true, "double": true, "else": true,
+	"enum": true, "extends": true, "final": true, "finally": true, "float": true,
+	"for": true, "goto": true, "if": true, "implements": true, "import": true,
+	"instanceof": true, "int": true, "interface": true, "long": true, "native": true,
+	"new": true, "package": true, "private": true, "protected": true, "public": true,
+	"return": true, "short": true, "static": true, "strictfp": true, "super": true,
+	"switch": true, "synchronized": true, "this": true, "throw": true, "throws": true,
+	"transient": true, "try": true, "void": true, "volatile": true, "while": true,
+	"true": true, "false": true, "null": true, "_": true,
+	"exports": true, "module": true, "non-sealed": true, "open": true, "opens": true,
+	"permits": true, "provides": true, "record": true, "requires": true, "sealed": true,
+	"to": true, "transitive": true, "uses": true, "var": true, "when": true,
+	"with": true, "yield": true,
+}
+
+// SourceJavaIdentifier returns a reversible Java-source spelling for an
+// arbitrary JVM identifier. Classfiles (and Kotlin) permit names which Java
+// reserves or cannot lex; rendering them verbatim would invalidate the entire
+// synthetic source file.
+func SourceJavaIdentifier(name string) string {
+	if validJavaIdentifier(name) {
+		return name
+	}
+	return "$kotlsp$" + hex.EncodeToString([]byte(name))
+}
+
+func sourceJavaQualifiedName(name string) string {
+	if name == "" {
+		return ""
+	}
+	parts := strings.Split(name, ".")
+	for index := range parts {
+		parts[index] = SourceJavaIdentifier(parts[index])
+	}
+	return strings.Join(parts, ".")
+}
+
+// RestoreSourceJavaIdentifiers reverses SourceJavaIdentifier tokens embedded
+// in parsed names, qualified names, and type signatures.
+func RestoreSourceJavaIdentifiers(value string) string {
+	const prefix = "$kotlsp$"
+	for at := strings.Index(value, prefix); at >= 0; {
+		start := at + len(prefix)
+		end := start
+		for end < len(value) && (value[end] >= '0' && value[end] <= '9' || value[end] >= 'a' && value[end] <= 'f') {
+			end++
+		}
+		if end == start || (end-start)%2 != 0 {
+			next := strings.Index(value[start:], prefix)
+			if next < 0 {
+				break
+			}
+			at = start + next
+			continue
+		}
+		decoded, err := hex.DecodeString(value[start:end])
+		if err != nil {
+			break
+		}
+		value = value[:at] + string(decoded) + value[end:]
+		searchFrom := at + len(decoded)
+		relative := strings.Index(value[searchFrom:], prefix)
+		if relative < 0 {
+			break
+		}
+		at = searchFrom + relative
+	}
+	return value
 }

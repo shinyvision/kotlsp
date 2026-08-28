@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/shinyvision/kotlsp/internal/analysis"
 	"github.com/shinyvision/kotlsp/internal/protocol"
 )
 
@@ -41,9 +42,12 @@ func TestFastRulesPredictTheCompilersExactMessages(t *testing.T) {
 		{"return expression", "package app\nfun f(): String = 1\n", "RETURN_TYPE_MISMATCH", "Return type mismatch: expected 'String', actual 'Int'."},
 		{"return block", "package app\nfun f(): String { return 1 }\n", "RETURN_TYPE_MISMATCH", "Return type mismatch: expected 'String', actual 'Int'."},
 		{"argument", "package app\nfun g(x: Int) = x\nfun f() = g(\"s\")\n", "ARGUMENT_TYPE_MISMATCH", "Argument type mismatch: actual type is 'String', but 'Int' was expected."},
+		{"typed argument expression", "package app\nfun g(x: Int) = x\nfun f() { val value: String = \"s\"; g(value) }\n", "ARGUMENT_TYPE_MISMATCH", "Argument type mismatch: actual type is 'String', but 'Int' was expected."},
 		{"missing argument", "package app\nfun g(x: Int, y: String = \"\") = x\nfun f() = g()\n", "NO_VALUE_FOR_PARAMETER", "No value passed for parameter 'x'."},
 		{"overrides nothing", "package app\nopen class P { open fun a() {} }\nclass C : P() { override fun b() {} }\n", "NOTHING_TO_OVERRIDE", "'b' overrides nothing."},
 		{"abstract member", "package app\ninterface S { fun area(): Int }\nclass Sq : S\n", "ABSTRACT_MEMBER_NOT_IMPLEMENTED", "Class 'Sq' is not abstract and does not implement abstract member:"},
+		{"same-name overload does not implement", "package app\ninterface S { fun area(x: Int): Int }\nclass Sq : S { fun area(x: String) = 0 }\n", "ABSTRACT_MEMBER_NOT_IMPLEMENTED", "Class 'Sq' is not abstract and does not implement abstract member:"},
+		{"wrong Any overload", "package app\nclass C { override fun equals() = true }\n", "NOTHING_TO_OVERRIDE", "'equals' overrides nothing."},
 		{"no type no init", "package app\nfun f() { val q }\n", "VARIABLE_WITH_NO_TYPE_NO_INITIALIZER", "This variable must either have an explicit type or be initialized."},
 		{"no body", "package app\nfun f(): Int\n", "NON_MEMBER_FUNCTION_NO_BODY", "Function 'f' must have a body."},
 		{"uninitialised property", "package app\nclass H { val h: Int }\n", "MUST_BE_INITIALIZED_OR_BE_ABSTRACT", "Property must be initialized or be abstract."},
@@ -219,5 +223,49 @@ func TestArgumentLabelsAreNotReportedAsUnresolved(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("the unresolved callee itself was not reported")
+	}
+}
+
+func TestLocalFastRuleRunsWhileWorkspaceIndexIsCold(t *testing.T) {
+	idx := New(nil)
+	t.Cleanup(idx.Close)
+	uri := protocol.URI("file:///workspace/Cold.kt")
+	idx.Open(context.Background(), protocol.TextDocumentItem{
+		URI: uri, LanguageID: "kotlin", Version: 1,
+		Text: "package app\n\nfun unfinished()\n",
+	})
+	if idx.Progress().Ready {
+		t.Fatal("test requires a cold index")
+	}
+	if found := fastFindings(idx, uri, "NON_MEMBER_FUNCTION_NO_BODY"); len(found) != 1 {
+		t.Fatalf("local declaration rule was hidden by workspace readiness: %#v", found)
+	}
+	status := idx.FastDiagnosticStatus()
+	if status.LocalRuleCount == 0 || status.WorkspaceRuleCount == 0 {
+		t.Fatalf("status does not separate local and workspace rules: %#v", status)
+	}
+	if status.UnavailableFilesByReason["workspace-dependent rules are waiting for a complete index"] != 1 {
+		t.Fatalf("cold-index abstention was not explained: %#v", status.UnavailableFilesByReason)
+	}
+}
+
+func TestSyntaxDamageOnlySuppressesItsOwningDeclaration(t *testing.T) {
+	file := &analysis.ParsedFile{
+		Symbols: []analysis.Symbol{
+			{Range: protocol.Range{Start: protocol.Position{Line: 0}, End: protocol.Position{Line: 2}}},
+			{Range: protocol.Range{Start: protocol.Position{Line: 4}, End: protocol.Position{Line: 6}}},
+		},
+		Diagnostics: []protocol.Diagnostic{{
+			Severity: 1, Code: "syntax",
+			Range: protocol.Range{Start: protocol.Position{Line: 1}, End: protocol.Position{Line: 1, Character: 1}},
+		}},
+	}
+	predictions := []protocol.Diagnostic{
+		{Message: "damaged", Range: protocol.Range{Start: protocol.Position{Line: 0}, End: protocol.Position{Line: 0, Character: 1}}},
+		{Message: "independent", Range: protocol.Range{Start: protocol.Position{Line: 5}, End: protocol.Position{Line: 5, Character: 1}}},
+	}
+	kept := predictionsOutsideSyntaxDamage(predictions, file)
+	if len(kept) != 1 || kept[0].Message != "independent" {
+		t.Fatalf("range-local syntax abstention = %#v", kept)
 	}
 }

@@ -98,6 +98,8 @@ func TestScopeEngineReportsProvablyUnresolvedNames(t *testing.T) {
 		{"inside with over a resolvable argument", "package app\nclass Ctx { fun put(x: Any) {} }\nclass Other { val secret = 1 }\nfun f(c: Ctx) { with(c) { put(secret) } }\n", "secret"},
 		{"call to a member of another class", "package app\nclass Other { fun helper() = 1 }\nfun f() = helper()\n", "helper"},
 		{"other package top-level not imported", "package app\nfun f() = util()\n", "util"},
+		{"local in another function", "package app\nfun first() { val secret = 1 }\nfun second() = secret\n", "secret"},
+		{"familiar generated-member spelling without receiver", "package app\nclass Other { val length = 1 }\nfun f() = length\n", "length"},
 	} {
 		files := map[string]string{"app/Probe.kt": fixture.source, "other/Util.kt": "package other\nfun util() = 1\n"}
 		idx := scopeIndex(t, files)
@@ -105,6 +107,17 @@ func TestScopeEngineReportsProvablyUnresolvedNames(t *testing.T) {
 		if len(got) != 1 || got[0] != fixture.want {
 			t.Errorf("%s: wanted %q, got %q", fixture.label, fixture.want, got)
 		}
+	}
+}
+
+func TestScopeEngineDoesNotBroadenEnumVisibilityFromRawWhenText(t *testing.T) {
+	idx := scopeIndex(t, map[string]string{
+		"other/Color.kt": "package other\nenum class Color { RED }\n",
+		"app/Probe.kt":   "package app\n// when mentioned only in a comment\nfun f() = RED\n",
+	})
+	got := unresolvedNames(idx, "file:///workspace/app/Probe.kt")
+	if len(got) != 1 || got[0] != "RED" {
+		t.Fatalf("comment text broadened enum visibility: %q", got)
 	}
 }
 

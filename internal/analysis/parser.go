@@ -3,7 +3,8 @@ package analysis
 import (
 	"bytes"
 	"context"
-	"hash/fnv"
+	"crypto/sha256"
+	"encoding/binary"
 	"runtime"
 	"sort"
 	"strings"
@@ -98,18 +99,186 @@ func LanguageFor(uri protocol.URI, languageID string) Language {
 	}
 }
 
+// SyntaxFingerprint hashes the complete concrete syntax tree while ignoring
+// trivia positions. Formatters may change whitespace, but every token, literal,
+// comment, error node, and parent/child shape must remain identical. Returning
+// ok=false makes callers withhold an edit rather than trust a lexical rewrite.
+func SyntaxFingerprint(ctx context.Context, source string, language Language) (fingerprint uint64, ok bool) {
+	parserLanguage := javaLanguage
+	if language == LanguageKotlin {
+		parserLanguage = kotlinLanguage
+	} else if language != LanguageJava {
+		return 0, false
+	}
+	parser := sitter.NewParser()
+	defer parser.Close()
+	if err := parser.SetLanguage(parserLanguage); err != nil {
+		return 0, false
+	}
+	tree := parseTreeContext(ctx, parser, []byte(source), nil)
+	if tree == nil || ctx.Err() != nil {
+		return 0, false
+	}
+	defer tree.Close()
+	hash := sha256.New()
+	type syntaxFrame struct {
+		node        sitter.Node
+		next, count uint
+		entered     bool
+	}
+	root := tree.RootNode()
+	if root == nil {
+		return 0, false
+	}
+	stack := []syntaxFrame{{node: *root}}
+	visited := 0
+	for len(stack) > 0 {
+		if visited&255 == 0 && ctx.Err() != nil || visited >= 4_000_000 || len(stack) > 65_536 {
+			return 0, false
+		}
+		frame := &stack[len(stack)-1]
+		if !frame.entered {
+			frame.entered = true
+			frame.count = frame.node.ChildCount()
+			visited++
+			_, _ = hash.Write([]byte(frame.node.Kind()))
+			_, _ = hash.Write([]byte{0})
+			if frame.count != 0 {
+				continue
+			}
+			start, end := int(frame.node.StartByte()), int(frame.node.EndByte())
+			if start < 0 || end < start || end > len(source) {
+				return 0, false
+			}
+			_, _ = hash.Write([]byte(source[start:end]))
+			_, _ = hash.Write([]byte{0xff})
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		if frame.next < frame.count {
+			child := frame.node.Child(frame.next)
+			frame.next++
+			if child == nil {
+				return 0, false
+			}
+			stack = append(stack, syntaxFrame{node: *child})
+			continue
+		}
+		_, _ = hash.Write([]byte{0xfe})
+		stack = stack[:len(stack)-1]
+	}
+	return binary.LittleEndian.Uint64(hash.Sum(nil)[:8]), true
+}
+
+// parseTreeContext keeps cancellation synchronous with the lifetime of parser.
+//
+// go-tree-sitter's deprecated ParseCtx starts a goroutine which writes through
+// the parser's native cancellation pointer. ParseCtx returns before proving
+// that goroutine has exited, so a context cancellation racing Parser.Close can
+// dereference an already deleted TSParser and terminate the whole process. A
+// panic in that detached goroutine is not recoverable by an LSP request guard.
+//
+// ParseWithOptions avoids that goroutine, but v0.25.0 retains the Go callback
+// payload for every options-bearing parse. A bounded input callback gives us
+// prompt cancellation without either lifetime defect. Returning an empty chunk
+// may let tree-sitter construct a prefix tree; the post-parse context check
+// closes and rejects it, so canceled syntax is never published.
+func parseTreeContext(ctx context.Context, parser *sitter.Parser, source []byte, oldTree *sitter.Tree) *sitter.Tree {
+	if parser == nil {
+		return nil
+	}
+	if ctx == nil || ctx.Done() == nil {
+		return parser.Parse(source, oldTree)
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+	const inputChunkBytes = 32 << 10
+	tree := parser.ParseWith(func(offset int, _ sitter.Point) []byte {
+		if ctx.Err() != nil || offset < 0 || offset >= len(source) {
+			return nil
+		}
+		end := offset + inputChunkBytes
+		if end > len(source) {
+			end = len(source)
+		}
+		return source[offset:end]
+	}, oldTree)
+	if ctx.Err() != nil {
+		if tree != nil {
+			tree.Close()
+		}
+		return nil
+	}
+	return tree
+}
+
+// SyntaxState owns the native syntax tree for one open document. Index edits
+// are serialized per document, while the mutex also makes shutdown safe.
+type SyntaxState struct {
+	mu                sync.Mutex
+	tree              *sitter.Tree
+	language          Language
+	incrementalParses uint64
+}
+
+func NewSyntaxState() *SyntaxState { return &SyntaxState{} }
+
+func (s *SyntaxState) Close() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.tree != nil {
+		s.tree.Close()
+		s.tree = nil
+	}
+	s.mu.Unlock()
+}
+
+func (s *SyntaxState) IncrementalParses() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.incrementalParses
+}
+
 func Parse(ctx context.Context, doc *textdoc.Document) *ParsedFile {
+	return parseDocument(ctx, doc, nil, nil)
+}
+
+func ParseIncremental(ctx context.Context, doc *textdoc.Document, state *SyntaxState, edits []textdoc.TextEdit) *ParsedFile {
+	return parseDocument(ctx, doc, state, edits)
+}
+
+func parseDocument(ctx context.Context, doc *textdoc.Document, state *SyntaxState, edits []textdoc.TextEdit) *ParsedFile {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	language := LanguageFor(doc.URI, doc.LanguageID)
-	parsed := &ParsedFile{URI: doc.URI, Language: language, Version: doc.Version}
-	h := fnv.New64a()
+	parsed := &ParsedFile{URI: doc.URI, Language: language, Version: doc.Version, ParseMode: "full"}
+	h := sha256.New()
 	_, _ = h.Write([]byte(doc.Text))
-	parsed.TextHash = h.Sum64()
+	parsed.TextHash = binary.LittleEndian.Uint64(h.Sum(nil)[:8])
+	if ctx.Err() != nil {
+		return parsed
+	}
 	if language == LanguageUnknown {
 		return parsed
 	}
 	if language == LanguageKotlin {
 		parsed.JVMFacadeName = kotlinFileAnnotationString(doc.Text, "JvmName")
 		parsed.JVMMultifile = hasKotlinFileAnnotation(doc.Text, "JvmMultifileClass")
+	}
+	if len(doc.Text) >= 8<<20 {
+		if state != nil {
+			state.Close()
+		}
+		parsed.ParseMode = "large"
+		parseLargeDeclarations(ctx, doc, parsed)
+		return parsed
 	}
 	if len(doc.Text) >= 512*1024 {
 		// Register before parser/tree Close defers so native nodes are destroyed
@@ -126,7 +295,7 @@ func Parse(ctx context.Context, doc *textdoc.Document) *ParsedFile {
 		parsed.Diagnostics = append(parsed.Diagnostics, protocol.Diagnostic{Range: protocol.Range{}, Severity: 1, Source: "kotlsp", Message: "failed to initialize parser: " + err.Error()})
 		return parsed
 	}
-	b := &parseBuilder{doc: doc, parsed: parsed, source: []byte(doc.Text), declarations: javaDeclarations, keywords: javaKeywords, fieldIDs: javaFieldIDs, selectionBytes: make(map[[2]int]bool)}
+	b := &parseBuilder{ctx: ctx, doc: doc, parsed: parsed, source: []byte(doc.Text), declarations: javaDeclarations, keywords: javaKeywords, fieldIDs: javaFieldIDs, selectionBytes: make(map[[2]int]bool)}
 	b.allowParallel = true
 	if language == LanguageKotlin {
 		b.declarations = kotlinDeclarations
@@ -144,41 +313,60 @@ func Parse(ctx context.Context, doc *textdoc.Document) *ParsedFile {
 		lexicalBuilder.addLexicalTokens()
 		lexicalDone <- lexicalParsed.Tokens
 	}()
-	parserSource := compressFullLineComments(b.source)
-	tree := p.Parse(parserSource, nil)
+	parserSource := b.source
+	var oldTree, previousTree *sitter.Tree
+	fullFallback := false
+	if state == nil {
+		parserSource = compressFullLineComments(parserSource)
+	} else {
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		if state.tree != nil && state.language == language {
+			previousTree = state.tree
+			oldTree = state.tree.Clone()
+			for _, edit := range edits {
+				oldTree.Edit(&sitter.InputEdit{
+					StartByte: uint(edit.StartByte), OldEndByte: uint(edit.OldEndByte), NewEndByte: uint(edit.NewEndByte),
+					StartPosition:  sitter.Point{Row: uint(edit.StartLine), Column: uint(edit.StartColumn)},
+					OldEndPosition: sitter.Point{Row: uint(edit.OldEndLine), Column: uint(edit.OldEndColumn)},
+					NewEndPosition: sitter.Point{Row: uint(edit.NewEndLine), Column: uint(edit.NewEndColumn)},
+				})
+			}
+		} else if state.tree != nil {
+			state.tree.Close()
+			state.tree = nil
+		}
+	}
+	tree := parseTreeContext(ctx, p, parserSource, oldTree)
+	if oldTree != nil {
+		oldTree.Close()
+	}
+	if tree == nil && ctx.Err() == nil {
+		// Incremental failure is not a reason to discard the last usable tree.
+		// Retry once from source while the unedited previous state remains owned
+		// by SyntaxState; only a successful replacement closes it.
+		tree = parseTreeContext(ctx, p, parserSource, nil)
+		fullFallback = tree != nil
+	}
 	b.lexicalTokens = <-lexicalDone
 	if tree == nil {
 		parsed.Diagnostics = append(parsed.Diagnostics, protocol.Diagnostic{Range: protocol.Range{}, Severity: 1, Source: "kotlsp", Message: "parser did not produce a syntax tree"})
 		return parsed
 	}
-	// An empty collection literal is valid Kotlin the grammar cannot parse, and
-	// it appears in almost every annotation declaration. Retry without those
-	// defaults before any other recovery, since one such literal is enough to
-	// lose the declaration that contains it.
-	if language == LanguageKotlin && tree.RootNode().HasError() {
-		if recovered := kotlinEmptyCollectionDefaultRecovery(parserSource); !bytes.Equal(recovered, parserSource) {
-			if candidate := p.Parse(recovered, nil); candidate != nil {
-				if syntaxErrorScore(candidate.RootNode()) < syntaxErrorScore(tree.RootNode()) {
-					tree.Close()
-					tree = candidate
-					parserSource = recovered
-				} else {
-					candidate.Close()
-				}
-			}
-		}
+	if ctx.Err() != nil {
+		tree.Close()
+		return parsed
 	}
-	// The grammar also rejects a declaration whose type runs straight into a
-	// closing brace on the same line, as in `class C { val v: Int }`, which
-	// is ordinary for a small class. The brace recovery below turns that into
-	// a form it accepts; it used to run only for large errors, but a small one
-	// hides a whole declaration just as well, and the retry is kept only when
-	// it scores better.
+	stateTree := tree
+	// Normalized recovery is one retry, never a cascade of two complete
+	// reparses. The real-source tree remains the incremental state even when a
+	// recovered tree supplies the semantic walk for this snapshot.
 	if language == LanguageKotlin && tree.RootNode().HasError() {
-		if recovered := kotlinBraceLineRecovery(parserSource); !bytes.Equal(recovered, parserSource) {
-			if candidate := p.Parse(recovered, nil); candidate != nil {
+		recovered := kotlinEmptyCollectionDefaultRecovery(parserSource)
+		recovered = kotlinBraceLineRecovery(recovered)
+		if !bytes.Equal(recovered, parserSource) {
+			if candidate := parseTreeContext(ctx, p, recovered, nil); candidate != nil {
 				if syntaxErrorScore(candidate.RootNode()) < syntaxErrorScore(tree.RootNode()) {
-					tree.Close()
 					tree = candidate
 				} else {
 					candidate.Close()
@@ -186,11 +374,42 @@ func Parse(ctx context.Context, doc *textdoc.Document) *ParsedFile {
 			}
 		}
 	}
-	defer tree.Close()
+	keepStateTree := false
+	defer func() {
+		if tree != stateTree {
+			tree.Close()
+		}
+		if !keepStateTree {
+			stateTree.Close()
+		}
+	}()
 	root := tree.RootNode()
+	if len(doc.Text) >= 256<<10 {
+		b.syntax = newSyntaxSnapshot(ctx, root, language)
+		parsed.ParseMode = "snapshot"
+	}
+	if fullFallback {
+		parsed.ParseMode = "full-fallback"
+	} else if previousTree != nil {
+		parsed.ParseMode = "incremental"
+	}
 	b.checkSyntaxErrors = root.HasError()
 	b.walk(root, "")
+	if ctx.Err() != nil {
+		return parsed
+	}
 	b.finish()
+	if state != nil && ctx.Err() == nil {
+		if previousTree != nil {
+			previousTree.Close()
+		}
+		state.tree = stateTree
+		state.language = language
+		if previousTree != nil && !fullFallback {
+			state.incrementalParses++
+		}
+		keepStateTree = true
+	}
 	return parsed
 }
 
@@ -340,59 +559,34 @@ func nextLineStart(source []byte, start int) int {
 	return start
 }
 
-func hasLargeSyntaxError(root *sitter.Node, sourceLength int) bool {
-	if root == nil || !root.HasError() {
-		return false
-	}
-	threshold := sourceLength / 4
-	if threshold < 32 {
-		threshold = 32
-	}
-	var walk func(*sitter.Node) bool
-	walk = func(node *sitter.Node) bool {
-		if node == nil {
-			return false
-		}
-		if node.IsError() && int(node.EndByte()-node.StartByte()) >= threshold {
-			return true
-		}
-		for _, child := range directNamedChildren(node) {
-			if walk(child) {
-				return true
-			}
-		}
-		return false
-	}
-	return walk(root)
-}
-
-func catastrophicWholeFileError(root *sitter.Node, sourceLength int) bool {
-	if root == nil || !root.HasError() || root.NamedChildCount() != 1 {
-		return false
-	}
-	child := root.NamedChild(0)
-	return child != nil && child.IsError() && child.StartByte() == 0 && int(child.EndByte()) == sourceLength
-}
-
 func syntaxErrorScore(root *sitter.Node) int64 {
 	if root == nil {
 		return 1 << 60
 	}
+	const maxScoredSyntaxNodes = 2_000_000
 	var score int64
-	var walk func(*sitter.Node)
-	walk = func(node *sitter.Node) {
-		if node == nil {
-			return
+	stack := []*sitter.Node{root}
+	for visited := 0; len(stack) > 0; visited++ {
+		if visited >= maxScoredSyntaxNodes {
+			// Recovery scoring is only a choice between two parse attempts. An
+			// adversarially large tree must not turn that choice into unbounded
+			// stack or heap growth.
+			return 1 << 60
 		}
+		node := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
 		if node.IsError() || node.IsMissing() {
 			span := int64(node.EndByte() - node.StartByte())
 			score += 1 + span
 		}
-		for _, child := range directNamedChildren(node) {
-			walk(child)
+		childCount := node.NamedChildCount()
+		if uint(len(stack))+childCount > maxScoredSyntaxNodes {
+			return 1 << 60
+		}
+		for index := uint(0); index < childCount; index++ {
+			stack = append(stack, node.NamedChild(index))
 		}
 	}
-	walk(root)
 	return score
 }
 
@@ -556,6 +750,7 @@ func kotlinEmptyCollectionDefaultRecovery(source []byte) []byte {
 }
 
 type parseBuilder struct {
+	ctx               context.Context
 	doc               *textdoc.Document
 	parsed            *ParsedFile
 	source            []byte
@@ -571,7 +766,10 @@ type parseBuilder struct {
 	ancestorKinds     []string
 	checkSyntaxErrors bool
 	allowParallel     bool
+	depthLimited      bool
 }
+
+const maxParserDiagnostics = 500
 
 func (b *parseBuilder) nodeKind(node *sitter.Node) string {
 	if record, _ := b.syntax.record(node); record != nil {
@@ -678,22 +876,42 @@ func (b *parseBuilder) firstDirectIdentifier(node *sitter.Node) *sitter.Node {
 }
 
 func (b *parseBuilder) firstIdentifier(node *sitter.Node) *sitter.Node {
-	if node == nil {
-		return nil
-	}
-	if isIdentifierKind(b.nodeKind(node)) {
-		return node
-	}
-	for _, child := range b.namedChildren(node) {
-		if identifier := b.firstIdentifier(child); identifier != nil {
-			return identifier
+	stack := []*sitter.Node{node}
+	for visited := 0; len(stack) > 0 && visited < 100_000; visited++ {
+		candidate := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if candidate == nil {
+			continue
+		}
+		if isIdentifierKind(b.nodeKind(candidate)) {
+			return candidate
+		}
+		children := b.namedChildren(candidate)
+		if len(stack)+len(children) > 100_000 {
+			return nil
+		}
+		for index := len(children) - 1; index >= 0; index-- {
+			stack = append(stack, children[index])
 		}
 	}
 	return nil
 }
 
 func (b *parseBuilder) walk(n *sitter.Node, parentKind string) {
-	if n == nil {
+	if n == nil || b.ctx != nil && b.ctx.Err() != nil {
+		return
+	}
+	if len(b.ancestorNodes) >= 1024 {
+		if !b.depthLimited {
+			start, end := b.nodeSpan(n)
+			if len(b.parsed.Diagnostics) < maxParserDiagnostics {
+				b.parsed.Diagnostics = append(b.parsed.Diagnostics, protocol.Diagnostic{
+					Range: b.doc.Range(start, end), Severity: 1, Source: "kotlsp", Code: "syntax-depth-limit",
+					Message: "syntax nesting exceeds the parser's 1024-level safety limit; deeper analysis was withheld",
+				})
+			}
+			b.depthLimited = true
+		}
 		return
 	}
 	startByte, endByte := b.nodeSpan(n)
@@ -710,7 +928,9 @@ func (b *parseBuilder) walk(n *sitter.Node, parentKind string) {
 		if b.nodeIsMissing(n) {
 			msg = "missing " + strings.Trim(kind, "\"")
 		}
-		b.parsed.Diagnostics = append(b.parsed.Diagnostics, protocol.Diagnostic{Range: r, Severity: 1, Source: "kotlsp", Code: "syntax", Message: msg})
+		if len(b.parsed.Diagnostics) < maxParserDiagnostics {
+			b.parsed.Diagnostics = append(b.parsed.Diagnostics, protocol.Diagnostic{Range: r, Severity: 1, Source: "kotlsp", Code: "syntax", Message: msg})
+		}
 	}
 
 	if kind == "package_header" || kind == "package_declaration" {
@@ -786,6 +1006,7 @@ func (b *parseBuilder) walk(n *sitter.Node, parentKind string) {
 				role = RoleCall
 			}
 			ref := Reference{Name: name, Qualifier: b.qualifier(n), URI: b.doc.URI, Range: b.doc.Range(startByte, endByte), StartByte: startByte, EndByte: endByte, ContainerID: b.currentContainerID(), Role: role, Arity: -1, ArgumentLabel: b.isNamedArgumentLabel(n, parentKind)}
+			ref.ContextualBranch = role == RoleRead && ref.Qualifier == "" && b.isContextualBranchReference(n)
 			if role == RoleCall {
 				if arguments, ok := b.callArguments(n); ok {
 					ref.Arguments = arguments
@@ -820,6 +1041,34 @@ func (b *parseBuilder) walk(n *sitter.Node, parentKind string) {
 	if containerPushed {
 		b.container = b.container[:len(b.container)-1]
 	}
+}
+
+// isContextualBranchReference uses the retained syntax ancestry rather than
+// file-wide keywords or same-line arrow text. Kotlin's when-entry body is the
+// last named child; Java exposes case/default labels as switch_label nodes.
+// A malformed entry with no distinct body is not treated as proof either way.
+func (b *parseBuilder) isContextualBranchReference(node *sitter.Node) bool {
+	if node == nil {
+		return false
+	}
+	_, referenceEnd := b.nodeSpan(node)
+	for index := len(b.ancestorNodes) - 1; index >= 0; index-- {
+		ancestor := b.ancestorNodes[index]
+		switch b.nodeKind(ancestor) {
+		case "switch_label":
+			return true
+		case "when_entry", "switch_rule":
+			children := b.namedChildren(ancestor)
+			if len(children) < 2 {
+				return false
+			}
+			bodyStart, _ := b.nodeSpan(children[len(children)-1])
+			return referenceEnd <= bodyStart
+		case "function_declaration", "method_declaration", "lambda_literal", "lambda_expression":
+			return false
+		}
+	}
+	return false
 }
 
 func (b *parseBuilder) appendLabelSymbol(name string, nameStart, nameEnd, scopeStart, scopeEnd int) {
@@ -997,7 +1246,10 @@ func (b *parseBuilder) walkClassBodyParallel(node *sitter.Node, parentKind strin
 		b.parsed.References = append(b.parsed.References, result.references...)
 		b.parsed.SmartCasts = append(b.parsed.SmartCasts, result.smartCasts...)
 		b.parsed.Folds = append(b.parsed.Folds, result.folds...)
-		b.parsed.Diagnostics = append(b.parsed.Diagnostics, result.diagnostics...)
+		remaining := maxParserDiagnostics - len(b.parsed.Diagnostics)
+		if remaining > 0 {
+			b.parsed.Diagnostics = append(b.parsed.Diagnostics, result.diagnostics[:min(remaining, len(result.diagnostics))]...)
+		}
 	}
 }
 
@@ -2575,6 +2827,61 @@ func (b *parseBuilder) addKotlinBinaryConventionReference(node *sitter.Node) {
 	})
 }
 
+// The Kotlin grammar represents the suffix of `receiver.member()` as syntax
+// punctuation inside a navigation expression rather than as a named
+// identifier node. The ordinary identifier walk therefore sees the receiver
+// and the synthetic invoke convention, but would otherwise lose `member`—the
+// exact token definition, completion, references, and diagnostics need.
+func (b *parseBuilder) addKotlinQualifiedCallReference(callee *sitter.Node, arguments []*sitter.Node) {
+	if callee == nil || b.nodeKind(callee) != "navigation_expression" {
+		return
+	}
+	start, end := b.nodeSpan(callee)
+	for end > start && unicode.IsSpace(rune(b.source[end-1])) {
+		end--
+	}
+	nameStart, nameEnd := end, end
+	if nameEnd > start && b.source[nameEnd-1] == '`' {
+		nameStart--
+		for nameStart > start && b.source[nameStart-1] != '`' {
+			nameStart--
+		}
+		if nameStart <= start || b.source[nameStart-1] != '`' {
+			return
+		}
+		nameStart--
+	} else {
+		for nameStart > start {
+			r, size := utf8.DecodeLastRune(b.source[start:nameStart])
+			if r != '_' && r != '$' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+				break
+			}
+			nameStart -= size
+		}
+	}
+	if nameStart >= nameEnd {
+		return
+	}
+	name := strings.Trim(string(b.source[nameStart:nameEnd]), "`")
+	qualifier := strings.TrimSpace(string(b.source[start:nameStart]))
+	qualifier = strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(qualifier, "?."), "!!."), "."), "::"))
+	if name == "" || qualifier == "" || b.selectionBytes[[2]int{nameStart, nameEnd}] {
+		return
+	}
+	ranges := make([]protocol.Range, len(arguments))
+	for index, argument := range arguments {
+		if argument != nil {
+			ranges[index] = b.doc.Range(int(argument.StartByte()), int(argument.EndByte()))
+		}
+	}
+	b.parsed.References = append(b.parsed.References, Reference{
+		Name: name, Qualifier: qualifier, URI: b.doc.URI,
+		Range: b.doc.Range(nameStart, nameEnd), StartByte: nameStart, EndByte: nameEnd,
+		ContainerID: b.currentContainerID(), Role: RoleCall, Arity: len(arguments), Arguments: ranges,
+	})
+	b.selectionBytes[[2]int{nameStart, nameEnd}] = true
+}
+
 func (b *parseBuilder) addKotlinConventionReferences(node *sitter.Node, parentKind string) {
 	switch node.Kind() {
 	case "binary_expression":
@@ -2645,6 +2952,7 @@ func (b *parseBuilder) addKotlinConventionReferences(node *sitter.Node, parentKi
 			return
 		}
 		callee, arguments := children[0], directNamedChildren(children[len(children)-1])
+		b.addKotlinQualifiedCallReference(callee, arguments)
 		anchor := childWithKind(children[len(children)-1], "(")
 		b.addKotlinConventionReference("invoke", nodeText(b.source, callee), anchor, arguments)
 	case "for_statement":
@@ -3471,15 +3779,22 @@ func unique(xs []string) []string {
 	return out
 }
 func firstIdentifier(n *sitter.Node) *sitter.Node {
-	if n == nil {
-		return nil
-	}
-	if isIdentifierKind(n.Kind()) {
-		return n
-	}
-	for i, count := uint(0), n.NamedChildCount(); i < count; i++ {
-		if x := firstIdentifier(n.NamedChild(i)); x != nil {
-			return x
+	stack := []*sitter.Node{n}
+	for visited := 0; len(stack) > 0 && visited < 100_000; visited++ {
+		candidate := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if candidate == nil {
+			continue
+		}
+		if isIdentifierKind(candidate.Kind()) {
+			return candidate
+		}
+		count := candidate.NamedChildCount()
+		if uint(len(stack))+count > 100_000 {
+			return nil
+		}
+		for index := int(count) - 1; index >= 0; index-- {
+			stack = append(stack, candidate.NamedChild(uint(index)))
 		}
 	}
 	return nil
@@ -3487,6 +3802,9 @@ func firstIdentifier(n *sitter.Node) *sitter.Node {
 
 func directNamedChildren(n *sitter.Node) []*sitter.Node {
 	if n == nil || n.NamedChildCount() == 0 {
+		return nil
+	}
+	if n.NamedChildCount() > 1_000_000 {
 		return nil
 	}
 	cursor := n.Walk()
@@ -3620,10 +3938,12 @@ func kotlinClassKind(src []byte, n *sitter.Node) SymbolKind {
 }
 func extractTypeNames(src []byte, n *sitter.Node) []string {
 	var out []string
-	var walk func(*sitter.Node)
-	walk = func(x *sitter.Node) {
+	stack := []*sitter.Node{n}
+	for visited := 0; len(stack) > 0 && visited < 100_000; visited++ {
+		x := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
 		if x == nil {
-			return
+			continue
 		}
 		if x.Kind() == "user_type" || x.Kind() == "type_identifier" || x.Kind() == "scoped_type_identifier" {
 			v := normalizeSpace(nodeText(src, x))
@@ -3634,13 +3954,16 @@ func extractTypeNames(src []byte, n *sitter.Node) []string {
 				v = v[:i]
 			}
 			out = append(out, strings.TrimSpace(v))
-			return
+			continue
 		}
-		for i, count := uint(0), x.NamedChildCount(); i < count; i++ {
-			walk(x.NamedChild(i))
+		count := x.NamedChildCount()
+		if uint(len(stack))+count > 100_000 {
+			return unique(out)
+		}
+		for index := int(count) - 1; index >= 0; index-- {
+			stack = append(stack, x.NamedChild(uint(index)))
 		}
 	}
-	walk(n)
 	return unique(out)
 }
 func cleanDoc(s string) string {

@@ -240,7 +240,7 @@ func TestInitializeBackgroundIndexOutlivesRequestContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	requestCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, responseErr := s.Request(requestCtx, "initialize", mustJSON(map[string]any{
@@ -260,7 +260,7 @@ func TestInitializeBackgroundIndexOutlivesRequestContext(t *testing.T) {
 
 func TestInitializedRegistersWorkspaceFileWatchers(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	type clientRequest struct {
 		method      string
 		params      any
@@ -288,7 +288,7 @@ func TestInitializedRegistersWorkspaceFileWatchers(t *testing.T) {
 		}
 		encoded, _ := json.Marshal(request.params)
 		text := string(encoded)
-		for _, expected := range []string{"workspace/didChangeWatchedFiles", "**/*.kt", "**/*.java", "**/*.jar", "**/pom.xml", "**/BUILD.bazel"} {
+		for _, expected := range []string{"workspace/didChangeWatchedFiles", "**/*.kt", "**/*.java", "**/*.jar", "**/pom.xml", "**/build.gradle.kts", "**/libs.versions.toml", "**/gradle-wrapper.properties"} {
 			if !strings.Contains(text, expected) {
 				t.Fatalf("watcher registration omitted %q: %s", expected, text)
 			}
@@ -298,9 +298,60 @@ func TestInitializedRegistersWorkspaceFileWatchers(t *testing.T) {
 	}
 }
 
+func TestServerCloseCancelsOwnedContext(t *testing.T) {
+	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
+	done := s.ctx.Done()
+	s.Close()
+	select {
+	case <-done:
+	default:
+		t.Fatal("server Close left its owned context live")
+	}
+}
+
+func TestServerCloseWaitsForRegisteredBackgroundWork(t *testing.T) {
+	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
+	started := make(chan struct{})
+	observedCancellation := make(chan struct{})
+	release := make(chan struct{})
+	if !s.launchBackground(func() {
+		close(started)
+		<-s.ctx.Done()
+		close(observedCancellation)
+		<-release
+	}) {
+		t.Fatal("background work was rejected before close")
+	}
+	<-started
+	closed := make(chan struct{})
+	go func() {
+		s.Close()
+		close(closed)
+	}()
+	select {
+	case <-observedCancellation:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel registered server work")
+	}
+	select {
+	case <-closed:
+		t.Fatal("Close returned before registered server work finished")
+	default:
+	}
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after registered server work exited")
+	}
+	if s.launchBackground(func() {}) {
+		t.Fatal("closed server accepted new background work")
+	}
+}
+
 func TestServerEnforcesLSPInitializationAndShutdownLifecycle(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	if _, responseErr := s.Request(context.Background(), "textDocument/hover", mustJSON(map[string]any{})); responseErr == nil || responseErr.Code != jsonrpc.ServerNotInitialized {
 		t.Fatalf("pre-initialize request error = %#v", responseErr)
 	}
@@ -328,7 +379,7 @@ func TestServerEnforcesLSPInitializationAndShutdownLifecycle(t *testing.T) {
 
 func TestInitializationDefaultSDKDrivesJavaExecutable(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	home := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(home, "bin"), 0o700); err != nil {
 		t.Fatal(err)

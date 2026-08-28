@@ -129,3 +129,35 @@ func TestPredictionsAbstainUntilIndexingFinishes(t *testing.T) {
 		t.Fatalf("once ready the same file should yield one prediction, got %d", len(found))
 	}
 }
+
+func TestUnresolvedTypeUncertaintyIsLocalizedToOwningScope(t *testing.T) {
+	for _, fixture := range []struct {
+		name   string
+		source string
+	}{
+		{
+			"unresolved supertype",
+			"package app\nclass Broken : Missing() { val local: Known? = null }\nfun outside(value: Known) {}\n",
+		},
+		{
+			"type parameter",
+			"package app\nclass Box<Known> { val local: Known? = null }\nfun outside(value: Known) {}\n",
+		},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			idx := New(nil)
+			defer idx.Close()
+			idx.Open(context.Background(), protocol.TextDocumentItem{
+				URI: "file:///workspace/other/Known.kt", LanguageID: "kotlin", Version: 1,
+				Text: "package other\nclass Known\n",
+			})
+			uri := protocol.URI("file:///workspace/app/Probe.kt")
+			idx.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: fixture.source})
+			idx.markReady()
+			found := fastFindings(idx, uri, "UNRESOLVED_REFERENCE")
+			if len(found) != 1 || found[0].Range.Start.Line != 2 {
+				t.Fatalf("localized unresolved-type findings = %#v", found)
+			}
+		})
+	}
+}

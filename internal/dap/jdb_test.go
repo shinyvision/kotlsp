@@ -2,148 +2,122 @@ package dap
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
-// newTestJDB builds a jdbProcess without a real jdb: tests feed `incoming`
-// and read results from waitForPrompt.
-func newTestJDB() *jdbProcess {
-	p := &jdbProcess{
-		ctx:      context.Background(),
-		incoming: make(chan string),
-		chunks:   make(chan string),
-		done:     make(chan error, 1),
-	}
-	go p.relayChunks()
-	return p
-}
-
-func waitPromptResult(t *testing.T, p *jdbProcess) []string {
-	t.Helper()
-	type result struct {
-		lines []string
-		err   error
-	}
-	outcome := make(chan result, 1)
-	go func() {
-		lines, err := p.waitForPrompt()
-		outcome <- result{lines, err}
-	}()
-	select {
-	case res := <-outcome:
-		if res.err != nil {
-			t.Fatalf("waitForPrompt: %v", res.err)
-		}
-		return res.lines
-	case <-time.After(2 * time.Second):
-		t.Fatal("waitForPrompt hung: prompt was not recognized")
-		return nil
+func TestBridgeRowsRoundTripBoundaries(t *testing.T) {
+	payload := "1\x1ffirst value\x1e2\x1fsecond\tvalue"
+	rows := decodeBridgeRows(payload)
+	if len(rows) != 2 || len(rows[0]) != 2 || rows[0][1] != "first value" || rows[1][1] != "second\tvalue" {
+		t.Fatalf("decoded rows = %#v", rows)
 	}
 }
 
-func TestThreadPromptWithPunctuationNameIsRecognized(t *testing.T) {
-	p := newTestJDB()
-	p.addThreadName("HikariPool-1:housekeeper")
-	go func() {
-		p.emit("some command output\n")
-		p.emit("HikariPool-1:housekeeper[1] ")
-	}()
-	lines := waitPromptResult(t, p)
-	if len(lines) != 2 {
-		t.Fatalf("lines = %#v", lines)
+func TestStructuredResponseRoutesByRequestID(t *testing.T) {
+	answer := make(chan bridgeResponse, 1)
+	process := &jdiProcess{pending: map[uint64]chan bridgeResponse{42: answer}}
+	payload := base64.StdEncoding.EncodeToString([]byte("name\x1fvalue"))
+	process.readResponse([]string{"R", "42", "OK", payload})
+	response := <-answer
+	if response.err != nil || len(response.rows) != 1 || response.rows[0][1] != "value" {
+		t.Fatalf("response = %#v", response)
+	}
+	if len(process.pending) != 0 {
+		t.Fatal("completed request was retained")
 	}
 }
 
-func TestArrayRenderingIsNotAPrompt(t *testing.T) {
-	p := newTestJDB()
-	p.addThreadName("main")
-	done := make(chan struct{})
-	go func() {
-		p.waitForPrompt()
-		close(done)
-	}()
-	// A partial rendering line that ends at a bracketed number, mid-line.
-	p.emit("nums = instance of int[3] ")
-	select {
-	case <-done:
-		t.Fatal("array rendering was misdetected as a prompt")
-	case <-time.After(300 * time.Millisecond):
+func TestStructuredRequestTimesOutWithoutResponse(t *testing.T) {
+	process := &jdiProcess{
+		ctx: context.Background(), stdin: bufio.NewWriter(io.Discard),
+		pending: make(map[uint64]chan bridgeResponse), commandLimit: 25 * time.Millisecond,
 	}
-	p.emit("(id=453)\n")
-	p.emit("main[1] ")
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("real prompt was not recognized after a rendering line")
+	started := time.Now()
+	if _, err := process.request("THREADS"); err == nil {
+		t.Fatal("request without a response must time out")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("timeout was not enforced promptly: %s", elapsed)
 	}
 }
 
-func TestPlainMainPromptStillWorks(t *testing.T) {
-	p := newTestJDB()
-	go func() {
-		p.emit("Set breakpoint com.acme.Widget:3\n")
-		p.emit("main[1] ")
-	}()
-	waitPromptResult(t, p)
-}
-
-type nopWriteCloser struct{}
-
-func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
-func (nopWriteCloser) Close() error                { return nil }
-
-func TestExecuteTimesOutWhenJDBNeverAnswers(t *testing.T) {
-	p := newTestJDB()
-	p.stdin = nopWriteCloser{}
-	p.commandTimeout = 100 * time.Millisecond
-	start := time.Now()
-	if _, err := p.execute("print user"); err == nil || !strings.Contains(err.Error(), "did not answer") {
-		t.Fatalf("expected a wedged-bridge timeout error, got %v", err)
+func TestBridgeRejectsOversizedPendingSet(t *testing.T) {
+	process := &jdiProcess{ctx: context.Background(), stdin: bufio.NewWriter(io.Discard), pending: make(map[uint64]chan bridgeResponse), commandLimit: time.Second}
+	for id := uint64(1); id <= 128; id++ {
+		process.pending[id] = make(chan bridgeResponse, 1)
 	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Fatalf("timeout not enforced promptly: %s", elapsed)
+	if _, err := process.request("PING"); err == nil || !strings.Contains(err.Error(), "too many pending") {
+		t.Fatalf("pending bound error = %v", err)
 	}
 }
 
-func TestEmitTerminatedKillsBridgeAndUnblocksExecute(t *testing.T) {
-	s := newSession(context.Background(), bufio.NewWriter(io.Discard))
-	defer s.cancel()
-	p := newTestJDB()
-	p.stdin = nopWriteCloser{}
-	p.commandTimeout = 50 * time.Millisecond
-	s.debugMu.Lock()
-	s.debug = p
-	s.debugMu.Unlock()
+func TestCanceledDebuggerRequestDoesNotReachBridge(t *testing.T) {
+	var wire bytes.Buffer
+	process := &jdiProcess{ctx: context.Background(), stdin: bufio.NewWriter(&wire), pending: make(map[uint64]chan bridgeResponse), commandLimit: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := process.requestFor([]context.Context{ctx}, "EVAL", "slow()"); err == nil {
+		t.Fatal("canceled debugger request succeeded")
+	}
+	if wire.Len() != 0 || len(process.pending) != 0 {
+		t.Fatalf("canceled request reached bridge: wire=%q pending=%d", wire.String(), len(process.pending))
+	}
+}
 
-	s.emitTerminated()
-	waitFor := time.Now().Add(2 * time.Second)
-	for s.currentDebugger() != nil && time.Now().Before(waitFor) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if s.currentDebugger() != nil {
-		t.Fatal("bridge still attached after termination")
-	}
-	start := time.Now()
-	if _, err := p.execute("where"); err == nil {
-		t.Fatal("execute on a killed bridge must fail, not hang")
-	}
-	if time.Since(start) > 3*time.Second {
-		t.Fatal("execute on a killed bridge was not released promptly")
+func TestDebugValueRecordsAreTyped(t *testing.T) {
+	values := decodeDebugValues([][]string{{"items", "instance", "java.util.List", "body.items", "true", "17"}})
+	if len(values) != 1 || !values[0].expandable || values[0].indexed != 17 || values[0].evaluateName != "body.items" {
+		t.Fatalf("values = %#v", values)
 	}
 }
 
 func TestUnusableThreadFilter(t *testing.T) {
-	if !unusableThread("DestroyJavaVM", "running") {
-		t.Fatal("DestroyJavaVM must be filtered: jdb hangs on its stack request")
+	if !unusableThread("DestroyJavaVM", "1") {
+		t.Fatal("DestroyJavaVM must be filtered")
 	}
-	if !unusableThread("main", "zombie") {
+	if !unusableThread("main", strconv.Itoa(0)) {
 		t.Fatal("zombie threads must be filtered")
 	}
-	if unusableThread("http-nio-8080-exec-1", "waiting") {
+	if unusableThread("http-nio-8080-exec-1", "4") {
 		t.Fatal("ordinary worker thread must stay visible")
+	}
+}
+
+func TestBridgeUsesJDIAndStructuredOperations(t *testing.T) {
+	for _, marker := range []string{"Bootstrap.virtualMachineManager", "THREADS", "FRAMES", "LOCALS", "CHILDREN", "BREAK_LINE"} {
+		if !strings.Contains(jdiBridgeSource, marker) {
+			t.Fatalf("bridge source missing %s", marker)
+		}
+	}
+	for _, forbidden := range []string{"main[1]", "Breakpoint hit:", "waitForPrompt"} {
+		if strings.Contains(jdiBridgeSource, forbidden) {
+			t.Fatalf("bridge source contains human jdb marker %q", forbidden)
+		}
+	}
+}
+
+func TestEmbeddedJDIBridgeCompiles(t *testing.T) {
+	javac, err := exec.LookPath("javac")
+	if err != nil {
+		t.Skip("javac is unavailable")
+	}
+	directory := t.TempDir()
+	source := filepath.Join(directory, "KotLSPJDI.java")
+	if err = os.WriteFile(source, []byte(jdiBridgeSource), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(javac, "--add-modules", "jdk.jdi", "-encoding", "UTF-8", "-d", directory, source)
+	if output, compileErr := command.CombinedOutput(); compileErr != nil {
+		t.Fatalf("embedded JDI helper does not compile: %v\n%s", compileErr, output)
 	}
 }

@@ -20,7 +20,7 @@ func scopeFixture(t *testing.T, name, language, marked string) (*Server, protoco
 	}
 	source := marked[:at] + marked[at+1:]
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	t.Cleanup(func() { s.index.Close() })
+	t.Cleanup(func() { s.Close() })
 	s.initializeReceived.Store(true)
 	s.initialized.Store(true)
 	uri := protocol.URI("file:///workspace/" + name)

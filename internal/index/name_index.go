@@ -1,6 +1,9 @@
 package index
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // nameIndex is the shared string-index machinery behind the workspace-symbol
 // and completion families: a name -> values map plus the satellites that keep
@@ -18,6 +21,8 @@ type nameIndex[T any] struct {
 	byPrefix   map[string][]string
 	trackChars bool
 	byChar     map[byte][]string
+	deadNames  map[string]bool
+	deadCount  int
 }
 
 func newNameIndex[T any](trackChars bool) nameIndex[T] {
@@ -33,11 +38,16 @@ func (n *nameIndex[T]) clear() {
 	n.byInitial = make(map[byte][]string)
 	n.byPrefix = make(map[string][]string)
 	n.byChar = make(map[byte][]string)
+	n.deadNames = make(map[string]bool)
+	n.deadCount = 0
 }
 
 // insert appends value under name, registering name and its satellites the
 // first time the bucket is filled.
 func (n *nameIndex[T]) insert(name string, value T) {
+	if name == "" || len(name) > 4096 {
+		return
+	}
 	if len(n.byName[name]) == 0 {
 		n.add(name)
 	}
@@ -46,6 +56,12 @@ func (n *nameIndex[T]) insert(name string, value T) {
 
 func (n *nameIndex[T]) add(name string) {
 	if n.known[name] {
+		return
+	}
+	if n.deadNames[name] {
+		delete(n.deadNames, name)
+		n.deadCount--
+		n.known[name] = true
 		return
 	}
 	n.known[name] = true
@@ -88,9 +104,37 @@ func (n *nameIndex[T]) removeValues(keys map[string]bool, removed func(T) bool) 
 		}
 		if len(out) == 0 {
 			delete(n.byName, key)
+			if n.known[key] {
+				delete(n.known, key)
+				n.deadNames[key] = true
+				n.deadCount++
+			}
 		} else {
 			n.byName[key] = out
 		}
+	}
+	if n.deadCount > 1024 && n.deadCount*4 > len(n.names) {
+		n.rebuildSatellites()
+	}
+}
+
+func (n *nameIndex[T]) rebuildSatellites() {
+	names := make([]string, 0, len(n.byName))
+	for name, values := range n.byName {
+		if len(values) > 0 {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	n.known = make(map[string]bool, len(names))
+	n.names = nil
+	n.byInitial = make(map[byte][]string)
+	n.byPrefix = make(map[string][]string)
+	n.byChar = make(map[byte][]string)
+	n.deadNames = make(map[string]bool)
+	n.deadCount = 0
+	for _, name := range names {
+		n.add(name)
 	}
 }
 

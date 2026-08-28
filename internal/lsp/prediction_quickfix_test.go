@@ -16,7 +16,7 @@ import (
 // fix the compiler's diagnostic offers is available immediately.
 func TestPredictedMissingImportOffersTheImportFix(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	s.initializeReceived.Store(true)
 	s.initialized.Store(true)
 

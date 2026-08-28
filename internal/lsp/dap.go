@@ -12,7 +12,7 @@ func (s *Server) startDAP() (int, error) {
 	if s.dap != nil {
 		return s.dap.Port(), nil
 	}
-	server, err := dap.Start(s.ctx)
+	server, err := dap.Start(s.ctx, s.index.DebugSourcePath)
 	if err != nil {
 		return 0, err
 	}

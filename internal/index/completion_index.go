@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -10,8 +11,45 @@ import (
 )
 
 func (i *Index) Completion(uri protocol.URI, pos protocol.Position, limit int) []analysis.Symbol {
-	limited := limit > 0
-	doc, ok := i.Document(uri)
+	return i.CompletionContext(context.Background(), uri, pos, limit)
+}
+
+func (i *Index) CompletionContext(ctx context.Context, uri protocol.URI, pos protocol.Position, limit int) []analysis.Symbol {
+	values, _ := i.CompletionBoundedContext(ctx, uri, pos, limit)
+	return values
+}
+
+// CompletionBoundedContext distinguishes a complete short result from one
+// whose candidate budget was exhausted. LSP callers must surface the latter
+// through CompletionList.isIncomplete so the client narrows and retries.
+func (i *Index) CompletionBoundedContext(ctx context.Context, uri protocol.URI, pos protocol.Position, limit int) ([]analysis.Symbol, bool) {
+	truncated := false
+	values := i.completionContext(ctx, uri, pos, limit, &truncated)
+	return values, truncated
+}
+
+func (i *Index) completionContext(ctx context.Context, uri protocol.URI, pos protocol.Position, limit int, truncated *bool) []analysis.Symbol {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+	if limit <= 0 || limit > 512 {
+		limit = 512
+	}
+	candidateLimit := limit * 4
+	candidateWorkLimit := candidateLimit * 32
+	candidateWork := 0
+	visitCandidate := func() bool {
+		candidateWork++
+		if candidateWork <= candidateWorkLimit {
+			return true
+		}
+		*truncated = true
+		return false
+	}
+	doc, ok := i.DocumentContext(ctx, uri)
 	if !ok {
 		return nil
 	}
@@ -35,54 +73,117 @@ func (i *Index) Completion(uri protocol.URI, pos protocol.Position, limit int) [
 	}
 	annotationOwner := AnnotationAttributeOwner(doc.Text, offset)
 	i.mu.RLock()
-	defer i.mu.RUnlock()
+	locked := true
+	defer func() {
+		if locked {
+			i.mu.RUnlock()
+		}
+	}()
 	file := i.files[uri]
 	if file == nil {
 		return nil
 	}
+	access := newAccessibilityMemoLocked(i, file)
+	if ctx.Err() != nil {
+		return nil
+	}
 	if position.Scope == CompletionDocParameter {
-		return i.documentedParametersLocked(file, position.DocEnd, prefix)
+		parameters := i.documentedParametersLocked(file, position.DocEnd, prefix, limit)
+		if len(parameters) >= limit {
+			*truncated = true
+		}
+		return parameters
 	}
 	// `Owner#member` and `[Owner.member]` reference a member the way code
 	// cannot: a doc reference names instance members through the type itself,
 	// where an expression would need a receiver.
 	if position.Scope == CompletionDocReference && qualifier != "" {
-		if members := i.docQualifiedMembersLocked(file, qualifier, prefix, offset); len(members) > 0 {
+		members, memberTruncated := i.docQualifiedMembersLocked(ctx, file, qualifier, prefix, offset, limit, access)
+		if memberTruncated {
+			*truncated = true
+		}
+		if len(members) > 0 {
+			if memberTruncated || len(members) >= limit {
+				*truncated = true
+			}
 			return members
+		}
+		if memberTruncated {
+			return nil
 		}
 	}
 	initialCapacity := 256
-	if limited {
-		initialCapacity = limit * 4
-	}
+	initialCapacity = candidateLimit
 	ids := make([]string, 0, initialCapacity)
 	synthetic := make([]analysis.Symbol, 0, 8)
 	if annotationOwner != "" {
 		usedAttributes := AnnotationAttributeNames(doc.Text, offset)
-		for _, owner := range i.resolveTypeSymbolsLocked(file, annotationOwner) {
+		for _, owner := range i.resolveTypeSymbolsForOwnerMemoLocked(file, annotationOwner, analysis.Symbol{}, access) {
+			if ctx.Err() != nil {
+				return nil
+			}
 			if owner.Kind != analysis.KindAnnotation {
 				continue
 			}
-			for _, candidateID := range i.byContainerName[owner.Name] {
-				symbol := i.symbols[candidateID]
-				if symbol.ContainerID == owner.ID && !usedAttributes[symbol.Name] && analysis.IsCallableKind(symbol.Kind) && i.accessibleLocked(file, *symbol, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
-					ids = append(ids, candidateID)
+			for _, candidateID := range i.byContainerName[owner.ID] {
+				if !visitCandidate() {
+					break
 				}
+				symbol := i.symbols[candidateID]
+				if symbol.ContainerID == owner.ID && !usedAttributes[symbol.Name] && analysis.IsCallableKind(symbol.Kind) && i.accessibleWithMemoLocked(file, *symbol, access, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
+					ids = append(ids, candidateID)
+					if len(ids) >= candidateLimit {
+						break
+					}
+				}
+			}
+			if len(ids) >= candidateLimit {
+				break
 			}
 		}
 	} else if qualifier != "" {
-		typeQualifierSymbols := i.resolveTypeSymbolsLocked(file, qualifier)
+		typeQualifierSymbols := i.resolveTypeSymbolsForOwnerMemoLocked(file, qualifier, analysis.Symbol{}, access)
 		typeQualifier := len(typeQualifierSymbols) > 0
 		typeQualifierValue := i.typeQualifierActsAsValueLocked(file, typeQualifierSymbols)
-		ids = append(ids, i.anonymousObjectMemberIDsLocked(file, qualifier, "", offset)...)
-		typ := i.typeOfExpressionLocked(file, qualifier, offset)
+		anonymous, complete := i.anonymousObjectMemberIDsBoundedLocked(ctx, file, qualifier, "", offset, maxResolutionCandidates)
+		if !complete {
+			*truncated = true
+			return nil
+		}
+		for _, id := range anonymous {
+			if !visitCandidate() {
+				break
+			}
+			ids = append(ids, id)
+			if len(ids) >= candidateLimit {
+				break
+			}
+		}
+		typ := i.inferExpressionResultLocked(file, qualifier, offset).Type
 		if explicit := explicitReceiverType(qualifier); explicit != "" {
 			typ = explicit
 		}
 		if typ != "" {
-			containers := i.typeAndSupertypesLocked(file, typ)
-			for _, container := range containers {
-				for _, candidateID := range i.byContainerName[container] {
+			containers, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, typ, maxResolutionCandidates, access)
+			if !complete {
+				*truncated = true
+				return nil
+			}
+			for _, instantiated := range containers {
+				if !visitCandidate() {
+					break
+				}
+				if len(ids) >= candidateLimit {
+					break
+				}
+				owner := instantiated.symbol
+				if ctx.Err() != nil {
+					return nil
+				}
+				for _, candidateID := range i.byContainerName[owner.ID] {
+					if !visitCandidate() {
+						break
+					}
 					s := i.symbols[candidateID]
 					if !i.memberInheritedForReceiverLocked(file, *s, typ) {
 						continue
@@ -90,29 +191,65 @@ func (i *Index) Completion(uri protocol.URI, pos protocol.Position, limit int) [
 					if typeQualifier && !i.memberAvailableThroughTypeQualifierLocked(file, *s, typeQualifierSymbols) {
 						continue
 					}
-					if i.accessibleLocked(file, *s, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(s.Name), strings.ToLower(prefix))) {
+					if i.accessibleWithMemoLocked(file, *s, access, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(s.Name), strings.ToLower(prefix))) {
 						ids = append(ids, candidateID)
-						if limited && len(ids) >= limit*4 {
+						if len(ids) >= candidateLimit {
 							break
 						}
 					}
 				}
-				for _, candidateID := range i.byReceiver[container] {
+				for _, candidateID := range i.extensionCandidatesLocked(owner) {
+					if !visitCandidate() {
+						break
+					}
 					s := i.symbols[candidateID]
-					if (!typeQualifier || typeQualifierValue) && i.extensionReceiverApplicableLocked(file, *s, typ) && i.accessibleLocked(file, *s, offset) && i.extensionVisibleLocked(file, *s, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(s.Name), strings.ToLower(prefix))) {
+					if (!typeQualifier || typeQualifierValue) && i.extensionReceiverApplicableLocked(file, *s, typ) && i.accessibleWithMemoLocked(file, *s, access, offset) && i.extensionVisibleLocked(file, *s, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(s.Name), strings.ToLower(prefix))) {
 						ids = append(ids, candidateID)
+						if len(ids) >= candidateLimit {
+							break
+						}
 					}
 				}
 				if file.Language == analysis.LanguageKotlin && typeQualifier {
-					for _, companion := range i.companionMembersLocked(file, container) {
-						if i.accessibleLocked(file, companion, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(companion.Name), strings.ToLower(prefix))) {
+					companions, complete := i.companionMembersForOwnerBoundedLocked(ctx, owner, nil, maxResolutionCandidates)
+					if !complete {
+						*truncated = true
+						return nil
+					}
+					for _, companion := range companions {
+						if !visitCandidate() {
+							break
+						}
+						if i.accessibleWithMemoLocked(file, companion, access, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(companion.Name), strings.ToLower(prefix))) {
 							ids = append(ids, companion.ID)
+							if len(ids) >= candidateLimit {
+								break
+							}
+						}
+					}
+				}
+			}
+			if len(containers) == 0 && file.Language == analysis.LanguageKotlin {
+				for _, owner := range spellingReceiverOwners(typ) {
+					for _, candidateID := range i.extensionCandidatesLocked(owner) {
+						if !visitCandidate() {
+							break
+						}
+						s := i.symbols[candidateID]
+						if (!typeQualifier || typeQualifierValue) && i.extensionReceiverApplicableLocked(file, *s, typ) && i.accessibleWithMemoLocked(file, *s, access, offset) && i.extensionVisibleLocked(file, *s, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(s.Name), strings.ToLower(prefix))) {
+							ids = append(ids, candidateID)
+							if len(ids) >= candidateLimit {
+								break
+							}
 						}
 					}
 				}
 			}
 		} else {
 			for _, child := range i.packageChildren[qualifier] {
+				if !visitCandidate() {
+					break
+				}
 				if prefix == "" || strings.HasPrefix(strings.ToLower(child), strings.ToLower(prefix)) {
 					fqn := child
 					if qualifier != "" {
@@ -120,43 +257,105 @@ func (i *Index) Completion(uri protocol.URI, pos protocol.Position, limit int) [
 					}
 					id := "package:" + fqn
 					synthetic = append(synthetic, analysis.Symbol{ID: id, Name: child, FQN: fqn, Kind: analysis.KindPackage})
+					if len(synthetic) >= limit {
+						break
+					}
 				}
 			}
 			for _, candidateID := range i.byPackage[qualifier] {
+				if !visitCandidate() {
+					break
+				}
 				symbol := i.symbols[candidateID]
-				if symbol.ContainerID == "" && i.accessibleLocked(file, *symbol, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
+				if symbol.ContainerID == "" && i.accessibleWithMemoLocked(file, *symbol, access, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
 					ids = append(ids, candidateID)
+					if len(ids) >= candidateLimit {
+						break
+					}
 				}
 			}
 		}
 	} else {
 		for _, child := range i.packageChildren[""] {
+			if !visitCandidate() {
+				break
+			}
 			if prefix == "" || strings.HasPrefix(strings.ToLower(child), strings.ToLower(prefix)) {
 				synthetic = append(synthetic, analysis.Symbol{ID: "package:" + child, Name: child, FQN: child, Kind: analysis.KindPackage})
+				if len(synthetic) >= limit {
+					break
+				}
 			}
 		}
 		currentType := i.enclosingTypeLocked(file, offset)
 		if enumType := i.javaSwitchLabelReceiverTypeLocked(file, offset); enumType != "" {
-			for _, container := range i.typeAndSupertypesLocked(file, enumType) {
-				for _, id := range i.byContainerName[container] {
+			hierarchy, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, enumType, maxResolutionCandidates, access)
+			if !complete {
+				*truncated = true
+				return nil
+			}
+			for _, instantiated := range hierarchy {
+				if !visitCandidate() {
+					break
+				}
+				if len(ids) >= candidateLimit {
+					break
+				}
+				for _, id := range i.byContainerName[instantiated.symbol.ID] {
+					if !visitCandidate() {
+						break
+					}
 					symbol := i.symbols[id]
-					if symbol.Kind == analysis.KindEnumMember && i.accessibleLocked(file, *symbol, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
+					if symbol.Kind == analysis.KindEnumMember && i.accessibleWithMemoLocked(file, *symbol, access, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
 						ids = append(ids, id)
+						if len(ids) >= candidateLimit {
+							break
+						}
 					}
 				}
 			}
 		}
 		for _, symbol := range file.Symbols {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if !visitCandidate() {
+				break
+			}
 			if symbol.StartByte <= offset && (symbol.ContainerID == "" || symbol.ContainerID == currentType.ID || symbol.ContainerID != "" && i.symbolWithinCallableScopeLocked(file, symbol, offset)) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
 				ids = append(ids, symbol.ID)
+				if len(ids) >= candidateLimit {
+					break
+				}
 			}
 		}
-		if currentType.ID != "" {
-			for _, container := range i.typeAndSupertypesLocked(file, currentType.Name) {
-				for _, id := range i.byContainerName[container] {
+		if currentType.ID != "" && len(ids) < candidateLimit {
+			currentTypeName := currentType.FQN
+			if currentTypeName == "" {
+				currentTypeName = currentType.Name
+			}
+			hierarchy, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, currentTypeName, maxResolutionCandidates, access)
+			if !complete {
+				*truncated = true
+				return nil
+			}
+			for _, instantiated := range hierarchy {
+				if !visitCandidate() {
+					break
+				}
+				if len(ids) >= candidateLimit {
+					break
+				}
+				for _, id := range i.byContainerName[instantiated.symbol.ID] {
+					if !visitCandidate() {
+						break
+					}
 					symbol := i.symbols[id]
-					if i.accessibleLocked(file, *symbol, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
+					if i.accessibleWithMemoLocked(file, *symbol, access, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
 						ids = append(ids, id)
+						if len(ids) >= candidateLimit {
+							break
+						}
 					}
 				}
 			}
@@ -167,20 +366,66 @@ func (i *Index) Completion(uri protocol.URI, pos protocol.Position, limit int) [
 			implicitReceiverTypes = append(implicitReceiverTypes, enclosing.Name)
 		}
 		for _, receiverType := range implicitReceiverTypes {
-			if receiverType == "" {
+			if !visitCandidate() {
+				break
+			}
+			if ctx.Err() != nil {
+				return nil
+			}
+			if receiverType == "" || len(ids) >= candidateLimit {
 				continue
 			}
-			for _, container := range i.typeAndSupertypesLocked(file, receiverType) {
-				for _, id := range i.byContainerName[container] {
+			hierarchy, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, receiverType, maxResolutionCandidates, access)
+			if !complete {
+				*truncated = true
+				return nil
+			}
+			for _, instantiated := range hierarchy {
+				if !visitCandidate() {
+					break
+				}
+				if len(ids) >= candidateLimit {
+					break
+				}
+				owner := instantiated.symbol
+				for _, id := range i.byContainerName[owner.ID] {
+					if !visitCandidate() {
+						break
+					}
 					symbol := i.symbols[id]
-					if i.accessibleLocked(file, *symbol, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
+					if i.accessibleWithMemoLocked(file, *symbol, access, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
 						ids = append(ids, id)
+						if len(ids) >= candidateLimit {
+							break
+						}
 					}
 				}
-				for _, id := range i.byReceiver[container] {
+				for _, id := range i.extensionCandidatesLocked(owner) {
+					if !visitCandidate() {
+						break
+					}
 					symbol := i.symbols[id]
-					if i.extensionReceiverApplicableLocked(file, *symbol, receiverType) && i.accessibleLocked(file, *symbol, offset) && i.extensionVisibleLocked(file, *symbol, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
+					if i.extensionReceiverApplicableLocked(file, *symbol, receiverType) && i.accessibleWithMemoLocked(file, *symbol, access, offset) && i.extensionVisibleLocked(file, *symbol, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
 						ids = append(ids, id)
+						if len(ids) >= candidateLimit {
+							break
+						}
+					}
+				}
+			}
+			if len(hierarchy) == 0 && file.Language == analysis.LanguageKotlin {
+				for _, owner := range spellingReceiverOwners(receiverType) {
+					for _, id := range i.extensionCandidatesLocked(owner) {
+						if !visitCandidate() {
+							break
+						}
+						symbol := i.symbols[id]
+						if i.extensionReceiverApplicableLocked(file, *symbol, receiverType) && i.accessibleWithMemoLocked(file, *symbol, access, offset) && i.extensionVisibleLocked(file, *symbol, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
+							ids = append(ids, id)
+							if len(ids) >= candidateLimit {
+								break
+							}
+						}
 					}
 				}
 			}
@@ -195,34 +440,65 @@ func (i *Index) Completion(uri protocol.URI, pos protocol.Position, limit int) [
 			}
 		}
 		for _, name := range names {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if !visitCandidate() {
+				break
+			}
 			values := i.completionIndex.get(name)
 			if prefix == "" || strings.HasPrefix(strings.ToLower(name), strings.ToLower(prefix)) {
 				for _, id := range values {
+					if !visitCandidate() {
+						break
+					}
 					symbol := i.symbols[id]
-					if i.accessibleLocked(file, *symbol, offset) && i.extensionVisibleLocked(file, *symbol, offset) {
+					if i.accessibleWithMemoLocked(file, *symbol, access, offset) && i.extensionVisibleLocked(file, *symbol, offset) {
 						ids = append(ids, id)
+						if len(ids) >= candidateLimit {
+							break
+						}
 					}
 				}
-				if limited && len(ids) >= limit*4 {
+				if len(ids) >= candidateLimit {
 					break
 				}
 			}
 		}
 	}
+	if len(ids) >= candidateLimit || len(synthetic) >= limit {
+		*truncated = true
+	}
+	candidates := make([]analysis.Symbol, 0, len(ids))
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if symbol := i.symbols[id]; symbol != nil {
+			candidates = append(candidates, *symbol)
+		}
+	}
+	fileLanguage := file.Language
+	i.mu.RUnlock()
+	locked = false
 	seen := map[string]bool{}
 	outCapacity := len(ids) + len(synthetic)
-	if limited && outCapacity > limit {
+	if outCapacity > limit {
 		outCapacity = limit
 	}
 	out := make([]analysis.Symbol, 0, outCapacity)
 	for _, symbol := range synthetic {
+		if ctx.Err() != nil {
+			return nil
+		}
 		key := symbol.ID
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
 		out = append(out, symbol)
-		if limited && len(out) >= limit {
+		if len(out) >= limit {
+			*truncated = true
 			return out
 		}
 	}
@@ -240,8 +516,7 @@ func (i *Index) Completion(uri protocol.URI, pos protocol.Position, limit int) [
 	// overloads stay distinct while copies collapse -- `address.length` was
 	// offered six times before this.
 	seenMember := make(map[string]int)
-	for _, id := range ids {
-		s := i.symbols[id]
+	for _, s := range candidates {
 		key := s.ID
 		if seen[key] || (!strings.HasPrefix(strings.ToLower(s.Name), strings.ToLower(prefix))) {
 			continue
@@ -253,12 +528,12 @@ func (i *Index) Completion(uri protocol.URI, pos protocol.Position, limit int) [
 			seenType[s.FQN] = true
 		}
 		if qualifier != "" && !analysis.IsTypeKind(s.Kind) {
-			member := memberSignatureKey(*s)
+			member := memberSignatureKey(s)
 			if at, exists := seenMember[member]; exists {
 				// Keep the view spelled in this file's language: a Kotlin file
 				// names `length` as a property, a Java one as `length()`.
-				if s.Language == file.Language && out[at].Language != file.Language {
-					out[at] = *s
+				if s.Language == fileLanguage && out[at].Language != fileLanguage {
+					out[at] = s
 				}
 				continue
 			}
@@ -269,8 +544,9 @@ func (i *Index) Completion(uri protocol.URI, pos protocol.Position, limit int) [
 			continue
 		}
 		seen[key] = true
-		out = append(out, *s)
-		if limited && len(out) >= limit {
+		out = append(out, s)
+		if len(out) >= limit {
+			*truncated = true
 			break
 		}
 	}
@@ -293,7 +569,7 @@ func memberSignatureKey(symbol analysis.Symbol) string {
 
 // documentedParametersLocked lists the parameters of the declaration a doc
 // comment documents, which is the one beginning after it.
-func (i *Index) documentedParametersLocked(file *analysis.ParsedFile, docEnd int, prefix string) []analysis.Symbol {
+func (i *Index) documentedParametersLocked(file *analysis.ParsedFile, docEnd int, prefix string, limit int) []analysis.Symbol {
 	var documented *analysis.Symbol
 	for index := range file.Symbols {
 		symbol := &file.Symbols[index]
@@ -309,6 +585,9 @@ func (i *Index) documentedParametersLocked(file *analysis.ParsedFile, docEnd int
 	}
 	out := make([]analysis.Symbol, 0, len(documented.Parameters))
 	add := func(name, typ string, kind analysis.SymbolKind) {
+		if len(out) >= limit {
+			return
+		}
 		if name == "" || prefix != "" && !strings.HasPrefix(strings.ToLower(name), strings.ToLower(prefix)) {
 			return
 		}
@@ -348,16 +627,35 @@ func (i *Index) documentedParametersLocked(file *analysis.ParsedFile, docEnd int
 
 // docQualifiedMembersLocked lists the members a doc reference may name through
 // an owning type, instance and static alike.
-func (i *Index) docQualifiedMembersLocked(file *analysis.ParsedFile, qualifier, prefix string, offset int) []analysis.Symbol {
-	owners := i.resolveTypeSymbolsLocked(file, qualifier)
+func (i *Index) docQualifiedMembersLocked(ctx context.Context, file *analysis.ParsedFile, qualifier, prefix string, offset, limit int, access *accessibilityMemo) ([]analysis.Symbol, bool) {
+	owners := i.resolveTypeSymbolsForOwnerMemoLocked(file, qualifier, analysis.Symbol{}, access)
 	if len(owners) == 0 {
-		return nil
+		return nil, false
 	}
 	out := make([]analysis.Symbol, 0, 16)
 	seen := make(map[string]bool)
+	work, workLimit := 0, limit*32
 	for _, owner := range owners {
-		for _, container := range i.typeAndSupertypesLocked(file, owner.Name) {
-			for _, id := range i.byContainerName[container] {
+		if len(out) >= limit {
+			break
+		}
+		hierarchy, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, owner.FQN, maxResolutionCandidates, access)
+		if !complete {
+			return nil, true
+		}
+		for _, instantiated := range hierarchy {
+			if len(out) >= limit {
+				break
+			}
+			bucket := i.byContainerName[instantiated.symbol.ID]
+			if len(bucket) > maxResolutionCandidates {
+				return nil, true
+			}
+			for _, id := range bucket {
+				work++
+				if work > workLimit {
+					return out, true
+				}
 				symbol := i.symbols[id]
 				if symbol == nil || seen[symbol.ID] || symbol.Synthetic {
 					continue
@@ -365,15 +663,18 @@ func (i *Index) docQualifiedMembersLocked(file *analysis.ParsedFile, qualifier, 
 				if prefix != "" && !strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix)) {
 					continue
 				}
-				if !i.accessibleLocked(file, *symbol, offset) {
+				if !i.accessibleWithMemoLocked(file, *symbol, access, offset) {
 					continue
 				}
 				seen[symbol.ID] = true
 				out = append(out, *symbol)
+				if len(out) >= limit {
+					break
+				}
 			}
 		}
 	}
-	return out
+	return out, false
 }
 
 // docReferenceContext reads the prefix and qualifier of a doc-comment

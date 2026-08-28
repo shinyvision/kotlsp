@@ -20,6 +20,9 @@ var semanticModifiers = map[string]bool{
 func (b *parseBuilder) addLexicalTokens() {
 	source := b.source
 	for at := 0; at < len(source); {
+		if at&4095 == 0 && b.ctx != nil && b.ctx.Err() != nil {
+			return
+		}
 		if isSpaceByte(source[at]) {
 			at++
 			continue

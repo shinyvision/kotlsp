@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"context"
 	"time"
 )
 
@@ -17,11 +18,11 @@ import (
 const diagnosticRefreshPoll = 250 * time.Millisecond
 
 func (s *Server) refreshDiagnosticsWhenIndexed() {
-	if !s.diagnosticRefreshActive.CompareAndSwap(false, true) {
+	if !s.diagnosticIndexWait.CompareAndSwap(false, true) {
 		return
 	}
-	go func() {
-		defer s.diagnosticRefreshActive.Store(false)
+	if !s.launchBackground(func() {
+		defer s.diagnosticIndexWait.Store(false)
 		ticker := time.NewTicker(diagnosticRefreshPoll)
 		defer ticker.Stop()
 		for {
@@ -35,16 +36,56 @@ func (s *Server) refreshDiagnosticsWhenIndexed() {
 				if !s.indexProgressNow().Ready {
 					continue
 				}
-				s.refreshDiagnostics()
+				s.queueDiagnosticRefresh()
 				return
 			}
 		}
-	}()
+	}) {
+		s.diagnosticIndexWait.Store(false)
+	}
+}
+
+// queueDiagnosticRefresh coalesces compiler/index changes and keeps a client
+// which never answers workspace/diagnostic/refresh from retaining one goroutine
+// per validation pass. A change arriving during an active refresh sets pending
+// and causes exactly one further refresh after the current bounded call.
+func (s *Server) queueDiagnosticRefresh() {
+	s.diagnosticRefreshPending.Store(true)
+	if !s.diagnosticRefreshActive.CompareAndSwap(false, true) {
+		return
+	}
+	if !s.launchBackground(func() {
+		for {
+			s.diagnosticRefreshPending.Store(false)
+			s.refreshDiagnostics()
+			if s.diagnosticRefreshPending.Load() {
+				continue
+			}
+			s.diagnosticRefreshActive.Store(false)
+			// Close the race between observing no pending work and making the
+			// runner inactive. A concurrent producer either owns a new runner or
+			// leaves pending set for this one to reclaim.
+			if !s.diagnosticRefreshPending.Load() || !s.diagnosticRefreshActive.CompareAndSwap(false, true) {
+				return
+			}
+		}
+	}) {
+		s.diagnosticRefreshActive.Store(false)
+	}
 }
 
 func (s *Server) refreshDiagnostics() {
+	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+	defer cancel()
+	s.refreshDiagnosticsContext(ctx)
+}
+
+func (s *Server) refreshDiagnosticsContext(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	if s.clientCapabilityBool("workspace", "diagnostics", "refreshSupport") {
-		if err := s.callClient(s.ctx, "workspace/diagnostic/refresh", nil, nil); err != nil && s.ctx.Err() == nil {
+		if err := s.callClient(ctx, "workspace/diagnostic/refresh", nil, nil); err != nil && ctx.Err() == nil {
 			s.log.Printf("diagnostic refresh: %v", err)
 		}
 	}
@@ -54,6 +95,9 @@ func (s *Server) refreshDiagnostics() {
 		return
 	}
 	for _, uri := range s.index.OpenDocuments() {
+		if ctx.Err() != nil {
+			return
+		}
 		s.publishDiagnostics(uri, s.index.Diagnostics(uri))
 	}
 }

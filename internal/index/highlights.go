@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"sort"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
@@ -12,7 +13,14 @@ import (
 // that resolve to them. Writes are reported as writes so an editor can tell an
 // assignment from a read at a glance.
 func (i *Index) DocumentHighlights(uri protocol.URI, pos protocol.Position) []protocol.DocumentHighlight {
-	target, _, ok := i.SymbolAt(uri, pos)
+	return i.DocumentHighlightsContext(context.Background(), uri, pos)
+}
+
+func (i *Index) DocumentHighlightsContext(ctx context.Context, uri protocol.URI, pos protocol.Position) []protocol.DocumentHighlight {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	target, _, ok := i.SymbolAtContext(ctx, uri, pos)
 	if !ok {
 		return nil
 	}
@@ -33,7 +41,10 @@ func (i *Index) DocumentHighlights(uri protocol.URI, pos protocol.Position) []pr
 		seen[r] = true
 		out = append(out, protocol.DocumentHighlight{Range: r, Kind: kind})
 	}
-	for _, member := range family {
+	for index, member := range family {
+		if index&255 == 0 && ctx.Err() != nil {
+			return nil
+		}
 		members[member.ID] = true
 		// Only the declarations written in this file are occurrences in it; a
 		// family member declared elsewhere is reported by its own file.
@@ -42,13 +53,16 @@ func (i *Index) DocumentHighlights(uri protocol.URI, pos protocol.Position) []pr
 		}
 	}
 	for index := range file.References {
+		if index&255 == 0 && ctx.Err() != nil {
+			return nil
+		}
 		reference := &file.References[index]
 		if !members[reference.ResolvedID] {
 			if reference.ResolvedID != "" {
 				continue
 			}
 			matched := false
-			for _, resolved := range i.resolveLocked(file, *reference) {
+			for _, resolved := range i.resolveContextLocked(ctx, file, *reference) {
 				if members[resolved.ID] {
 					matched = true
 					break

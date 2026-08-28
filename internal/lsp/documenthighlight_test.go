@@ -14,7 +14,7 @@ import (
 
 func TestDocumentHighlightSeparatesReadsFromWrites(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	s.initializeReceived.Store(true)
 	s.initialized.Store(true)
 	uri := protocol.URI("file:///workspace/Highlight.java")
@@ -60,7 +60,7 @@ func TestDocumentHighlightSeparatesReadsFromWrites(t *testing.T) {
 
 func TestDocumentHighlightIsAdvertised(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	result, responseErr := s.Request(context.Background(), "initialize", json.RawMessage(`{"processId":null,"rootUri":null,"capabilities":{}}`))
 	if responseErr != nil {
 		t.Fatalf("initialize failed: %v", responseErr)

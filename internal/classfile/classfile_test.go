@@ -79,6 +79,63 @@ func TestRejectsInvalidClass(t *testing.T) {
 	}
 }
 
+func TestRenderManglesJvmIdentifiersThatAreJavaKeywords(t *testing.T) {
+	class := &classfile.Class{
+		InternalName: "fixtures/when",
+		SuperName:    "java/lang/Object",
+		Access:       0x0001,
+		Fields:       []classfile.Field{{Name: "class", Descriptor: "I", Access: 0x0001}},
+		Methods:      []classfile.Method{{Name: "switch", Descriptor: "(I)V", Access: 0x0001, ParameterNames: []string{"var"}}},
+	}
+	rendered := classfile.RenderJava(class)
+	parsed := analysis.Parse(context.Background(), textdoc.NewDocument("jar:///keywords.jar!/fixtures/when.class", "java", 0, rendered))
+	if len(parsed.Diagnostics) != 0 {
+		t.Fatalf("keyword-safe stub did not parse: %#v\n%s", parsed.Diagnostics, rendered)
+	}
+	for _, original := range []string{"when", "class", "switch", "var"} {
+		safe := classfile.SourceJavaIdentifier(original)
+		if !strings.Contains(rendered, safe) || classfile.RestoreSourceJavaIdentifiers(safe) != original {
+			t.Fatalf("identifier %q was not reversibly rendered in:\n%s", original, rendered)
+		}
+	}
+}
+
+func TestRecoversParameterNamesFromLocalVariableTable(t *testing.T) {
+	javac, err := exec.LookPath("javac")
+	if err != nil {
+		t.Skip("javac is not installed")
+	}
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "DebugNames.java")
+	source := `package fixtures;
+public class DebugNames {
+    public long combine(long left, double right, String[] labels) { return left + (long) right + labels.length; }
+}`
+	if err := os.WriteFile(sourcePath, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, compileErr := exec.Command(javac, "-g", "-d", dir, sourcePath).CombinedOutput(); compileErr != nil {
+		t.Fatalf("javac: %v\n%s", compileErr, output)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "fixtures", "DebugNames.class"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := classfile.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, method := range parsed.Methods {
+		if method.Name == "combine" {
+			if got := strings.Join(method.ParameterNames, ","); got != "left,right,labels" {
+				t.Fatalf("LocalVariableTable parameter names = %q", got)
+			}
+			return
+		}
+	}
+	t.Fatal("combine method missing")
+}
+
 func TestParsePreservesMethodAndParameterAnnotations(t *testing.T) {
 	javac, err := exec.LookPath("javac")
 	if err != nil {

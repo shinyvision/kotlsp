@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
+	"github.com/shinyvision/kotlsp/internal/archiveio"
 	"github.com/shinyvision/kotlsp/internal/classfile"
 	textdoc "github.com/shinyvision/kotlsp/internal/text"
 	uriutil "github.com/shinyvision/kotlsp/internal/uri"
@@ -40,6 +42,15 @@ type breakpointHitCondition struct {
 	operator string
 	value    int
 }
+
+const (
+	maxRequestedBreakpoints = 4096
+	maxInstalledBreakpoints = 100_000
+	maxSourceClasses        = 4096
+	maxSourceBytes          = 64 << 20
+	maxBreakpointTextBytes  = 64 << 10
+	maxBreakpointPathBytes  = 32 << 10
+)
 
 func parseHitCondition(value string) (breakpointHitCondition, error) {
 	value = strings.TrimSpace(value)
@@ -81,10 +92,15 @@ func (condition breakpointHitCondition) matches(hits int) bool {
 	}
 }
 
-func (s *session) setBreakpoints(raw json.RawMessage) (any, bool, string) {
+func (s *session) setBreakpoints(raw json.RawMessage, contexts ...context.Context) (any, bool, string) {
+	s.debugOperationMu.Lock()
+	defer s.debugOperationMu.Unlock()
 	var args breakpointRequest
-	if json.Unmarshal(raw, &args) != nil || args.Source.Path == "" && args.Source.Name == "" {
+	if decodeDAPArguments(raw, &args) != nil || args.Source.Path == "" && args.Source.Name == "" {
 		return nil, false, "setBreakpoints requires a source"
+	}
+	if len(args.Source.Path) > maxBreakpointPathBytes || len(args.Source.Name) > maxBreakpointPathBytes || strings.IndexByte(args.Source.Path, 0) >= 0 || strings.IndexByte(args.Source.Name, 0) >= 0 {
+		return nil, false, "breakpoint source name/path exceeds its size or NUL-safety limit"
 	}
 	path := args.Source.Path
 	if path == "" {
@@ -95,20 +111,23 @@ func (s *session) setBreakpoints(raw json.RawMessage) (any, bool, string) {
 	}
 	source := map[string]any{"name": args.Source.Name, "path": path}
 	s.stateMu.Lock()
-	s.sourceByName[args.Source.Name] = path
+	s.rememberSourceLocked(args.Source.Name, path)
+	_, pathKnown := s.breakpoints[path]
 	previous := append([]sourceBreakpoint(nil), s.breakpoints[path]...)
 	s.stateMu.Unlock()
 	debugger := s.currentDebugger()
-	if debugger != nil {
-		for _, old := range previous {
-			_, _ = debugger.execute("clear " + old.Class + ":" + strconv.Itoa(old.Line))
-		}
-	}
 	s.stateMu.Lock()
 	classPaths := append([]string(nil), s.classPaths...)
 	s.stateMu.Unlock()
-	classesByLine, bytecodeAvailable := executableBytecodeClasses(path, classPaths)
-	classes := sourceClasses(path)
+	classesByLine, bytecodeAvailable, scanErr := s.cachedExecutableBytecodeClasses(requestContext(contexts), path, classPaths)
+	if scanErr != nil {
+		return nil, false, scanErr.Error()
+	}
+	ctx := requestContext(contexts)
+	classes, classErr := sourceClassesContext(ctx, path)
+	if classErr != nil {
+		return nil, false, classErr.Error()
+	}
 	requested := args.Breakpoints
 	if len(requested) == 0 {
 		requested = make([]requestedBreakpoint, len(args.Lines))
@@ -116,20 +135,35 @@ func (s *session) setBreakpoints(raw json.RawMessage) (any, bool, string) {
 			requested[index].Line = line
 		}
 	}
+	if len(requested) > maxRequestedBreakpoints {
+		return nil, false, "setBreakpoints exceeds its 4096-breakpoint safety limit"
+	}
 	response := make([]map[string]any, 0, len(requested))
-	installed := make([]sourceBreakpoint, 0, len(requested)*len(classes))
+	installedCapacity := len(requested) * min(len(classes), maxInstalledBreakpoints/max(1, len(requested)))
+	installed := make([]sourceBreakpoint, 0, installedCapacity)
+	seenLines := make(map[int]bool, len(requested))
 	for index, requestedBreakpoint := range requested {
 		line := requestedBreakpoint.Line
-		hitCondition, hitErr := parseHitCondition(requestedBreakpoint.HitCondition)
+		textInvalid := len(requestedBreakpoint.Condition) > maxBreakpointTextBytes || len(requestedBreakpoint.LogMessage) > maxBreakpointTextBytes || len(requestedBreakpoint.HitCondition) > 256 || strings.IndexByte(requestedBreakpoint.Condition, 0) >= 0 || strings.IndexByte(requestedBreakpoint.LogMessage, 0) >= 0 || strings.IndexByte(requestedBreakpoint.HitCondition, 0) >= 0
+		var hitCondition breakpointHitCondition
+		var hitErr error
+		if !textInvalid {
+			hitCondition, hitErr = parseHitCondition(requestedBreakpoint.HitCondition)
+		}
 		verified := false
 		message := ""
 		if debugger == nil {
 			message = "debugger is not attached"
 		} else if line <= 0 {
 			message = "line must be positive"
+		} else if textInvalid {
+			message = "breakpoint condition, hit condition, or log message exceeds its size/NUL safety limit"
 		} else if hitErr != nil {
 			message = hitErr.Error()
+		} else if seenLines[line] {
+			message = "duplicate source breakpoint line was ignored"
 		} else {
+			seenLines[line] = true
 			lineClasses := classes
 			if bytecodeAvailable {
 				lineClasses = classesByLine[line]
@@ -138,20 +172,11 @@ func (s *session) setBreakpoints(raw json.RawMessage) (any, bool, string) {
 				}
 			}
 			for _, className := range lineClasses {
-				lines, err := debugger.execute("stop at " + className + ":" + strconv.Itoa(line))
-				if err != nil {
-					message = err.Error()
-					continue
+				if len(installed) >= maxInstalledBreakpoints {
+					return nil, false, "expanded source breakpoints exceed their 100000-location safety limit"
 				}
-				text := strings.ToLower(strings.Join(lines, ""))
-				if strings.Contains(text, "set breakpoint") || strings.Contains(text, "deferring breakpoint") {
-					verified = true
-					installed = append(installed, sourceBreakpoint{Class: className, Line: line, Source: source, Condition: requestedBreakpoint.Condition, HitCondition: hitCondition, LogMessage: requestedBreakpoint.LogMessage})
-				} else if strings.Contains(text, "unable") || strings.Contains(text, "not found") {
-					message = strings.TrimSpace(strings.Join(lines, ""))
-				} else if strings.TrimSpace(strings.Join(lines, "")) != "" {
-					message = strings.TrimSpace(strings.Join(lines, ""))
-				}
+				verified = true
+				installed = append(installed, sourceBreakpoint{Class: className, Line: line, Source: source, Condition: requestedBreakpoint.Condition, HitCondition: hitCondition, LogMessage: requestedBreakpoint.LogMessage})
 			}
 		}
 		entry := map[string]any{"id": index + 1, "verified": verified, "line": line, "column": 1, "source": source}
@@ -161,39 +186,97 @@ func (s *session) setBreakpoints(raw json.RawMessage) (any, bool, string) {
 		response = append(response, entry)
 	}
 	s.stateMu.Lock()
+	totalInstalled := len(installed)
+	for existingPath, values := range s.breakpoints {
+		if existingPath != path {
+			totalInstalled += len(values)
+		}
+		if totalInstalled > maxInstalledBreakpoints {
+			break
+		}
+	}
+	pathCount := len(s.breakpoints)
+	s.stateMu.Unlock()
+	if totalInstalled > maxInstalledBreakpoints {
+		return nil, false, "session breakpoints exceed their 100000-location safety limit"
+	}
+	if !pathKnown && pathCount >= maxRememberedPath {
+		return nil, false, "breakpoint source files exceed their 8192-path safety limit"
+	}
+	if debugger != nil {
+		oldSpecs := make([]lineBreakpointSpec, 0, len(previous))
+		for _, breakpoint := range previous {
+			oldSpecs = append(oldSpecs, lineBreakpointSpec{Class: breakpoint.Class, Line: breakpoint.Line})
+		}
+		newSpecs := make([]lineBreakpointSpec, 0, len(installed))
+		for _, breakpoint := range installed {
+			newSpecs = append(newSpecs, lineBreakpointSpec{Class: breakpoint.Class, Line: breakpoint.Line})
+		}
+		if err := debugger.replaceLineBreakpoints(oldSpecs, newSpecs, contexts...); err != nil {
+			return nil, false, "staged breakpoint replacement failed; Go metadata was not published: " + err.Error()
+		}
+	}
+	s.stateMu.Lock()
 	s.breakpoints[path] = installed
 	s.stateMu.Unlock()
 	return map[string]any{"breakpoints": response}, true, ""
 }
 
-func (s *session) setFunctionBreakpoints(raw json.RawMessage) (any, bool, string) {
+func (s *session) setFunctionBreakpoints(raw json.RawMessage, contexts ...context.Context) (any, bool, string) {
+	s.debugOperationMu.Lock()
+	defer s.debugOperationMu.Unlock()
 	var args struct {
 		Breakpoints []struct {
 			Name string `json:"name"`
 		} `json:"breakpoints"`
 	}
-	if json.Unmarshal(raw, &args) != nil {
+	if decodeDAPArguments(raw, &args) != nil {
 		return nil, false, "invalid function breakpoints"
 	}
+	if len(args.Breakpoints) > maxRequestedBreakpoints {
+		return nil, false, "function breakpoints exceed their 4096-item safety limit"
+	}
 	debugger := s.currentDebugger()
+	names := make([]string, 0, len(args.Breakpoints))
+	seen := make(map[string]bool, len(args.Breakpoints))
+	for _, breakpoint := range args.Breakpoints {
+		if breakpoint.Name == "" || len(breakpoint.Name) > maxBreakpointTextBytes || strings.IndexByte(breakpoint.Name, 0) >= 0 {
+			continue
+		}
+		if !seen[breakpoint.Name] {
+			seen[breakpoint.Name] = true
+			names = append(names, breakpoint.Name)
+		}
+	}
+	s.stateMu.Lock()
+	previous := append([]string(nil), s.functionBreakpoints...)
+	s.stateMu.Unlock()
+	statuses := make(map[string][]string)
+	if debugger != nil {
+		var replaceErr error
+		statuses, replaceErr = debugger.replaceFunctionBreakpoints(previous, names, contexts...)
+		if replaceErr != nil {
+			return nil, false, "staged function-breakpoint replacement failed; Go metadata was not published: " + replaceErr.Error()
+		}
+		s.stateMu.Lock()
+		s.functionBreakpoints = append([]string(nil), names...)
+		s.stateMu.Unlock()
+	}
 	response := make([]map[string]any, 0, len(args.Breakpoints))
 	for index, breakpoint := range args.Breakpoints {
 		verified := false
 		message := ""
 		if debugger == nil {
 			message = "debugger is not attached"
-		} else if breakpoint.Name == "" {
-			message = "function name is empty"
+		} else if breakpoint.Name == "" || len(breakpoint.Name) > maxBreakpointTextBytes || strings.IndexByte(breakpoint.Name, 0) >= 0 {
+			message = "function name is empty or exceeds its safety limit"
 		} else {
-			lines, err := debugger.execute("stop in " + breakpoint.Name)
-			if err != nil {
-				message = err.Error()
+			status := statuses[breakpoint.Name]
+			verified = len(status) >= 2 && status[0] == "true"
+			if len(status) >= 2 {
+				message = status[1]
 			} else {
-				text := strings.ToLower(strings.Join(lines, ""))
-				verified = strings.Contains(text, "set breakpoint") || strings.Contains(text, "deferring breakpoint")
-				if !verified {
-					message = strings.TrimSpace(strings.Join(lines, ""))
-				}
+				message = "function breakpoint was not accepted by the debugger bridge"
 			}
 		}
 		entry := map[string]any{"id": index + 1, "verified": verified}
@@ -205,35 +288,42 @@ func (s *session) setFunctionBreakpoints(raw json.RawMessage) (any, bool, string
 	return map[string]any{"breakpoints": response}, true, ""
 }
 
-func (s *session) setExceptionBreakpoints(raw json.RawMessage) (any, bool, string) {
+func (s *session) setExceptionBreakpoints(raw json.RawMessage, contexts ...context.Context) (any, bool, string) {
+	s.debugOperationMu.Lock()
+	defer s.debugOperationMu.Unlock()
 	var args struct {
 		Filters []string `json:"filters"`
 	}
-	if json.Unmarshal(raw, &args) != nil {
+	if decodeDAPArguments(raw, &args) != nil {
 		return nil, false, "invalid exception breakpoints"
+	}
+	if len(args.Filters) > 32 {
+		return nil, false, "exception breakpoint filters exceed their 32-item safety limit"
 	}
 	debugger := s.currentDebugger()
 	if debugger == nil {
 		return map[string]any{"breakpoints": []any{}}, true, ""
 	}
-	_, _ = debugger.execute("ignore caught java.lang.Throwable")
-	_, _ = debugger.execute("ignore uncaught java.lang.Throwable")
+	caught, uncaught := false, false
 	for _, filter := range args.Filters {
-		if filter == "caught" || filter == "uncaught" {
-			_, _ = debugger.execute("catch " + filter + " java.lang.Throwable")
-			if filter == "uncaught" {
-				// spring-boot-devtools restarts the application by throwing
-				// SilentExitException on the main thread. It is control flow,
-				// not a failure, and pausing on it at every launch is pure
-				// noise.
-				_, _ = debugger.execute("ignore uncaught org.springframework.boot.devtools.restart.SilentExitExceptionHandler$SilentExitException")
-			}
-		}
+		caught = caught || filter == "caught"
+		uncaught = uncaught || filter == "uncaught"
+	}
+	if err := debugger.configureExceptions(caught, uncaught, contexts...); err != nil {
+		return nil, false, err.Error()
 	}
 	return map[string]any{"breakpoints": []any{}}, true, ""
 }
 
 func breakpointLocations(raw json.RawMessage, classPaths ...string) (any, bool, string) {
+	return (&session{breakpointCache: make(map[string]breakpointClassCacheEntry)}).breakpointLocationsContext(context.Background(), raw, classPaths...)
+}
+
+func (s *session) breakpointLocations(raw json.RawMessage, classPaths ...string) (any, bool, string) {
+	return s.breakpointLocationsContext(context.Background(), raw, classPaths...)
+}
+
+func (s *session) breakpointLocationsContext(ctx context.Context, raw json.RawMessage, classPaths ...string) (any, bool, string) {
 	var args struct {
 		Source struct {
 			Path string `json:"path"`
@@ -241,16 +331,32 @@ func breakpointLocations(raw json.RawMessage, classPaths ...string) (any, bool, 
 		Line    int `json:"line"`
 		EndLine int `json:"endLine"`
 	}
-	if json.Unmarshal(raw, &args) != nil || args.Line <= 0 {
+	if decodeDAPArguments(raw, &args) != nil || args.Line <= 0 {
 		return nil, false, "invalid breakpointLocations arguments"
+	}
+	if len(args.Source.Path) > maxBreakpointPathBytes || strings.IndexByte(args.Source.Path, 0) >= 0 {
+		return nil, false, "breakpointLocations source path exceeds its size or NUL-safety limit"
 	}
 	end := args.EndLine
 	if end < args.Line {
 		end = args.Line
 	}
-	executable, bytecodeAvailable := executableBytecodeLines(args.Source.Path, classPaths)
+	if end-args.Line > 10_000 {
+		return nil, false, "breakpointLocations exceeds its 10000-line safety limit"
+	}
+	classes, bytecodeAvailable, scanErr := s.cachedExecutableBytecodeClasses(ctx, args.Source.Path, classPaths)
+	if scanErr != nil {
+		return nil, false, scanErr.Error()
+	}
+	executable := make(map[int]bool, len(classes))
+	for line := range classes {
+		executable[line] = true
+	}
 	if !bytecodeAvailable {
-		executable = executableSourceLines(args.Source.Path)
+		executable, scanErr = executableSourceLinesContext(ctx, args.Source.Path)
+		if scanErr != nil {
+			return nil, false, scanErr.Error()
+		}
 	}
 	breakpoints := make([]map[string]any, 0, end-args.Line+1)
 	for line := args.Line; line <= end; line++ {
@@ -259,6 +365,52 @@ func breakpointLocations(raw json.RawMessage, classPaths ...string) (any, bool, 
 		}
 	}
 	return map[string]any{"breakpoints": breakpoints}, true, ""
+}
+
+type breakpointClassCacheEntry struct {
+	lines     map[int][]string
+	available bool
+}
+
+func (s *session) cachedExecutableBytecodeClasses(ctx context.Context, sourcePath string, classPaths []string) (map[int][]string, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(classPaths) > 4096 {
+		return nil, false, fmt.Errorf("debug classpath exceeds its 4096-root safety limit")
+	}
+	var key strings.Builder
+	for index, path := range append([]string{sourcePath}, classPaths...) {
+		if index&63 == 0 && ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
+		key.WriteString(filepath.Clean(path))
+		if info, err := os.Stat(path); err == nil {
+			key.WriteString("|")
+			key.WriteString(strconv.FormatInt(info.Size(), 10))
+			key.WriteString("|")
+			key.WriteString(info.ModTime().UTC().Format("20060102150405.000000000"))
+		}
+		key.WriteByte(0)
+	}
+	cacheKey := key.String()
+	s.breakpointMu.Lock()
+	if cached, ok := s.breakpointCache[cacheKey]; ok {
+		s.breakpointMu.Unlock()
+		return cached.lines, cached.available, nil
+	}
+	s.breakpointMu.Unlock()
+	lines, available, err := executableBytecodeClassesContext(ctx, sourcePath, classPaths)
+	if err != nil {
+		return nil, false, err
+	}
+	s.breakpointMu.Lock()
+	if len(s.breakpointCache) >= 128 {
+		s.breakpointCache = make(map[string]breakpointClassCacheEntry)
+	}
+	s.breakpointCache[cacheKey] = breakpointClassCacheEntry{lines: lines, available: available}
+	s.breakpointMu.Unlock()
+	return lines, available, nil
 }
 
 func executableBytecodeLines(sourcePath string, classPaths []string) (map[int]bool, bool) {
@@ -271,32 +423,33 @@ func executableBytecodeLines(sourcePath string, classPaths []string) (map[int]bo
 }
 
 func executableBytecodeClasses(sourcePath string, classPaths []string) (map[int][]string, bool) {
+	lines, available, _ := executableBytecodeClassesContext(context.Background(), sourcePath, classPaths)
+	return lines, available
+}
+
+func executableBytecodeClassesContext(ctx context.Context, sourcePath string, classPaths []string) (map[int][]string, bool, error) {
 	lines := make(map[int][]string)
 	if sourcePath == "" {
-		return lines, false
+		return lines, false, nil
 	}
-	classNames := sourceClasses(sourcePath)
-	seenFiles := make(map[string]bool)
-	var classFiles []string
+	if len(classPaths) > 4096 {
+		return nil, false, fmt.Errorf("debug classpath exceeds its 4096-root safety limit")
+	}
+	classNames, classErr := sourceClassesContext(ctx, sourcePath)
+	if classErr != nil {
+		return nil, false, classErr
+	}
+	localBases := []string{strings.TrimSuffix(filepath.Base(sourcePath), filepath.Ext(sourcePath))}
 	for _, className := range classNames {
 		tail := className
 		if dot := strings.LastIndexByte(tail, '.'); dot >= 0 {
 			tail = tail[dot+1:]
 		}
-		candidate := filepath.Join(filepath.Dir(sourcePath), tail+".class")
-		if !seenFiles[candidate] {
-			seenFiles[candidate] = true
-			classFiles = append(classFiles, candidate)
-		}
+		localBases = appendUniqueString(localBases, tail)
 	}
-	base := strings.TrimSuffix(filepath.Base(sourcePath), filepath.Ext(sourcePath))
-	if matches, _ := filepath.Glob(filepath.Join(filepath.Dir(sourcePath), base+"*.class")); len(matches) > 0 {
-		for _, candidate := range matches {
-			if !seenFiles[candidate] {
-				seenFiles[candidate] = true
-				classFiles = append(classFiles, candidate)
-			}
-		}
+	classFiles, siblingErr := boundedSiblingClassFamilies(ctx, filepath.Dir(sourcePath), localBases)
+	if siblingErr != nil {
+		return nil, false, siblingErr
 	}
 	available := false
 	consume := func(data []byte) {
@@ -313,62 +466,198 @@ func executableBytecodeClasses(sourcePath string, classPaths []string) (map[int]
 		}
 	}
 	for _, candidate := range classFiles {
-		if data, err := os.ReadFile(candidate); err == nil {
+		if ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
+		if data, err := readBoundedFile(candidate, archiveio.MaxEntryBytes); err == nil {
 			consume(data)
 		}
 	}
+	const maxClasspathArchives = 512
+	const maxArchiveEntries = 250_000
+	archives, entries := 0, 0
+	exhausted := false
+classpathScan:
 	for _, root := range classPaths {
+		if ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
 		info, err := os.Stat(root)
 		if err == nil && info.IsDir() {
+			directoryBases := make(map[string][]string)
 			for _, className := range classNames {
+				if ctx.Err() != nil {
+					return nil, false, ctx.Err()
+				}
 				candidate := filepath.Join(root, filepath.FromSlash(strings.ReplaceAll(className, ".", "/"))+".class")
-				base := strings.TrimSuffix(filepath.Base(candidate), ".class")
-				matches, _ := filepath.Glob(filepath.Join(filepath.Dir(candidate), base+"*.class"))
+				directory := filepath.Dir(candidate)
+				directoryBases[directory] = appendUniqueString(directoryBases[directory], strings.TrimSuffix(filepath.Base(candidate), ".class"))
+			}
+			for directory, bases := range directoryBases {
+				matches, siblingErr := boundedSiblingClassFamilies(ctx, directory, bases)
+				if siblingErr != nil {
+					return nil, false, siblingErr
+				}
 				for _, match := range matches {
-					if data, readErr := os.ReadFile(match); readErr == nil {
+					if data, readErr := readBoundedFile(match, archiveio.MaxEntryBytes); readErr == nil {
 						consume(data)
 					}
 				}
 			}
+			if available {
+				break classpathScan
+			}
 			continue
+		}
+		if archives >= maxClasspathArchives {
+			exhausted = true
+			break
 		}
 		archive, openErr := zip.OpenReader(root)
 		if openErr != nil {
 			continue
 		}
-		wanted := make([]string, 0, len(classNames))
+		budget, validateErr := archiveio.NewBudget(archive.File)
+		if validateErr != nil {
+			_ = archive.Close()
+			return nil, false, validateErr
+		}
+		archives++
+		wanted := make(map[string]bool, len(classNames))
 		for _, className := range classNames {
-			wanted = append(wanted, strings.ReplaceAll(className, ".", "/"))
+			wanted[strings.ReplaceAll(className, ".", "/")] = true
 		}
 		for _, entry := range archive.File {
+			entries++
+			if entries&255 == 0 && ctx.Err() != nil {
+				_ = archive.Close()
+				return nil, false, ctx.Err()
+			}
+			if entries > maxArchiveEntries {
+				exhausted = true
+				break
+			}
 			classPath := strings.TrimSuffix(entry.Name, ".class")
-			matched := false
-			for _, prefix := range wanted {
-				if classPath == prefix || strings.HasPrefix(classPath, prefix+"$") {
-					matched = true
+			matched := wanted[classPath]
+			for candidate := classPath; !matched; {
+				nested := strings.LastIndexByte(candidate, '$')
+				if nested < 0 {
 					break
 				}
+				candidate = candidate[:nested]
+				matched = wanted[candidate]
 			}
 			if !matched {
 				continue
 			}
-			reader, readErr := entry.Open()
-			if readErr != nil {
-				continue
-			}
-			data := make([]byte, entry.UncompressedSize64)
-			_, readErr = io.ReadFull(reader, data)
-			_ = reader.Close()
+			data, readErr := budget.ReadContext(ctx, entry, archiveio.MaxEntryBytes)
 			if readErr == nil {
 				consume(data)
+			} else if errors.Is(readErr, archiveio.ErrArchiveBudget) {
+				_ = archive.Close()
+				return nil, false, readErr
 			}
 		}
 		_ = archive.Close()
+		if exhausted {
+			break
+		}
+		// Classpath order is authoritative. Once one root supplies classes for
+		// this source file, later duplicate artifacts cannot be the loaded copy.
+		if available {
+			break
+		}
+	}
+	if exhausted {
+		return nil, false, fmt.Errorf("executable-bytecode scan exceeded %d archives or %d entries", maxClasspathArchives, maxArchiveEntries)
 	}
 	for line := range lines {
 		sort.Strings(lines[line])
 	}
-	return lines, available
+	return lines, available, nil
+}
+
+func requestContext(contexts []context.Context) context.Context {
+	if len(contexts) > 0 && contexts[0] != nil {
+		return contexts[0]
+	}
+	return context.Background()
+}
+
+func readBoundedFile(path string, limit int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	if info, statErr := file.Stat(); statErr != nil {
+		return nil, statErr
+	} else if info.Size() > limit {
+		return nil, archiveio.ErrEntryTooLarge
+	}
+	reader := &io.LimitedReader{R: file, N: limit + 1}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, archiveio.ErrEntryTooLarge
+	}
+	return data, nil
+}
+
+func boundedSiblingClassFamilies(ctx context.Context, directory string, bases []string) ([]string, error) {
+	const (
+		maxDirectoryEntries = 100_000
+		maxClassMatches     = 4096
+	)
+	directoryHandle, err := os.Open(directory)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer directoryHandle.Close()
+	var out []string
+	visited := 0
+	for {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		entries, readErr := directoryHandle.ReadDir(256)
+		for _, entry := range entries {
+			visited++
+			if visited > maxDirectoryEntries {
+				return nil, fmt.Errorf("class directory exceeds its 100000-entry safety limit")
+			}
+			name := entry.Name()
+			matched := false
+			if !entry.IsDir() && strings.HasSuffix(strings.ToLower(name), ".class") {
+				stem := name[:len(name)-len(".class")]
+				for _, base := range bases {
+					if stem == base || strings.HasPrefix(stem, base+"$") {
+						matched = true
+						break
+					}
+				}
+			}
+			if matched {
+				if len(out) >= maxClassMatches {
+					return nil, fmt.Errorf("source class family exceeds its 4096-file safety limit")
+				}
+				out = append(out, filepath.Join(directory, name))
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func appendUniqueString(values []string, value string) []string {
@@ -381,18 +670,29 @@ func appendUniqueString(values []string, value string) []string {
 }
 
 func executableSourceLines(path string) map[int]bool {
+	lines, _ := executableSourceLinesContext(context.Background(), path)
+	return lines
+}
+
+func executableSourceLinesContext(ctx context.Context, path string) (map[int]bool, error) {
 	result := make(map[int]bool)
 	if path == "" {
-		return result
+		return result, nil
 	}
-	data, err := os.ReadFile(path)
+	data, err := readBoundedFile(path, maxSourceBytes)
 	if err != nil {
-		return result
+		return result, err
 	}
 	doc := textdoc.NewDocument(uriutil.File(path), strings.TrimPrefix(strings.ToLower(filepath.Ext(path)), "."), 0, string(data))
-	parsed := analysis.Parse(context.Background(), doc)
+	parsed := analysis.Parse(ctx, doc)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	callables := make([]analysis.Symbol, 0)
-	for _, symbol := range parsed.Symbols {
+	for index, symbol := range parsed.Symbols {
+		if index&255 == 0 && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if analysis.IsCallableKind(symbol.Kind) {
 			callables = append(callables, symbol)
 		}
@@ -400,7 +700,10 @@ func executableSourceLines(path string) map[int]bool {
 			result[symbol.SelectionRange.Start.Line+1] = true
 		}
 	}
-	for _, reference := range parsed.References {
+	for index, reference := range parsed.References {
+		if index&255 == 0 && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		for _, callable := range callables {
 			if callable.StartByte <= reference.StartByte && reference.EndByte <= callable.EndByte {
 				result[reference.Range.Start.Line+1] = true
@@ -410,6 +713,9 @@ func executableSourceLines(path string) map[int]bool {
 	}
 	lines := strings.Split(doc.Text, "\n")
 	for index, line := range lines {
+		if index&255 == 0 && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || trimmed == "{" || trimmed == "}" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "package ") || strings.HasPrefix(trimmed, "import ") {
 			continue
@@ -418,7 +724,7 @@ func executableSourceLines(path string) map[int]bool {
 			result[index+1] = true
 		}
 	}
-	return result
+	return result, nil
 }
 
 var packagePattern = regexp.MustCompile(`(?m)^\s*package\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)`)
@@ -427,7 +733,21 @@ var kotlinTypePattern = regexp.MustCompile(`\b(?:class|interface|object|enum\s+c
 var kotlinFileJVMNamePattern = regexp.MustCompile(`(?m)@file:(?:kotlin\.jvm\.)?JvmName\s*\(\s*"([^"]+)"\s*\)`)
 
 func sourceClasses(path string) []string {
-	data, _ := os.ReadFile(path)
+	classes, _ := sourceClassesContext(context.Background(), path)
+	return classes
+}
+
+func sourceClassesContext(ctx context.Context, path string) ([]string, error) {
+	data, err := readBoundedFile(path, maxSourceBytes)
+	if err != nil {
+		if os.IsNotExist(err) {
+			base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+			if base != "" {
+				return []string{base}, nil
+			}
+		}
+		return nil, err
+	}
 	text := string(data)
 	packageName := ""
 	if match := packagePattern.FindStringSubmatch(text); len(match) == 2 {
@@ -446,18 +766,27 @@ func sourceClasses(path string) []string {
 	} else {
 		_ = javaTypePattern // retained for the malformed-source fallback below.
 	}
-	parsed := analysis.Parse(context.Background(), textdoc.NewDocument(uriutil.File(path), strings.TrimPrefix(extension, "."), 0, text))
+	parsed := analysis.Parse(ctx, textdoc.NewDocument(uriutil.File(path), strings.TrimPrefix(extension, "."), 0, text))
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	byID := make(map[string]analysis.Symbol, len(parsed.Symbols))
 	for _, symbol := range parsed.Symbols {
 		byID[symbol.ID] = symbol
 	}
 	for _, symbol := range parsed.Symbols {
 		if analysis.IsTypeKind(symbol.Kind) {
+			if len(names) >= maxSourceClasses {
+				return nil, fmt.Errorf("source declares more than %d debug-visible classes", maxSourceClasses)
+			}
 			names = append(names, binarySourceClass(symbol, byID))
 		}
 	}
 	if extension != ".kt" && extension != ".kts" && len(names) == 0 {
-		for _, match := range javaTypePattern.FindAllStringSubmatch(text, -1) {
+		for _, match := range javaTypePattern.FindAllStringSubmatch(text, maxSourceClasses+1) {
+			if len(names) >= maxSourceClasses {
+				return nil, fmt.Errorf("source declares more than %d debug-visible classes", maxSourceClasses)
+			}
 			names = append(names, prefix+match[1])
 		}
 		if len(names) == 0 && base != "" {
@@ -465,7 +794,7 @@ func sourceClasses(path string) []string {
 		}
 	}
 	sort.Strings(names)
-	return uniqueStrings(names)
+	return uniqueStrings(names), nil
 }
 
 func binarySourceClass(symbol analysis.Symbol, byID map[string]analysis.Symbol) string {

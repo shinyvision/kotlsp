@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"math/big"
 	"sort"
 	"strings"
@@ -8,10 +9,29 @@ import (
 	"unicode/utf8"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
+	"github.com/shinyvision/kotlsp/internal/lexical"
+	"github.com/shinyvision/kotlsp/internal/protocol"
 	textdoc "github.com/shinyvision/kotlsp/internal/text"
 )
 
+const maxResolutionCandidates = 512
+
 func (i *Index) resolveLocked(file *analysis.ParsedFile, r analysis.Reference) []analysis.Symbol {
+	return i.resolveContextLocked(context.Background(), file, r)
+}
+
+// resolveContextLocked is always called with i.mu held. It bounds the total
+// candidate inventory before ranking so an exact-name collision in a large
+// dependency graph cannot turn a cursor request into unbounded lock-held work.
+// Exhaustion deliberately means ambiguity/abstention, never a partial answer.
+func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedFile, r analysis.Reference) []analysis.Symbol {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil || file == nil {
+		return nil
+	}
+	access := newAccessibilityMemoLocked(i, file)
 	if r.ResolvedID != "" {
 		if symbol, ok := i.symbols[r.ResolvedID]; ok {
 			return []analysis.Symbol{*symbol}
@@ -23,17 +43,59 @@ func (i *Index) resolveLocked(file *analysis.ParsedFile, r analysis.Reference) [
 				return symbols
 			}
 		}
-		return i.resolveArgumentLabelLocked(file, r)
+		return i.resolveArgumentLabelContextLocked(ctx, file, r)
 	}
 	ids := make([]string, 0)
+	exhausted := false
+	appendIDs := func(bucket []string) {
+		if exhausted || !access.consumeWork(len(bucket)) || len(bucket) > maxResolutionCandidates-len(ids) {
+			exhausted = true
+			return
+		}
+		ids = append(ids, bucket...)
+	}
+	appendID := func(id string) {
+		if exhausted || !access.consumeWork(1) || len(ids) >= maxResolutionCandidates {
+			exhausted = true
+			return
+		}
+		ids = append(ids, id)
+	}
+	finishExhausted := func() []analysis.Symbol {
+		i.recordHealth("resolution", r.Name, "candidate inventory exceeded its 512-symbol safety limit and was withheld")
+		return nil
+	}
+	if !i.prepareResolutionImportsLocked(file, access) {
+		return finishExhausted()
+	}
+	explicitImports := make(map[string]bool)
+	for _, imported := range access.importsByLocal[r.Name] {
+		if !imported.Wildcard {
+			explicitImports[imported.Path] = true
+		}
+	}
+	relevantImports := make([]analysis.Import, 0, len(access.importsByLocal[r.Name])+len(access.wildcardImports))
+	relevantImports = append(relevantImports, access.importsByLocal[r.Name]...)
+	relevantImports = append(relevantImports, access.wildcardImports...)
+	if !access.consumeWork(len(relevantImports)) {
+		return finishExhausted()
+	}
 	qualifier := r.Qualifier
 	implicitReceiverTypes := make([]string, 0, 4)
-	if document := i.docs[file.URI]; document != nil {
+	if text := i.documentTextLocked(file.URI); text != "" {
 		// Tree-sitter's qualifier field commonly contains only the final token
-		// (`value` in wrap(x).value.member). Prefer the complete balanced source
-		// expression so generic return arguments survive through longer chains.
-		if textual := expressionQualifierBefore(document.Text, r.StartByte); textual != "" {
-			qualifier = textual
+		// (`value` in wrap(x).value.member), and is empty altogether for a
+		// call qualified by a call with a trailing lambda (`Foo(false).apply {`).
+		// Prefer the complete balanced source expression before the dot so
+		// generic return arguments survive through longer chains and a dotted
+		// call never falls back to unqualified name lookup. Synthetic references
+		// built by type inference borrow an outer reference's position while
+		// naming a callee elsewhere; the text must spell the reference itself
+		// before the dot is trusted, or inference would re-enter itself.
+		if referenceSpelledAt(text, r) {
+			if textual := expressionQualifierBefore(text, r.StartByte); textual != "" {
+				qualifier = textual
+			}
 		}
 	}
 	if qualifier == "" {
@@ -47,94 +109,187 @@ func (i *Index) resolveLocked(file *analysis.ParsedFile, r analysis.Reference) [
 			implicitReceiverTypes = append(implicitReceiverTypes, i.javaSwitchLabelReceiverTypeLocked(file, r.StartByte))
 		}
 	}
-	typeQualifierSymbols := i.resolveTypeSymbolsLocked(file, qualifier)
+	typeQualifierSymbols := i.resolveTypeSymbolsForOwnerMemoLocked(file, qualifier, analysis.Symbol{}, access)
 	typeQualifier := qualifier != "" && !strings.ContainsAny(qualifier, "()[]{} ") && !strings.Contains(qualifier, "::") && len(typeQualifierSymbols) > 0
 	typeQualifierValue := i.typeQualifierActsAsValueLocked(file, typeQualifierSymbols)
 	callableReference := callableReferenceOperatorBefore(i.documentTextLocked(file.URI), r.StartByte)
 	unboundCallableReference := typeQualifier && callableReference
 	if r.Role == analysis.RoleImport && r.Qualifier != "" {
-		ids = append(ids, i.byFQN[r.Qualifier+"."+r.Name]...)
+		appendIDs(i.byFQN[r.Qualifier+"."+r.Name])
 	}
 	if qualifier != "" {
-		ids = append(ids, i.anonymousObjectMemberIDsLocked(file, qualifier, r.Name, r.StartByte)...)
-		typ := i.typeOfExpressionLocked(file, qualifier, r.StartByte)
+		anonymous, complete := i.anonymousObjectMemberIDsBoundedLocked(ctx, file, qualifier, r.Name, r.StartByte, maxResolutionCandidates-len(ids))
+		if !complete {
+			exhausted = true
+		} else {
+			appendIDs(anonymous)
+		}
+		typ := i.inferExpressionResultLocked(file, qualifier, r.StartByte).Type
 		if explicit := explicitReceiverType(qualifier); explicit != "" {
 			typ = explicit
 		}
 		if typ != "" {
 			nullableReceiver := file.Language == analysis.LanguageKotlin && strings.HasSuffix(strings.TrimSpace(typ), "?")
 			memberAccessAllowed := !nullableReceiver || kotlinNullableMemberAccessAllowed(i.documentTextLocked(file.URI), r.StartByte)
-			validContainers := i.typeAndSupertypesLocked(file, typ)
-			for _, container := range validContainers {
+			validContainers, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, typ, maxIntAtLeastOne(maxResolutionCandidates-len(ids)), access)
+			if !complete {
+				exhausted = true
+			}
+			for _, instantiated := range validContainers {
+				if ctx.Err() != nil {
+					return nil
+				}
+				owner := instantiated.symbol
 				if memberAccessAllowed {
-					for _, id := range i.byContainerMember[memberKey(container, r.Name)] {
-						if symbol := i.symbols[id]; i.memberInheritedForReceiverLocked(file, *symbol, typ) && (!typeQualifier || unboundCallableReference || i.memberAvailableThroughTypeQualifierLocked(file, *symbol, typeQualifierSymbols)) && i.accessibleLocked(file, *symbol, r.StartByte) {
-							ids = append(ids, id)
+					bucket := i.byContainerMember[memberKey(owner.ID, r.Name)]
+					if len(bucket) > maxResolutionCandidates-len(ids) {
+						exhausted = true
+						break
+					}
+					for _, id := range bucket {
+						if symbol := i.symbols[id]; i.memberInheritedForReceiverLocked(file, *symbol, typ) && (!typeQualifier || unboundCallableReference || i.memberAvailableThroughTypeQualifierLocked(file, *symbol, typeQualifierSymbols)) && i.accessibleWithMemoLocked(file, *symbol, access, r.StartByte) {
+							appendID(id)
 						}
 					}
 				}
-				for _, id := range i.byReceiverMember[memberKey(container, r.Name)] {
-					if symbol := i.symbols[id]; (!typeQualifier || typeQualifierValue || unboundCallableReference) && i.extensionReceiverApplicableLocked(file, *symbol, typ) && (memberAccessAllowed || strings.HasSuffix(strings.TrimSpace(symbol.ReceiverType), "?")) && i.accessibleLocked(file, *symbol, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) {
-						ids = append(ids, id)
+				extensions, complete := i.extensionMemberCandidatesBoundedLocked(owner, r.Name, maxResolutionCandidates-len(ids))
+				if !complete {
+					exhausted = true
+					break
+				}
+				for _, id := range extensions {
+					if symbol := i.symbols[id]; (!typeQualifier || typeQualifierValue || unboundCallableReference) && i.extensionReceiverApplicableLocked(file, *symbol, typ) && (memberAccessAllowed || strings.HasSuffix(strings.TrimSpace(symbol.ReceiverType), "?")) && i.accessibleWithMemoLocked(file, *symbol, access, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) {
+						appendID(id)
 					}
 				}
 				if file.Language == analysis.LanguageKotlin {
-					for _, id := range i.companionMemberIDsLocked(file, container, r.Name) {
-						if i.accessibleLocked(file, *i.symbols[id], r.StartByte) {
-							ids = append(ids, id)
+					companionMembers, complete := i.companionMembersForOwnerBoundedLocked(ctx, owner, nil, maxResolutionCandidates-len(ids))
+					if !complete {
+						exhausted = true
+						break
+					}
+					for _, member := range companionMembers {
+						if member.Name == r.Name && i.accessibleWithMemoLocked(file, member, access, r.StartByte) {
+							appendID(member.ID)
+						}
+					}
+				}
+			}
+			if complete && len(validContainers) == 0 && file.Language == analysis.LanguageKotlin {
+				for _, owner := range spellingReceiverOwners(typ) {
+					extensions, complete := i.extensionMemberCandidatesBoundedLocked(owner, r.Name, maxResolutionCandidates-len(ids))
+					if !complete {
+						exhausted = true
+						break
+					}
+					for _, id := range extensions {
+						if symbol := i.symbols[id]; (!typeQualifier || typeQualifierValue || unboundCallableReference) && i.extensionReceiverApplicableLocked(file, *symbol, typ) && (memberAccessAllowed || strings.HasSuffix(strings.TrimSpace(symbol.ReceiverType), "?")) && i.accessibleWithMemoLocked(file, *symbol, access, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) {
+							appendID(id)
 						}
 					}
 				}
 			}
 		} else {
-			ids = append(ids, i.byFQN[qualifier+"."+r.Name]...)
+			appendIDs(i.byFQN[qualifier+"."+r.Name])
 		}
 	}
+	if exhausted {
+		return finishExhausted()
+	}
 	for _, implicitReceiverType := range implicitReceiverTypes {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if implicitReceiverType == "" {
 			continue
 		}
-		for _, container := range i.typeAndSupertypesLocked(file, implicitReceiverType) {
-			for _, id := range i.byContainerMember[memberKey(container, r.Name)] {
-				if symbol := i.symbols[id]; i.memberInheritedForReceiverLocked(file, *symbol, implicitReceiverType) && i.accessibleLocked(file, *symbol, r.StartByte) {
-					ids = append(ids, id)
+		hierarchy, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, implicitReceiverType, maxIntAtLeastOne(maxResolutionCandidates-len(ids)), access)
+		if !complete {
+			exhausted = true
+			break
+		}
+		for _, instantiated := range hierarchy {
+			owner := instantiated.symbol
+			bucket := i.byContainerMember[memberKey(owner.ID, r.Name)]
+			if len(bucket) > maxResolutionCandidates-len(ids) {
+				exhausted = true
+				break
+			}
+			for _, id := range bucket {
+				if symbol := i.symbols[id]; i.memberInheritedForReceiverLocked(file, *symbol, implicitReceiverType) && i.accessibleWithMemoLocked(file, *symbol, access, r.StartByte) {
+					appendID(id)
 				}
 			}
-			for _, id := range i.byReceiverMember[memberKey(container, r.Name)] {
-				if symbol := i.symbols[id]; i.extensionReceiverApplicableLocked(file, *symbol, implicitReceiverType) && i.accessibleLocked(file, *symbol, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) {
-					ids = append(ids, id)
+			extensions, complete := i.extensionMemberCandidatesBoundedLocked(owner, r.Name, maxResolutionCandidates-len(ids))
+			if !complete {
+				exhausted = true
+				break
+			}
+			for _, id := range extensions {
+				if symbol := i.symbols[id]; i.extensionReceiverApplicableLocked(file, *symbol, implicitReceiverType) && i.accessibleWithMemoLocked(file, *symbol, access, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) {
+					appendID(id)
+				}
+			}
+		}
+		if len(hierarchy) == 0 && file.Language == analysis.LanguageKotlin {
+			for _, owner := range spellingReceiverOwners(implicitReceiverType) {
+				extensions, complete := i.extensionMemberCandidatesBoundedLocked(owner, r.Name, maxResolutionCandidates-len(ids))
+				if !complete {
+					exhausted = true
+					break
+				}
+				for _, id := range extensions {
+					if symbol := i.symbols[id]; i.extensionReceiverApplicableLocked(file, *symbol, implicitReceiverType) && i.accessibleWithMemoLocked(file, *symbol, access, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) {
+						appendID(id)
+					}
 				}
 			}
 		}
 	}
-	for _, imp := range file.Imports {
+	if exhausted {
+		return finishExhausted()
+	}
+	for _, imp := range relevantImports {
 		if imp.Static && file.Language == analysis.LanguageJava {
 			if imp.Wildcard || imp.LocalName() == r.Name {
-				ids = append(ids, i.staticImportMemberIDsLocked(file, imp, r.Name, r.StartByte)...)
+				members, complete := i.staticImportMemberIDsBoundedWithMemoLocked(ctx, file, imp, r.Name, r.StartByte, maxResolutionCandidates-len(ids), access)
+				if !complete {
+					exhausted = true
+					break
+				}
+				appendIDs(members)
 			}
 			continue
 		}
 		if !imp.Wildcard && imp.LocalName() == r.Name {
-			ids = append(ids, i.byFQN[imp.Path]...)
+			appendIDs(i.byFQN[imp.Path])
 		}
 		if imp.Wildcard {
-			ids = append(ids, i.byFQN[imp.Path+"."+r.Name]...)
+			appendIDs(i.byFQN[imp.Path+"."+r.Name])
 		}
 	}
 	if file.Package != "" {
-		ids = append(ids, i.byFQN[file.Package+"."+r.Name]...)
+		appendIDs(i.byFQN[file.Package+"."+r.Name])
 	}
 	if r.ContainerID != "" && qualifier == "" {
 		instanceReceiver := !i.staticLikeContextLocked(file, r.StartByte)
 		for containerID := r.ContainerID; containerID != ""; {
+			if ctx.Err() != nil {
+				return nil
+			}
 			c, ok := i.symbols[containerID]
 			if !ok {
 				break
 			}
-			for _, id := range i.byContainerMember[memberKey(c.Name, r.Name)] {
+			bucket := i.byContainerMember[memberKey(c.ID, r.Name)]
+			if len(bucket) > maxResolutionCandidates-len(ids) {
+				exhausted = true
+				break
+			}
+			for _, id := range bucket {
 				s := i.symbols[id]
 				if (s.ContainerID == c.ID || s.ContainerName == c.Name) && (instanceReceiver || i.staticOrNestedMemberLocked(*s)) {
-					ids = append(ids, id)
+					appendID(id)
 				}
 			}
 			nextID := c.ContainerID
@@ -145,29 +300,52 @@ func (i *Index) resolveLocked(file *analysis.ParsedFile, r analysis.Reference) [
 		}
 	}
 	if len(ids) == 0 && qualifier == "" {
-		for _, id := range i.byName[r.Name] {
+		bucket := i.byName[r.Name]
+		if len(bucket) > maxResolutionCandidates {
+			exhausted = true
+		}
+		for _, id := range bucket {
+			if exhausted || ctx.Err() != nil {
+				break
+			}
 			symbol := i.symbols[id]
-			if i.accessibleLocked(file, *symbol, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) && (analysis.IsTypeKind(symbol.Kind) || symbol.ContainerID == "") && i.simpleNameInScopeLocked(file, *symbol) {
-				ids = append(ids, id)
+			if i.accessibleWithMemoLocked(file, *symbol, access, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) && (analysis.IsTypeKind(symbol.Kind) || symbol.ContainerID == "") && i.simpleNameInScopeLocked(file, *symbol) {
+				appendID(id)
 			}
 		}
 	}
+	if exhausted {
+		return finishExhausted()
+	}
 	if r.Role == analysis.RoleCall {
 		for _, id := range append([]string(nil), ids...) {
+			if ctx.Err() != nil {
+				return nil
+			}
 			owner := i.symbols[id]
 			if !analysis.IsTypeKind(owner.Kind) {
 				continue
 			}
-			for _, constructorID := range i.byContainerMember[memberKey(owner.Name, owner.Name)] {
+			constructors := i.byContainerMember[memberKey(owner.ID, owner.Name)]
+			if len(constructors) > maxResolutionCandidates-len(ids) {
+				return finishExhausted()
+			}
+			for _, constructorID := range constructors {
 				constructor := i.symbols[constructorID]
 				if constructor.Kind == analysis.KindConstructor && constructor.ContainerID == owner.ID {
-					ids = append(ids, constructorID)
+					appendID(constructorID)
 				}
 			}
 		}
 	}
+	if exhausted || ctx.Err() != nil {
+		if exhausted {
+			return finishExhausted()
+		}
+		return nil
+	}
 	candidates := i.symbolsForIDsLocked(ids, func(s analysis.Symbol) bool {
-		if !i.accessibleLocked(file, s, r.StartByte) || !i.extensionVisibleLocked(file, s, r.StartByte) {
+		if !i.accessibleWithMemoLocked(file, s, access, r.StartByte) || !i.extensionVisibleLocked(file, s, r.StartByte) {
 			return false
 		}
 		if typeQualifier && !unboundCallableReference && !i.memberAvailableThroughTypeQualifierLocked(file, s, typeQualifierSymbols) {
@@ -189,23 +367,13 @@ func (i *Index) resolveLocked(file *analysis.ParsedFile, r analysis.Reference) [
 		}
 		return true
 	})
-	explicitImports := make(map[string]bool)
-	if qualifier == "" {
-		for _, imported := range file.Imports {
-			if !imported.Wildcard && imported.LocalName() == r.Name {
-				explicitImports[imported.Path] = true
-			}
-		}
-	}
-	fromModule := i.moduleForURILocked(file.URI)
-	fromSourceSet := i.sourceSetForURILocked(file.URI, fromModule)
+	fromModule := access.fromModule
 	sourceSetRank := func(symbol analysis.Symbol) int {
-		targetModule := i.moduleForURILocked(symbol.URI)
+		targetModule, targetSet, _ := i.accessibilityTargetLocked(access, symbol.URI)
 		if fromModule == nil || targetModule == nil || fromModule.Name != targetModule.Name || fromModule.Dir != targetModule.Dir {
 			return 0
 		}
-		targetSet := i.sourceSetForURILocked(symbol.URI, targetModule)
-		if distance := sourceSetAccessDistance(fromModule, fromSourceSet, targetSet); distance >= 0 {
+		if distance := i.sourceSetDistanceWithMemoLocked(access, targetModule, targetSet); distance >= 0 {
 			return 40 - distance
 		}
 		return 0
@@ -218,60 +386,52 @@ func (i *Index) resolveLocked(file *analysis.ParsedFile, r analysis.Reference) [
 		}
 		for _, receiverType := range receiverTypes {
 			if receiverType != "" {
-				for rank, container := range i.typeAndSupertypesLocked(file, receiverType) {
-					if _, exists := receiverRanks[container]; !exists {
-						receiverRanks[container] = 1000 - rank
+				hierarchy, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, receiverType, maxResolutionCandidates, access)
+				if !complete {
+					return nil
+				}
+				for _, owner := range hierarchy {
+					rank := 1000 - owner.distance
+					for _, container := range []string{owner.symbol.Name, owner.symbol.FQN} {
+						if container == "" {
+							continue
+						}
+						if previous, exists := receiverRanks[container]; !exists || rank > previous {
+							receiverRanks[container] = rank
+						}
 					}
 				}
 			}
 		}
 	}
+	resolutionRank := func(candidate analysis.Symbol) int {
+		score := sourceSetRank(candidate)
+		if explicitImports[candidate.FQN] {
+			score += 30
+		}
+		score += receiverRanks[candidate.ContainerName]
+		if owner, ok := i.symbols[candidate.ContainerID]; ok {
+			score += receiverRanks[owner.FQN]
+		}
+		if candidate.ContainerID == r.ContainerID {
+			score += 100
+		}
+		if candidate.URI == file.URI && candidate.StartByte <= r.StartByte && candidate.EndByte >= r.StartByte {
+			score += 50
+		}
+		if candidate.URI == file.URI {
+			score += 20
+		}
+		if candidate.Package == file.Package {
+			score += 10
+		}
+		if candidate.StartByte <= r.StartByte {
+			score += 2
+		}
+		return score
+	}
 	sort.SliceStable(candidates, func(a, b int) bool {
-		as, bs := sourceSetRank(candidates[a]), sourceSetRank(candidates[b])
-		if explicitImports[candidates[a].FQN] {
-			as += 30
-		}
-		if explicitImports[candidates[b].FQN] {
-			bs += 30
-		}
-		as += receiverRanks[candidates[a].ContainerName]
-		bs += receiverRanks[candidates[b].ContainerName]
-		if owner, ok := i.symbols[candidates[a].ContainerID]; ok {
-			as += receiverRanks[owner.FQN]
-		}
-		if owner, ok := i.symbols[candidates[b].ContainerID]; ok {
-			bs += receiverRanks[owner.FQN]
-		}
-		if candidates[a].ContainerID == r.ContainerID {
-			as += 100
-		}
-		if candidates[b].ContainerID == r.ContainerID {
-			bs += 100
-		}
-		if candidates[a].URI == file.URI && candidates[a].StartByte <= r.StartByte && candidates[a].EndByte >= r.StartByte {
-			as += 50
-		}
-		if candidates[b].URI == file.URI && candidates[b].StartByte <= r.StartByte && candidates[b].EndByte >= r.StartByte {
-			bs += 50
-		}
-		if candidates[a].URI == file.URI {
-			as += 20
-		}
-		if candidates[b].URI == file.URI {
-			bs += 20
-		}
-		if candidates[a].Package == file.Package {
-			as += 10
-		}
-		if candidates[b].Package == file.Package {
-			bs += 10
-		}
-		if candidates[a].StartByte <= r.StartByte {
-			as += 2
-		}
-		if candidates[b].StartByte <= r.StartByte {
-			bs += 2
-		}
+		as, bs := resolutionRank(candidates[a]), resolutionRank(candidates[b])
 		if as == bs {
 			aLexical, bLexical := isLexicalSymbol(candidates[a]), isLexicalSymbol(candidates[b])
 			if aLexical && bLexical && candidates[a].URI == file.URI && candidates[b].URI == file.URI {
@@ -288,6 +448,16 @@ func (i *Index) resolveLocked(file *analysis.ParsedFile, r analysis.Reference) [
 		}
 		return as > bs
 	})
+	if len(candidates) > 1 {
+		best := resolutionRank(candidates[0])
+		filtered := candidates[:0]
+		for _, candidate := range candidates {
+			if resolutionRank(candidate) == best {
+				filtered = append(filtered, candidate)
+			}
+		}
+		candidates = preferInnermostLexicalCandidates(filtered, file.URI)
+	}
 	if callableReference && len(candidates) > 1 {
 		if expected, ok := i.callableReferenceExpectedParametersLocked(file, r.StartByte); ok {
 			filtered := make([]analysis.Symbol, 0, len(candidates))
@@ -314,10 +484,13 @@ func (i *Index) resolveLocked(file *analysis.ParsedFile, r analysis.Reference) [
 			candidates = filtered
 		}
 	}
-	if r.Role == analysis.RoleCall && len(candidates) > 1 {
+	if r.Role == analysis.RoleCall && len(candidates) > 0 {
 		scores := make([]int, len(candidates))
 		typedScores := make([]bool, len(candidates))
 		for n, candidate := range candidates {
+			if n&31 == 0 && ctx.Err() != nil {
+				return nil
+			}
 			score, typed := i.callCompatibilityLocked(file, r, candidate)
 			scores[n] = score
 			typedScores[n] = typed
@@ -344,31 +517,107 @@ func (i *Index) resolveLocked(file *analysis.ParsedFile, r analysis.Reference) [
 				candidates, scores, typedScores = memberCandidates, memberScores, memberTyped
 			}
 		}
-		bestScore, anyTyped := -1<<30, false
+		bestScore, anyTyped, anyApplicableTyped := -1<<30, false, false
 		for n, score := range scores {
 			if typedScores[n] {
 				anyTyped = true
-				if score > bestScore {
+				if score > -1<<19 && score > bestScore {
+					anyApplicableTyped = true
 					bestScore = score
 				}
 			}
 		}
-		if anyTyped {
+		if anyTyped && !anyApplicableTyped {
+			return nil
+		}
+		if anyApplicableTyped {
 			filtered := candidates[:0]
 			for n, candidate := range candidates {
-				if scores[n] == bestScore {
+				if typedScores[n] && scores[n] == bestScore {
 					filtered = append(filtered, candidate)
 				}
 			}
-			candidates = filtered
-		}
-	}
-	if len(candidates) > 1 {
-		if r.Role != analysis.RoleCall || candidates[0].FQN != candidates[1].FQN || candidates[0].URI == candidates[1].URI && !analysis.IsCallableKind(candidates[0].Kind) {
-			return candidates[:1]
+			candidates = i.preferMostSpecificCallCandidatesLocked(file, filtered)
 		}
 	}
 	return candidates
+}
+
+func (i *Index) preferMostSpecificCallCandidatesLocked(file *analysis.ParsedFile, candidates []analysis.Symbol) []analysis.Symbol {
+	if len(candidates) < 2 {
+		return candidates
+	}
+	moreSpecific := func(left, right analysis.Symbol) bool {
+		if len(left.Parameters) != len(right.Parameters) {
+			return false
+		}
+		strict := false
+		for index := range left.Parameters {
+			leftType := variadicElementType(left.Parameters[index].Type)
+			rightType := variadicElementType(right.Parameters[index].Type)
+			if sameJvmType(leftType, rightType) {
+				continue
+			}
+			if typeContainsAnyParameter(leftType, left.TypeParameters) && !typeContainsAnyParameter(rightType, right.TypeParameters) {
+				return false
+			}
+			if !i.isSubtypeLocked(file, leftType, rightType) {
+				return false
+			}
+			strict = true
+		}
+		if len(left.TypeParameters) < len(right.TypeParameters) {
+			strict = true
+		}
+		leftVariadic, rightVariadic := false, false
+		for _, parameter := range left.Parameters {
+			leftVariadic = leftVariadic || parameter.Variadic || strings.Contains(parameter.Type, "...") || strings.Contains(parameter.Type, "vararg")
+		}
+		for _, parameter := range right.Parameters {
+			rightVariadic = rightVariadic || parameter.Variadic || strings.Contains(parameter.Type, "...") || strings.Contains(parameter.Type, "vararg")
+		}
+		if !leftVariadic && rightVariadic {
+			strict = true
+		}
+		return strict
+	}
+	maximal := make([]analysis.Symbol, 0, len(candidates))
+	for index, candidate := range candidates {
+		dominated := false
+		for otherIndex, other := range candidates {
+			if index != otherIndex && moreSpecific(other, candidate) {
+				dominated = true
+				break
+			}
+		}
+		if !dominated {
+			maximal = append(maximal, candidate)
+		}
+	}
+	return maximal
+}
+
+func preferInnermostLexicalCandidates(candidates []analysis.Symbol, uri protocol.URI) []analysis.Symbol {
+	bestEnd, bestStart := 0, 0
+	found := false
+	for _, candidate := range candidates {
+		if candidate.URI != uri || !isLexicalSymbol(candidate) {
+			continue
+		}
+		if !found || candidate.ScopeEndByte < bestEnd || candidate.ScopeEndByte == bestEnd && candidate.StartByte > bestStart {
+			bestEnd, bestStart, found = candidate.ScopeEndByte, candidate.StartByte, true
+		}
+	}
+	if !found {
+		return candidates
+	}
+	out := candidates[:0]
+	for _, candidate := range candidates {
+		if candidate.URI == uri && isLexicalSymbol(candidate) && candidate.ScopeEndByte == bestEnd && candidate.StartByte == bestStart {
+			out = append(out, candidate)
+		}
+	}
+	return out
 }
 
 func (i *Index) callableReferenceExpectedParametersLocked(file *analysis.ParsedFile, at int) ([]string, bool) {
@@ -420,31 +669,35 @@ func (i *Index) callableReferenceExpectedParametersLocked(file *analysis.ParsedF
 	case "Supplier", "Runnable":
 		return []string{}, true
 	}
-	for _, owner := range i.resolveTypeSymbolsLocked(file, base) {
-		for _, id := range i.byContainerName[owner.Name] {
-			method := i.symbols[id]
-			if method.ContainerID != owner.ID || !analysis.IsCallableKind(method.Kind) || containsString(method.Modifiers, "static") || containsString(method.Modifiers, "default") || containsString(method.Modifiers, "private") {
-				continue
-			}
-			parameters := make([]string, len(method.Parameters))
-			for index, parameter := range method.Parameters {
-				parameters[index] = substituteTypeParameters(parameter.Type, owner.TypeParameters, arguments)
-			}
-			return parameters, true
-		}
+	if parameters := i.functionalParameterTypesLocked(file, instantiatedTypeName(base, arguments)); parameters != nil {
+		return parameters, true
 	}
 	return nil, false
 }
 
 func (i *Index) anonymousObjectMemberIDsLocked(file *analysis.ParsedFile, qualifier, name string, at int) []string {
-	qualifier = strings.TrimSpace(qualifier)
-	if strings.ContainsAny(qualifier, ".()[]{} 	\r\n") {
+	ids, complete := i.anonymousObjectMemberIDsBoundedLocked(context.Background(), file, qualifier, name, at, maxResolutionCandidates)
+	if !complete {
 		return nil
+	}
+	return ids
+}
+
+func (i *Index) anonymousObjectMemberIDsBoundedLocked(ctx context.Context, file *analysis.ParsedFile, qualifier, name string, at, limit int) ([]string, bool) {
+	qualifier = strings.TrimSpace(qualifier)
+	if limit < 0 || strings.ContainsAny(qualifier, ".()[]{} 	\r\n") {
+		return nil, limit >= 0
 	}
 	var owner analysis.Symbol
 	candidates := i.fileAnonymousByName[file.URI][qualifier]
+	if len(candidates) > maxResolutionCandidates {
+		return nil, false
+	}
 	before := sort.Search(len(candidates), func(index int) bool { return candidates[index].StartByte > at })
 	for index := before - 1; index >= 0; index-- {
+		if ctx.Err() != nil {
+			return nil, false
+		}
 		symbol := candidates[index]
 		if symbol.ScopeEndByte > 0 && at > symbol.ScopeEndByte {
 			continue
@@ -453,19 +706,29 @@ func (i *Index) anonymousObjectMemberIDsLocked(file *analysis.ParsedFile, qualif
 		break
 	}
 	if owner.ID == "" {
-		return nil
+		return nil, true
 	}
-	var ids []string
-	for index := range file.Symbols {
-		symbol := &file.Symbols[index]
-		if symbol.StartByte <= owner.NameEndByte || symbol.EndByte > owner.EndByte || name != "" && symbol.Name != name {
+	bucket := i.byContainerName[owner.ID]
+	if len(bucket) > limit || len(bucket) > maxResolutionCandidates {
+		return nil, false
+	}
+	ids := make([]string, 0, len(bucket))
+	for index, id := range bucket {
+		if index&31 == 0 && ctx.Err() != nil {
+			return nil, false
+		}
+		symbol := i.symbols[id]
+		if symbol == nil || symbol.ContainerID != owner.ID || name != "" && symbol.Name != name {
 			continue
 		}
 		if analysis.IsCallableKind(symbol.Kind) || symbol.Kind == analysis.KindProperty || symbol.Kind == analysis.KindField || analysis.IsTypeKind(symbol.Kind) {
-			ids = append(ids, symbol.ID)
+			if len(ids) >= limit {
+				return nil, false
+			}
+			ids = append(ids, id)
 		}
 	}
-	return ids
+	return ids, true
 }
 
 func (i *Index) resolveAnnotationAttributeLabelLocked(file *analysis.ParsedFile, label analysis.Reference) []analysis.Symbol {
@@ -474,11 +737,11 @@ func (i *Index) resolveAnnotationAttributeLabelLocked(file *analysis.ParsedFile,
 		return nil
 	}
 	var ids []string
-	for _, owner := range i.resolveTypeSymbolsLocked(file, ownerName) {
+	for _, owner := range i.resolveTypeSymbolsAtLocked(file, ownerName, label.StartByte) {
 		if owner.Kind != analysis.KindAnnotation {
 			continue
 		}
-		for _, id := range i.byContainerMember[memberKey(owner.Name, label.Name)] {
+		for _, id := range i.byContainerMember[memberKey(owner.ID, label.Name)] {
 			if symbol := i.symbols[id]; symbol.ContainerID == owner.ID && i.accessibleLocked(file, *symbol, label.StartByte) {
 				ids = append(ids, id)
 			}
@@ -504,6 +767,21 @@ func (i *Index) memberInheritedForReceiverLocked(file *analysis.ParsedFile, symb
 }
 
 func (i *Index) staticImportMemberIDsLocked(file *analysis.ParsedFile, imported analysis.Import, name string, at int) []string {
+	ids, complete := i.staticImportMemberIDsBoundedLocked(context.Background(), file, imported, name, at, maxResolutionCandidates)
+	if !complete {
+		return nil
+	}
+	return ids
+}
+
+func (i *Index) staticImportMemberIDsBoundedLocked(ctx context.Context, file *analysis.ParsedFile, imported analysis.Import, name string, at, limit int) ([]string, bool) {
+	return i.staticImportMemberIDsBoundedWithMemoLocked(ctx, file, imported, name, at, limit, newAccessibilityMemoLocked(i, file))
+}
+
+func (i *Index) staticImportMemberIDsBoundedWithMemoLocked(ctx context.Context, file *analysis.ParsedFile, imported analysis.Import, name string, at, limit int, access *accessibilityMemo) ([]string, bool) {
+	if limit < 0 {
+		return nil, false
+	}
 	ownerName := imported.Path
 	if !imported.Wildcard {
 		if dot := strings.LastIndexByte(ownerName, '.'); dot >= 0 {
@@ -511,17 +789,45 @@ func (i *Index) staticImportMemberIDsLocked(file *analysis.ParsedFile, imported 
 		}
 	}
 	var ids []string
-	for _, owner := range i.resolveTypeSymbolsLocked(file, ownerName) {
-		for _, container := range i.typeAndSupertypesLocked(file, owner.FQN) {
-			for _, id := range i.byContainerName[container] {
+	owners := i.resolveTypeSymbolsForOwnerMemoLocked(file, ownerName, analysis.Symbol{}, access)
+	if len(owners) > limit {
+		return nil, false
+	}
+	for _, owner := range owners {
+		if limit-len(ids) < 1 {
+			return nil, false
+		}
+		hierarchy, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, owner.FQN, limit-len(ids), access)
+		if !complete {
+			return nil, false
+		}
+		for _, instantiated := range hierarchy {
+			bucket := i.byContainerName[instantiated.symbol.ID]
+			if len(bucket) > maxResolutionCandidates {
+				return nil, false
+			}
+			for index, id := range bucket {
+				if index&31 == 0 && ctx.Err() != nil {
+					return nil, false
+				}
 				symbol := i.symbols[id]
-				if symbol.Name == name && i.staticOrNestedMemberLocked(*symbol) && i.memberInheritedForReceiverLocked(file, *symbol, owner.FQN) && i.accessibleLocked(file, *symbol, at) {
+				if symbol != nil && symbol.Name == name && i.staticOrNestedMemberLocked(*symbol) && i.memberInheritedForReceiverLocked(file, *symbol, owner.FQN) && i.accessibleWithMemoLocked(file, *symbol, access, at) {
+					if len(ids) >= limit {
+						return nil, false
+					}
 					ids = append(ids, id)
 				}
 			}
 		}
 	}
-	return ids
+	return ids, true
+}
+
+func maxIntAtLeastOne(value int) int {
+	if value < 1 {
+		return 1
+	}
+	return value
 }
 
 func (i *Index) javaSwitchLabelReceiverTypeLocked(file *analysis.ParsedFile, at int) string {
@@ -557,19 +863,7 @@ func (i *Index) javaSwitchLabelReceiverTypeLocked(file *analysis.ParsedFile, at 
 }
 
 func matchingDelimiter(source string, open int, opening, closing byte) int {
-	depth := 0
-	for index := open; index < len(source); index++ {
-		switch source[index] {
-		case opening:
-			depth++
-		case closing:
-			depth--
-			if depth == 0 {
-				return index
-			}
-		}
-	}
-	return -1
+	return lexical.MatchingDelimiter(source, open, string(opening), string(closing), true)
 }
 
 func callableReferenceOperatorBefore(source string, start int) bool {
@@ -586,7 +880,7 @@ func callableReferenceOperatorBefore(source string, start int) bool {
 	return start >= 2 && source[start-2:start] == "::"
 }
 
-func (i *Index) resolveArgumentLabelLocked(file *analysis.ParsedFile, label analysis.Reference) []analysis.Symbol {
+func (i *Index) resolveArgumentLabelContextLocked(ctx context.Context, file *analysis.ParsedFile, label analysis.Reference) []analysis.Symbol {
 	document := i.docs[file.URI]
 	if document == nil {
 		document = i.indexedDocs[file.URI]
@@ -600,6 +894,9 @@ func (i *Index) resolveArgumentLabelLocked(file *analysis.ParsedFile, label anal
 	var call *analysis.Reference
 	bestSpan := int(^uint(0) >> 1)
 	for index := range file.References {
+		if index&255 == 0 && ctx.Err() != nil {
+			return nil
+		}
 		candidate := &file.References[index]
 		if candidate.Role != analysis.RoleCall || candidate.ArgumentLabel || candidate.StartByte >= label.StartByte {
 			continue
@@ -618,7 +915,10 @@ func (i *Index) resolveArgumentLabelLocked(file *analysis.ParsedFile, label anal
 		return i.resolveAnnotationAttributeLocked(file, document, label)
 	}
 	var out []analysis.Symbol
-	for _, callable := range i.resolveLocked(file, *call) {
+	for _, callable := range i.resolveContextLocked(ctx, file, *call) {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if !analysis.IsCallableKind(callable.Kind) {
 			continue
 		}
@@ -658,11 +958,11 @@ func (i *Index) resolveAnnotationAttributeLocked(file *analysis.ParsedFile, docu
 		return nil
 	}
 	var out []analysis.Symbol
-	for _, annotation := range i.resolveTypeSymbolsLocked(file, owner) {
+	for _, annotation := range i.resolveTypeSymbolsAtLocked(file, owner, label.StartByte) {
 		if !analysis.IsTypeKind(annotation.Kind) {
 			continue
 		}
-		for _, memberID := range i.byContainerName[annotation.Name] {
+		for _, memberID := range i.byContainerName[annotation.ID] {
 			member := i.symbols[memberID]
 			if member == nil || member.ContainerID != annotation.ID || member.Name != label.Name {
 				continue
@@ -679,22 +979,131 @@ func (i *Index) companionMembersLocked(file *analysis.ParsedFile, container stri
 	seen := make(map[string]bool)
 	var members []analysis.Symbol
 	for _, owner := range i.resolveTypeSymbolsLocked(file, container) {
-		for _, companionID := range i.byContainerName[owner.Name] {
-			companion, ok := i.symbols[companionID]
-			if !ok || companion.ContainerID != owner.ID || companion.Kind != analysis.KindObject || !containsString(companion.Modifiers, "companion") {
+		members = append(members, i.companionMembersForOwnerLocked(owner, seen)...)
+	}
+	return members
+}
+
+func (i *Index) companionMembersForOwnerLocked(owner analysis.Symbol, seen map[string]bool) []analysis.Symbol {
+	members, complete := i.companionMembersForOwnerBoundedLocked(context.Background(), owner, seen, maxResolutionCandidates)
+	if !complete {
+		return nil
+	}
+	return members
+}
+
+func (i *Index) companionMembersForOwnerBoundedLocked(ctx context.Context, owner analysis.Symbol, seen map[string]bool, limit int) ([]analysis.Symbol, bool) {
+	if limit < 0 {
+		return nil, false
+	}
+	if seen == nil {
+		seen = make(map[string]bool)
+	}
+	var members []analysis.Symbol
+	companions := i.byContainerName[owner.ID]
+	if len(companions) > maxResolutionCandidates {
+		return nil, false
+	}
+	for index, companionID := range companions {
+		if index&31 == 0 && ctx.Err() != nil {
+			return nil, false
+		}
+		companion, ok := i.symbols[companionID]
+		if !ok || companion.ContainerID != owner.ID || companion.Kind != analysis.KindObject || !containsString(companion.Modifiers, "companion") {
+			continue
+		}
+		bucket := i.byContainerName[companion.ID]
+		if len(bucket) > limit-len(members) || len(bucket) > maxResolutionCandidates {
+			return nil, false
+		}
+		for memberIndex, memberID := range bucket {
+			if memberIndex&31 == 0 && ctx.Err() != nil {
+				return nil, false
+			}
+			member, exists := i.symbols[memberID]
+			if !exists || member.ContainerID != companion.ID || seen[member.ID] {
 				continue
 			}
-			for _, memberID := range i.byContainerName[companion.Name] {
-				member, exists := i.symbols[memberID]
-				if !exists || member.ContainerID != companion.ID || seen[member.ID] {
-					continue
+			if len(members) >= limit {
+				return nil, false
+			}
+			seen[member.ID] = true
+			members = append(members, *member)
+		}
+	}
+	return members, true
+}
+
+func (i *Index) companionMemberIDsForOwnerLocked(owner analysis.Symbol, name string) []string {
+	members := i.companionMembersForOwnerLocked(owner, nil)
+	ids := make([]string, 0, len(members))
+	for _, member := range members {
+		if member.Name == name {
+			ids = append(ids, member.ID)
+		}
+	}
+	return ids
+}
+
+// Extension declarations are indexed by their source spelling because their
+// receiver can contain generic patterns. These buckets are candidate-only:
+// callers must prove applicability against the resolved owner identity before
+// returning a symbol.
+func (i *Index) extensionMemberCandidatesLocked(owner analysis.Symbol, name string) []string {
+	ids, complete := i.extensionMemberCandidatesBoundedLocked(owner, name, maxResolutionCandidates)
+	if !complete {
+		return nil
+	}
+	return ids
+}
+
+func (i *Index) extensionMemberCandidatesBoundedLocked(owner analysis.Symbol, name string, limit int) ([]string, bool) {
+	if limit < 0 {
+		return nil, false
+	}
+	seen := make(map[string]bool)
+	var ids []string
+	for _, key := range []string{owner.ID, owner.Name, owner.FQN} {
+		if key == "" {
+			continue
+		}
+		for _, id := range i.byReceiverMember[memberKey(key, name)] {
+			if !seen[id] {
+				if len(ids) >= limit {
+					return nil, false
 				}
-				seen[member.ID] = true
-				members = append(members, *member)
+				seen[id] = true
+				ids = append(ids, id)
 			}
 		}
 	}
-	return members
+	for _, id := range i.byGenericReceiverMember[name] {
+		if !seen[id] {
+			if len(ids) >= limit {
+				return nil, false
+			}
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	return ids, true
+}
+
+func (i *Index) extensionCandidatesLocked(owner analysis.Symbol) []string {
+	seen := make(map[string]bool)
+	var ids []string
+	for _, key := range []string{owner.ID, owner.Name, owner.FQN} {
+		if key == "" {
+			continue
+		}
+		for _, id := range i.byReceiver[key] {
+			if !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids
 }
 
 func (i *Index) companionMemberIDsLocked(file *analysis.ParsedFile, container, name string) []string {
@@ -712,11 +1121,34 @@ func sameCallableShape(left, right analysis.Symbol) bool {
 	if left.Name != right.Name || len(left.Parameters) != len(right.Parameters) {
 		return false
 	}
-	for index := range left.Parameters {
-		if simpleType(left.Parameters[index].Type) != simpleType(right.Parameters[index].Type) {
+	if left.JVMName != right.JVMName || left.ReceiverType != "" || right.ReceiverType != "" {
+		if left.JVMName != right.JVMName || !sameJvmType(left.ReceiverType, right.ReceiverType) {
 			return false
 		}
 	}
+	// Alpha-equivalent generic override signatures require substitution through
+	// both owners. Until that identity is available, omitting a dispatch-family
+	// edge is safer than merging unrelated generic overloads.
+	if len(left.TypeParameters) > 0 || len(right.TypeParameters) > 0 {
+		return false
+	}
+	if left.JVMDescriptor != "" && right.JVMDescriptor != "" {
+		leftClose, rightClose := strings.IndexByte(left.JVMDescriptor, ')'), strings.IndexByte(right.JVMDescriptor, ')')
+		if leftClose < 0 || rightClose < 0 || left.JVMDescriptor[:leftClose+1] != right.JVMDescriptor[:rightClose+1] {
+			return false
+		}
+		// JVM dispatch identity is the erased name and parameter descriptor.
+		// Return types may be covariant and therefore are not part of the
+		// override-family key.
+		return true
+	}
+	for index := range left.Parameters {
+		if left.Parameters[index].Variadic != right.Parameters[index].Variadic || !sameJvmType(left.Parameters[index].Type, right.Parameters[index].Type) {
+			return false
+		}
+	}
+	// Return types are covariant (and often omitted in Kotlin source), so they
+	// are not part of the override-family key here either.
 	return true
 }
 
@@ -736,7 +1168,7 @@ func (i *Index) protectedReceiverAccessibleLocked(file *analysis.ParsedFile, sym
 		return true
 	}
 	receiverType := i.typeOfExpressionLocked(file, qualifier, reference.StartByte)
-	for _, receiver := range i.resolveTypeSymbolsLocked(file, receiverType) {
+	for _, receiver := range i.resolveTypeSymbolsAtLocked(file, receiverType, reference.StartByte) {
 		if receiver.ID == current.ID || i.containerInheritsLocked(receiver.ID, current.ID) {
 			return true
 		}
@@ -895,13 +1327,38 @@ func isLexicalSymbol(symbol analysis.Symbol) bool {
 func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.Reference, candidate analysis.Symbol) (int, bool) {
 	doc := i.docs[file.URI]
 	if doc == nil {
+		doc = i.indexedDocs[file.URI]
+	}
+	if doc == nil {
+		return 0, false
+	}
+	if len(ref.Arguments) == 0 && ref.Arity > 0 {
+		// Synthetic references built by type inference carry the argument
+		// count but no argument ranges. Arity still rules out candidates, yet
+		// there is no argument text to type, so this is not type evidence.
+		if !matchesArityForLanguage(candidate, ref.Arity, file.Language) {
+			return -1 << 20, true
+		}
 		return 0, false
 	}
 	if len(candidate.Parameters) == 0 {
 		return 16, len(ref.Arguments) == 0
 	}
+	required, variadicCallable := 0, false
+	for _, parameter := range candidate.Parameters {
+		variadic := parameter.Variadic || strings.Contains(parameter.Type, "...") || strings.Contains(parameter.Type, "vararg")
+		variadicCallable = variadicCallable || variadic
+		if !variadic && parameter.Default == "" {
+			required++
+		}
+	}
+	if len(ref.Arguments) < required || !variadicCallable && len(ref.Arguments) > len(candidate.Parameters) {
+		return -1 << 20, true
+	}
 	score, typed := 0, true
+	ownerBindings, ownerBindingsKnown := i.receiverOwnerTypeBindingsLocked(file, ref, candidate)
 	provided := make(map[int]bool, len(ref.Arguments))
+	inferredTypeParameters := make(map[string]string, len(candidate.TypeParameters))
 	for n, argumentRange := range ref.Arguments {
 		parameterIndex := n
 		expression := doc.Slice(argumentRange)
@@ -924,7 +1381,11 @@ func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.
 			parameterIndex = len(candidate.Parameters) - 1
 		}
 		provided[parameterIndex] = true
-		expectedType := strings.TrimSpace(candidate.Parameters[parameterIndex].Type)
+		parameter := candidate.Parameters[parameterIndex]
+		expectedType := strings.TrimSpace(substituteTypeBindings(parameter.Type, ownerBindings))
+		if parameter.Variadic || strings.Contains(expectedType, "...") || strings.Contains(expectedType, "vararg") {
+			expectedType = variadicElementType(expectedType)
+		}
 		if lambdaTypes, explicitLambda := explicitLambdaParameterTypes(expression, file.Language); explicitLambda {
 			expectedParameters := kotlinFunctionParameterTypes(expectedType)
 			if file.Language == analysis.LanguageJava {
@@ -934,15 +1395,31 @@ func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.
 				return -1 << 20, true
 			}
 			for index := range lambdaTypes {
-				matches := sameJvmType(lambdaTypes[index], expectedParameters[index])
-				if file.Language == analysis.LanguageJava {
-					matches = javaInvocationType(simpleType(lambdaTypes[index])) == javaInvocationType(simpleType(expectedParameters[index]))
+				matches, known := i.typesIdenticalAtLocked(file, lambdaTypes[index], expectedParameters[index], ref.StartByte)
+				if !known {
+					typed = false
+					continue
 				}
 				if !matches {
 					return -1 << 20, true
 				}
 			}
 			score += 48
+			continue
+		}
+		if lambdaArity, lambda := untypedLambdaArity(expression); lambda {
+			expectedParameters := kotlinFunctionParameterTypes(expectedType)
+			if file.Language == analysis.LanguageJava {
+				expectedParameters = i.functionalParameterTypesLocked(file, expectedType)
+			}
+			if expectedParameters == nil {
+				typed = false
+				continue
+			}
+			if len(expectedParameters) != lambdaArity {
+				return -1 << 20, true
+			}
+			score += 40
 			continue
 		}
 		if file.Language == analysis.LanguageKotlin && strings.TrimSpace(expression) == "null" {
@@ -952,7 +1429,18 @@ func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.
 			}
 			return -1 << 20, true
 		}
-		actualType := strings.TrimSpace(i.inferExpressionTypeLocked(file, expression, ref.StartByte))
+		if file.Language == analysis.LanguageJava && strings.TrimSpace(expression) == "null" {
+			if javaPrimitiveType(expectedType) {
+				return -1 << 20, true
+			}
+			score += 28
+			continue
+		}
+		inferred := i.inferExpressionResultLocked(file, expression, ref.StartByte)
+		actualType := strings.TrimSpace(inferred.Type)
+		if inferred.Expression.Kind == expressionUnknown || inferred.Expression.Kind == expressionBlock {
+			typed = false
+		}
 		if file.Language == analysis.LanguageKotlin && strings.HasSuffix(actualType, "?") && !strings.HasSuffix(expectedType, "?") {
 			return -1 << 20, true
 		}
@@ -962,43 +1450,94 @@ func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.
 			typed = false
 			continue
 		}
-		genericParameter := ""
-		for _, parameter := range candidate.TypeParameters {
-			if expected == parameter {
-				genericParameter = parameter
-				break
-			}
+		if inferred.Confidence == inferenceExact {
+			score += 2
 		}
-		if genericParameter != "" {
-			if !i.typeArgumentSatisfiesBoundsLocked(file, actualType, candidate.TypeParameterBounds[genericParameter]) {
+		if typeContainsAnyParameter(expectedType, candidate.TypeParameters) {
+			if !i.inferTypeParameterBindingsLocked(file, expectedType, actualType, candidate.TypeParameters, inferredTypeParameters) {
+				typed = false
+				continue
+			}
+			if substituted := substituteTypeBindings(expectedType, inferredTypeParameters); substituted != expectedType && !i.typePatternApplicableLocked(file, substituted, actualType) {
 				return -1 << 20, true
 			}
-			// A type variable captures the argument precisely, but a concrete
-			// identity overload remains more specific when both are applicable.
-			score += 30
+			// A solved type variable is applicable evidence but is less specific
+			// than an otherwise equal concrete parameter.
+			score += 28
 			continue
 		}
-		identity := sameJvmType(actual, expected)
-		if file.Language == analysis.LanguageJava {
-			identity = javaInvocationType(actual) == javaInvocationType(expected)
-		}
+		identity, identityKnown := i.typesIdenticalAtLocked(file, actualType, expectedType, ref.StartByte)
 		if identity {
 			score += 32
 		} else if file.Language == analysis.LanguageKotlin {
 			if conversion, ok := kotlinIntegerLiteralConversionScore(expression, expected); ok {
 				score += conversion
-			} else if i.isSubtypeLocked(file, actual, expected) {
+			} else if subtype, known := i.subtypeRelationAtLocked(file, actualType, expectedType, ref.StartByte); subtype {
 				score += 24
+			} else if !known || !identityKnown {
+				typed = false
+				continue
 			} else {
 				return -1 << 20, true
 			}
-		} else if i.isSubtypeLocked(file, actual, expected) {
+		} else if subtype, known := i.subtypeRelationAtLocked(file, actualType, expectedType, ref.StartByte); subtype {
 			score += 24
 		} else if file.Language == analysis.LanguageJava {
-			if conversion, ok := javaInvocationConversionScore(actual, expected); ok {
+			if conversion, ok := javaConstantInvocationConversionScore(expression, expected); ok {
 				score += conversion
+			} else if conversion, ok := javaInvocationConversionScore(actual, expected); ok {
+				score += conversion
+			} else if !known || !identityKnown {
+				typed = false
+				continue
 			} else {
 				return -1 << 20, true
+			}
+		}
+	}
+	for _, parameter := range candidate.TypeParameters {
+		inferred := inferredTypeParameters[parameter]
+		if inferred == "" {
+			typed = false
+			continue
+		}
+		bounds := candidate.TypeParameterBounds[parameter]
+		if len(ownerBindings) > 0 {
+			bounds = append([]string(nil), bounds...)
+			for index := range bounds {
+				bounds[index] = substituteTypeBindings(bounds[index], ownerBindings)
+			}
+		}
+		owner := i.symbols[candidate.ContainerID]
+		unresolvedOwnerBound := false
+		if owner != nil {
+			for _, bound := range bounds {
+				if typeContainsAnyParameter(bound, owner.TypeParameters) {
+					unresolvedOwnerBound = true
+					break
+				}
+			}
+		}
+		if unresolvedOwnerBound {
+			typed = false
+			continue
+		}
+		if !i.typeArgumentSatisfiesBoundsLocked(file, inferred, bounds) {
+			return -1 << 20, true
+		}
+	}
+	if owner := i.symbols[candidate.ContainerID]; owner != nil && len(owner.TypeParameters) > 0 {
+		for _, parameter := range owner.TypeParameters {
+			if ownerBindingsKnown && ownerBindings[parameter] != "" {
+				continue
+			}
+			for _, value := range candidate.Parameters {
+				if typeContainsAnyParameter(value.Type, []string{parameter}) {
+					typed = false
+				}
+			}
+			if typeContainsAnyParameter(candidate.Type, []string{parameter}) {
+				typed = false
 			}
 		}
 	}
@@ -1016,10 +1555,163 @@ func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.
 	if variadic {
 		score -= 2
 	}
-	// Arity/default ranking is semantic evidence even when an incomplete
-	// argument expression has no inferable type yet.
-	typed = true
+	// Preserve an earlier unknown-expression result. Arity/default ranking can
+	// order otherwise applicable candidates, but it is not type evidence and
+	// must not turn an untyped overload tie into a unique semantic answer.
 	return score, typed
+}
+
+// receiverOwnerTypeBindingsLocked recovers the concrete arguments of the
+// declaration owner reached through the call receiver. A method can introduce
+// its own type parameter bounded by an owner parameter (CrudRepository's
+// `<S extends T> S save(S)` is the common example); checking `S` against the
+// literal spelling `T` incorrectly rejects an otherwise proven call.
+func (i *Index) receiverOwnerTypeBindingsLocked(file *analysis.ParsedFile, ref analysis.Reference, candidate analysis.Symbol) (map[string]string, bool) {
+	owner := i.symbols[candidate.ContainerID]
+	if owner == nil || len(owner.TypeParameters) == 0 {
+		return nil, true
+	}
+	qualifier := strings.TrimSpace(ref.Qualifier)
+	if qualifier != "" {
+		if text := i.documentTextLocked(file.URI); text != "" {
+			if textual := expressionQualifierBefore(text, ref.StartByte); textual != "" {
+				qualifier = textual
+			}
+		}
+	}
+	if qualifier == "" {
+		return nil, false
+	}
+	receiverType := i.inferExpressionTypeLocked(file, qualifier, ref.StartByte)
+	if receiverType == "" {
+		return nil, false
+	}
+	var found map[string]string
+	for _, instantiated := range i.instantiatedTypeHierarchyLocked(file, receiverType) {
+		if instantiated.symbol.ID != owner.ID || len(instantiated.arguments) != len(owner.TypeParameters) {
+			continue
+		}
+		bindings := make(map[string]string, len(owner.TypeParameters))
+		for index, parameter := range owner.TypeParameters {
+			bindings[parameter] = instantiated.arguments[index]
+		}
+		if found == nil {
+			found = bindings
+			continue
+		}
+		for parameter, value := range bindings {
+			if found[parameter] != value {
+				return nil, false
+			}
+		}
+	}
+	return found, found != nil
+}
+
+func typeContainsAnyParameter(value string, parameters []string) bool {
+	for index := 0; index < len(value); {
+		if !isIdentRune(rune(value[index])) {
+			index++
+			continue
+		}
+		end := index + 1
+		for end < len(value) && isIdentRune(rune(value[end])) {
+			end++
+		}
+		for _, parameter := range parameters {
+			if value[index:end] == parameter {
+				return true
+			}
+		}
+		index = end
+	}
+	return false
+}
+
+func (i *Index) typePatternApplicableLocked(file *analysis.ParsedFile, expected, actual string) bool {
+	if sameJvmType(expected, actual) || i.isSubtypeLocked(file, actual, expected) {
+		return true
+	}
+	expectedBase, expectedArguments := splitInstantiatedType(expected)
+	for _, owner := range i.instantiatedTypeHierarchyLocked(file, actual) {
+		if !sameJvmType(owner.symbol.Name, expectedBase) && !sameJvmType(owner.symbol.FQN, expectedBase) || len(owner.arguments) != len(expectedArguments) {
+			continue
+		}
+		matches := true
+		for index := range expectedArguments {
+			if !sameJvmType(owner.arguments[index], expectedArguments[index]) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
+}
+
+func variadicElementType(value string) string {
+	value = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "vararg "))
+	if strings.HasSuffix(value, "...") {
+		return strings.TrimSpace(strings.TrimSuffix(value, "..."))
+	}
+	if strings.HasSuffix(value, "[]") {
+		return strings.TrimSpace(strings.TrimSuffix(value, "[]"))
+	}
+	return value
+}
+
+func untypedLambdaArity(expression string) (int, bool) {
+	arrow := topLevelExpressionOperator(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(expression), "{")), "->")
+	if arrow < 0 {
+		return 0, false
+	}
+	prefix := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(expression), "{"))
+	prefix = strings.TrimSpace(prefix[:arrow])
+	if strings.HasPrefix(prefix, "(") && strings.HasSuffix(prefix, ")") {
+		prefix = strings.TrimSpace(prefix[1 : len(prefix)-1])
+	}
+	if prefix == "" {
+		return 0, true
+	}
+	parameters := splitTopLevelCallArguments(prefix)
+	for _, parameter := range parameters {
+		if strings.Contains(parameter, ":") || len(strings.Fields(parameter)) > 1 {
+			return 0, false
+		}
+	}
+	return len(parameters), true
+}
+
+func javaPrimitiveType(value string) bool {
+	switch javaInvocationType(value) {
+	case "byte", "short", "int", "long", "float", "double", "char", "boolean":
+		return true
+	default:
+		return false
+	}
+}
+
+func javaConstantInvocationConversionScore(expression, expected string) (int, bool) {
+	expected = javaInvocationType(expected)
+	if expected != "byte" && expected != "short" && expected != "char" {
+		return 0, false
+	}
+	value, ok := javaIntLiteralValue(strings.TrimSpace(expression))
+	if !ok {
+		return 0, false
+	}
+	low, high := int64(-128), int64(127)
+	if expected == "short" {
+		low, high = -32768, 32767
+	} else if expected == "char" {
+		low, high = 0, 65535
+	}
+	if value < low || value > high {
+		return 0, false
+	}
+	return 22, true
 }
 
 func explicitLambdaParameterTypes(expression string, language analysis.Language) ([]string, bool) {
@@ -1143,29 +1835,253 @@ func sameJvmType(a, b string) bool {
 	return canonicalJvmType(a) == canonicalJvmType(b)
 }
 
-func canonicalJvmType(value string) string {
-	switch strings.ToLower(simpleType(value)) {
-	case "byte", "java.lang.byte":
-		return "byte"
-	case "short", "java.lang.short":
-		return "short"
-	case "int", "integer", "java.lang.integer":
-		return "int"
-	case "long", "java.lang.long":
-		return "long"
-	case "float", "java.lang.float":
-		return "float"
-	case "double", "java.lang.double":
-		return "double"
-	case "char", "character", "java.lang.character":
-		return "char"
-	case "boolean", "java.lang.boolean":
-		return "boolean"
-	case "string", "java.lang.string":
-		return "string"
-	default:
-		return strings.ToLower(simpleType(value))
+func (i *Index) typesIdenticalAtLocked(file *analysis.ParsedFile, left, right string, at int) (bool, bool) {
+	leftID, leftKnown := i.exactTypeIdentityAtLocked(file, left, at, 0)
+	rightID, rightKnown := i.exactTypeIdentityAtLocked(file, right, at, 0)
+	if !leftKnown || !rightKnown {
+		return false, false
 	}
+	return leftID == rightID, true
+}
+
+// exactTypeIdentityAtLocked resolves user types to stable symbol identities.
+// Textual simple names are never equality evidence: two imports can expose the
+// same spelling from unrelated packages. Builtins are used only as a fallback
+// after scoped symbol lookup has found no declaration.
+func (i *Index) exactTypeIdentityAtLocked(file *analysis.ParsedFile, value string, at, depth int) (string, bool) {
+	if file == nil || depth > 16 {
+		return "", false
+	}
+	value = strings.TrimSpace(value)
+	for _, prefix := range []string{"out ", "in ", "? extends ", "? super "} {
+		value = strings.TrimPrefix(value, prefix)
+	}
+	nullable := strings.HasSuffix(value, "?")
+	value = strings.TrimSuffix(value, "?")
+	arrays := 0
+	for strings.HasSuffix(value, "[]") {
+		arrays++
+		value = strings.TrimSpace(strings.TrimSuffix(value, "[]"))
+	}
+	base, arguments := splitInstantiatedType(value)
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return "", false
+	}
+	var symbols []analysis.Symbol
+	if at >= 0 {
+		symbols = i.resolveTypeSymbolsAtLocked(file, base, at)
+	} else {
+		symbols = i.resolveTypeSymbolsLocked(file, base)
+	}
+	identity := ""
+	if len(symbols) == 1 {
+		identity = "symbol:" + symbols[0].ID
+		if platform, ok := jvmPlatformIdentity(symbols[0].FQN); ok {
+			identity = "jvm:" + platform
+		}
+	} else if len(symbols) > 1 {
+		return "", false
+	} else if builtin, ok := builtinTypeIdentity(file.Language, base); ok {
+		identity = "builtin:" + builtin
+		if platform, ok := jvmPlatformIdentity(builtin); ok {
+			identity = "jvm:" + platform
+		}
+	} else {
+		return "", false
+	}
+	for _, argument := range arguments {
+		argument = strings.TrimSpace(argument)
+		if argument == "*" || argument == "?" {
+			identity += "<*>"
+			continue
+		}
+		argumentID, ok := i.exactTypeIdentityAtLocked(file, argument, at, depth+1)
+		if !ok {
+			return "", false
+		}
+		identity += "<" + argumentID + ">"
+	}
+	if nullable {
+		identity += "?"
+	}
+	return strings.Repeat("[]", arrays) + identity, true
+}
+
+// jvmPlatformIdentity maps a resolved type name to the JVM class it denotes
+// when Kotlin and Java spell the same class differently: kotlin.String and
+// java.lang.String are one class, kotlin.collections.List is java.util.List,
+// Int is int (or its box). Only names in the platform mapping qualify; every
+// other resolved declaration keeps its symbol identity.
+func jvmPlatformIdentity(name string) (string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	switch lower {
+	case "java.lang.integer":
+		return "int", true
+	case "java.lang.long":
+		return "long", true
+	case "java.lang.short":
+		return "short", true
+	case "java.lang.byte":
+		return "byte", true
+	case "java.lang.float":
+		return "float", true
+	case "java.lang.double":
+		return "double", true
+	case "java.lang.character":
+		return "char", true
+	case "java.lang.boolean":
+		return "boolean", true
+	}
+	switch canonical := canonicalJvmType(name); canonical {
+	case "byte", "short", "int", "long", "float", "double", "char", "boolean":
+		return canonical, true
+	}
+	if alias, ok := jvmTypeAliases[lower]; ok {
+		return alias, true
+	}
+	if jvmPlatformClasses[lower] {
+		return lower, true
+	}
+	return "", false
+}
+
+// jvmPlatformClasses is the set of JVM classes the alias table maps onto, so
+// a declaration spelled by that class itself (java.lang.CharSequence from the
+// JDK) shares the identity of the Kotlin names mapped to it.
+var jvmPlatformClasses = func() map[string]bool {
+	classes := make(map[string]bool, len(jvmTypeAliases))
+	for _, alias := range jvmTypeAliases {
+		classes[alias] = true
+	}
+	return classes
+}()
+
+// jvmSameClass reports whether two resolved type symbols denote one JVM
+// class, by identity or through the Kotlin/Java platform mapping.
+func jvmSameClass(left, right analysis.Symbol) bool {
+	if left.ID == right.ID {
+		return true
+	}
+	leftPlatform, leftOK := jvmPlatformIdentity(left.FQN)
+	rightPlatform, rightOK := jvmPlatformIdentity(right.FQN)
+	return leftOK && rightOK && leftPlatform == rightPlatform
+}
+
+// referenceSpelledAt reports whether the document spells the reference's own
+// name at its byte range, which distinguishes a parsed reference from a
+// synthetic one that reuses another reference's position.
+func referenceSpelledAt(text string, r analysis.Reference) bool {
+	return r.StartByte >= 0 && r.EndByte <= len(text) && r.StartByte < r.EndByte && text[r.StartByte:r.EndByte] == r.Name
+}
+
+func builtinTypeIdentity(language analysis.Language, base string) (string, bool) {
+	if language == analysis.LanguageJava {
+		switch base {
+		case "byte", "short", "int", "long", "float", "double", "char", "boolean", "void":
+			return base, true
+		}
+		// java.lang is implicitly imported by every compilation unit. Scoped
+		// lookup runs first, so a declaration shadowing one of these names
+		// still wins; the fallback only names the class the JLS guarantees.
+		simple := strings.TrimPrefix(base, "java.lang.")
+		switch simple {
+		case "Object", "String", "CharSequence", "Number", "Integer", "Long", "Short", "Byte", "Float", "Double", "Character", "Boolean", "Void", "Class", "Iterable", "Comparable", "Runnable", "Throwable", "Exception", "RuntimeException", "Error", "StringBuilder", "Enum", "Record", "Thread", "Math", "System":
+			return "java.lang." + simple, true
+		}
+	} else if language == analysis.LanguageKotlin {
+		switch base {
+		case "Boolean", "Byte", "Char", "Short", "Int", "Long", "Float", "Double", "UByte", "UShort", "UInt", "ULong", "String", "Any", "Unit", "Nothing":
+			return "kotlin." + base, true
+		}
+		if strings.HasPrefix(base, "kotlin.") {
+			switch strings.TrimPrefix(base, "kotlin.") {
+			case "Boolean", "Byte", "Char", "Short", "Int", "Long", "Float", "Double", "UByte", "UShort", "UInt", "ULong", "String", "Any", "Unit", "Nothing":
+				return base, true
+			}
+		}
+	}
+	return "", false
+}
+
+func canonicalJvmType(value string) string {
+	value = strings.TrimSpace(value)
+	for _, prefix := range []string{"out ", "in ", "? extends ", "? super "} {
+		value = strings.TrimPrefix(value, prefix)
+	}
+	value = strings.TrimSuffix(value, "?")
+	arrays := 0
+	for strings.HasSuffix(value, "[]") {
+		arrays++
+		value = strings.TrimSpace(strings.TrimSuffix(value, "[]"))
+	}
+	if open := strings.IndexByte(value, '<'); open >= 0 {
+		value = strings.TrimSpace(value[:open])
+	}
+	base := value
+	lower := strings.ToLower(value)
+	switch lower {
+	case "byte", "kotlin.byte":
+		base = "byte"
+	case "short", "kotlin.short":
+		base = "short"
+	case "int", "kotlin.int":
+		base = "int"
+	case "long", "kotlin.long":
+		base = "long"
+	case "float", "kotlin.float":
+		base = "float"
+	case "double", "kotlin.double":
+		base = "double"
+	case "char", "kotlin.char":
+		base = "char"
+	case "boolean", "kotlin.boolean":
+		base = "boolean"
+	default:
+		// Only known language aliases are case-folded. JVM package and class
+		// identifiers themselves are case-sensitive.
+		if alias := jvmTypeAliases[lower]; alias != "" {
+			base = alias
+		}
+	}
+	if alias := jvmTypeAliases[strings.ToLower(base)]; alias != "" {
+		base = alias
+	}
+	return base + strings.Repeat("[]", arrays)
+}
+
+var jvmTypeAliases = map[string]string{
+	"java.lang.string":                     "java.lang.string",
+	"string":                               "java.lang.string",
+	"kotlin.string":                        "java.lang.string",
+	"any":                                  "java.lang.object",
+	"kotlin.any":                           "java.lang.object",
+	"object":                               "java.lang.object",
+	"charsequence":                         "java.lang.charsequence",
+	"kotlin.charsequence":                  "java.lang.charsequence",
+	"number":                               "java.lang.number",
+	"kotlin.number":                        "java.lang.number",
+	"throwable":                            "java.lang.throwable",
+	"kotlin.throwable":                     "java.lang.throwable",
+	"iterable":                             "java.lang.iterable",
+	"java.lang.iterable":                   "java.lang.iterable",
+	"kotlin.collections.iterable":          "java.lang.iterable",
+	"collection":                           "java.util.collection",
+	"java.util.collection":                 "java.util.collection",
+	"kotlin.collections.collection":        "java.util.collection",
+	"kotlin.collections.mutablecollection": "java.util.collection",
+	"list":                                 "java.util.list",
+	"java.util.list":                       "java.util.list",
+	"kotlin.collections.list":              "java.util.list",
+	"kotlin.collections.mutablelist":       "java.util.list",
+	"set":                                  "java.util.set",
+	"java.util.set":                        "java.util.set",
+	"kotlin.collections.set":               "java.util.set",
+	"kotlin.collections.mutableset":        "java.util.set",
+	"map":                                  "java.util.map",
+	"java.util.map":                        "java.util.map",
+	"kotlin.collections.map":               "java.util.map",
+	"kotlin.collections.mutablemap":        "java.util.map",
 }
 
 func javaInvocationConversionScore(actual, expected string) (int, bool) {
@@ -1243,15 +2159,48 @@ func javaInvocationType(value string) string {
 }
 
 func (i *Index) isSubtypeLocked(file *analysis.ParsedFile, actual, expected string) bool {
-	if file.Language == analysis.LanguageKotlin && simpleType(expected) == "Any" && actual != "" {
-		return true
+	matched, _ := i.subtypeRelationAtLocked(file, actual, expected, -1)
+	return matched
+}
+
+func (i *Index) subtypeRelationAtLocked(file *analysis.ParsedFile, actual, expected string, at int) (bool, bool) {
+	if file == nil || strings.TrimSpace(actual) == "" || strings.TrimSpace(expected) == "" {
+		return false, false
 	}
-	for _, candidate := range i.typeAndSupertypesLocked(file, actual) {
-		if sameJvmType(candidate, expected) {
-			return true
+	if identical, known := i.typesIdenticalAtLocked(file, actual, expected, at); known && identical {
+		return true, true
+	}
+	expectedBase, _ := splitInstantiatedType(strings.TrimSuffix(strings.TrimSpace(expected), "?"))
+	// kotlin.Any and java.lang.Object are the top of both hierarchies; every
+	// non-null reference is a subtype without consulting the index.
+	if topType := expectedBase == "Any" || expectedBase == "kotlin.Any" || expectedBase == "Object" || expectedBase == "java.lang.Object"; topType {
+		if file.Language == analysis.LanguageKotlin && !strings.HasSuffix(strings.TrimSpace(actual), "?") {
+			return true, true
+		}
+		if file.Language == analysis.LanguageJava && !javaPrimitiveType(strings.TrimSpace(actual)) {
+			return true, true
 		}
 	}
-	return false
+	var expectedSymbols []analysis.Symbol
+	if at >= 0 {
+		expectedSymbols = i.resolveTypeSymbolsAtLocked(file, expectedBase, at)
+	} else {
+		expectedSymbols = i.resolveTypeSymbolsLocked(file, expectedBase)
+	}
+	if len(expectedSymbols) != 1 {
+		return false, false
+	}
+	access := newAccessibilityMemoLocked(i, file)
+	hierarchy, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(context.Background(), file, actual, maxResolutionCandidates, access)
+	if !complete || access.workExhausted || len(hierarchy) == 0 {
+		return false, false
+	}
+	for _, owner := range hierarchy {
+		if jvmSameClass(owner.symbol, expectedSymbols[0]) {
+			return true, true
+		}
+	}
+	return false, true
 }
 
 func memberKey(container, name string) string { return container + "\x00" + name }
@@ -1270,10 +2219,11 @@ func matchesArityForLanguage(symbol analysis.Symbol, count int, language analysi
 	required := 0
 	variadic := false
 	for _, parameter := range symbol.Parameters {
-		if parameter.Default == "" || language == analysis.LanguageJava {
+		variadicParameter := parameter.Variadic || strings.Contains(parameter.Type, "...") || strings.Contains(parameter.Type, "vararg")
+		if !variadicParameter && (parameter.Default == "" || language == analysis.LanguageJava) {
 			required++
 		}
-		if parameter.Variadic || strings.Contains(parameter.Type, "...") || strings.Contains(parameter.Type, "vararg") {
+		if variadicParameter {
 			variadic = true
 		}
 	}

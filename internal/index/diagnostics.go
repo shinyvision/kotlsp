@@ -9,18 +9,6 @@ import (
 	"github.com/shinyvision/kotlsp/internal/protocol"
 )
 
-var implicitNames = map[string]bool{
-	"Any": true, "Nothing": true, "Unit": true, "String": true, "CharSequence": true,
-	"Boolean": true, "Byte": true, "Short": true, "Int": true, "Long": true,
-	"Float": true, "Double": true, "Char": true, "Array": true,
-	"Object": true, "Class": true, "Throwable": true, "Exception": true,
-	"void": true, "boolean": true, "byte": true, "short": true, "int": true,
-	"long": true, "float": true, "double": true, "char": true,
-	"println": true, "print": true, "error": true, "TODO": true,
-	"listOf": true, "mutableListOf": true, "setOf": true, "mutableSetOf": true,
-	"mapOf": true, "mutableMapOf": true, "arrayOf": true, "emptyList": true,
-}
-
 // Diagnostics augments parser errors with bounded, index-backed semantic
 // checks. It performs no I/O and only touches precomputed maps.
 func (i *Index) Diagnostics(uri protocol.URI) []protocol.Diagnostic {
@@ -35,13 +23,18 @@ func (i *Index) Diagnostics(uri protocol.URI) []protocol.Diagnostic {
 	// them immediately. The compiler may add findings these did not, but must
 	// never contradict one, which the soundness gate asserts. They carry the
 	// compiler's own code and wording, so a confirming finding changes nothing.
-	predictions := append(i.declarationDiagnosticsLocked(file), i.referenceDiagnosticsLocked(file)...)
-	predictions = append(predictions, i.fastDiagnosticsLocked(file)...)
+	var predictions []protocol.Diagnostic
+	if file.ParseMode != "large" {
+		predictions = append(i.declarationDiagnosticsLocked(file), i.referenceDiagnosticsLocked(file)...)
+		predictions = append(predictions, i.fastDiagnosticsLocked(file)...)
+		predictions = append(predictions, i.springDataDiagnosticsLocked(file)...)
+	}
 	predictions, compiler := reconcilePredictions(predictions, i.compilerDiagnostics[uri])
 	out = append(out, compiler...)
-	out = append(out, i.importDiagnosticsLocked(file)...)
+	if file.ParseMode != "large" {
+		out = append(out, i.importDiagnosticsLocked(file)...)
+	}
 	out = append(out, predictions...)
-	out = append(out, i.springDataDiagnosticsLocked(file)...)
 	sort.SliceStable(out, func(a, b int) bool {
 		if out[a].Range.Start == out[b].Range.Start {
 			return out[a].Message < out[b].Message
@@ -51,19 +44,39 @@ func (i *Index) Diagnostics(uri protocol.URI) []protocol.Diagnostic {
 		}
 		return out[a].Range.Start.Line < out[b].Range.Start.Line
 	})
+	if len(out) > maxCompilerDiagnosticsPerFile {
+		omitted := len(out) - (maxCompilerDiagnosticsPerFile - 1)
+		sort.SliceStable(out, func(a, b int) bool {
+			if out[a].Severity == out[b].Severity {
+				return out[a].Range.Start.Line < out[b].Range.Start.Line
+			}
+			return out[a].Severity < out[b].Severity
+		})
+		out = append(append([]protocol.Diagnostic(nil), out[:maxCompilerDiagnosticsPerFile-1]...), protocol.Diagnostic{
+			Severity: 2, Source: "kotlsp", Code: "diagnostics-omitted",
+			Message: fmt.Sprintf("%d additional diagnostics omitted by the document safety limit.", omitted),
+		})
+		sort.SliceStable(out, func(a, b int) bool {
+			if out[a].Range.Start == out[b].Range.Start {
+				return out[a].Message < out[b].Message
+			}
+			if out[a].Range.Start.Line == out[b].Range.Start.Line {
+				return out[a].Range.Start.Character < out[b].Range.Start.Character
+			}
+			return out[a].Range.Start.Line < out[b].Range.Start.Line
+		})
+	}
 	return out
 }
 
 func (i *Index) importDiagnosticsLocked(file *analysis.ParsedFile) []protocol.Diagnostic {
-	used := make(map[string]bool)
-	for _, ref := range file.References {
-		if ref.Role != analysis.RoleImport {
-			used[ref.Name] = true
-		}
-	}
+	usedImports := i.usedImportsLocked(file)
 	seen := make(map[string]bool)
 	var out []protocol.Diagnostic
 	for _, imp := range file.Imports {
+		if len(out) >= maxCompilerDiagnosticsPerFile {
+			break
+		}
 		key := imp.Path + "|" + imp.Alias
 		if seen[key] {
 			out = append(out, protocol.Diagnostic{Range: imp.Range, Severity: 2, Code: "duplicate-import", Source: "kotlsp", Message: "Duplicate import: " + imp.Path, Tags: []int{1}, Data: map[string]any{"kind": "removeImport"}})
@@ -71,7 +84,7 @@ func (i *Index) importDiagnosticsLocked(file *analysis.ParsedFile) []protocol.Di
 		}
 		seen[key] = true
 		if !imp.Wildcard && len(i.byFQN[imp.Path]) == 0 && !isImplicitImport(imp.Path, file.Language) {
-			if i.generation.Load() > 0 && !i.Progress().Ready {
+			if !i.absenceProvesUnresolvedLocked(file) || i.hasUnmodelledGeneratedSourcesFor(file) {
 				// Library archives are published incrementally. Absence is not proof
 				// of an invalid import until their authoritative index is complete.
 				continue
@@ -79,7 +92,7 @@ func (i *Index) importDiagnosticsLocked(file *analysis.ParsedFile) []protocol.Di
 			out = append(out, protocol.Diagnostic{Range: imp.Range, Severity: 1, Code: "unresolved-import", Source: "kotlsp", Message: "Unresolved import: " + imp.Path, Data: map[string]any{"kind": "removeImport"}})
 			continue
 		}
-		if !imp.Wildcard && !used[imp.LocalName()] {
+		if !imp.Wildcard && !usedImports[imp.Path] {
 			out = append(out, protocol.Diagnostic{Range: imp.Range, Severity: 4, Code: "unused-import", Source: "kotlsp", Message: "Unused import: " + imp.Path, Tags: []int{1}, Data: map[string]any{"kind": "removeImport"}})
 		}
 	}
@@ -144,6 +157,9 @@ func (i *Index) declarationDiagnosticsLocked(file *analysis.ParsedFile) []protoc
 	reportedFirst := make(map[string]bool)
 	var out []protocol.Diagnostic
 	for _, symbol := range file.Symbols {
+		if len(out) >= maxCompilerDiagnosticsPerFile {
+			break
+		}
 		if symbol.Synthetic {
 			continue
 		}
@@ -200,9 +216,22 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 	var out []protocol.Diagnostic
 	deprecationCache := make(map[string]bool)
 	scopeContext := newUnresolvedNameContext(file)
+	resolvedTypeScope := make(map[string]bool)
+	resolvesType := func(name string, at int) bool {
+		key := name + "\x00" + fmt.Sprint(i.containerIDAtLocked(file, at))
+		if answer, known := resolvedTypeScope[key]; known {
+			return answer
+		}
+		answer := len(i.resolveTypeSymbolsAtLocked(file, name, at)) > 0
+		resolvedTypeScope[key] = answer
+		return answer
+	}
 	for _, ref := range file.References {
+		if len(out) >= maxCompilerDiagnosticsPerFile {
+			break
+		}
 		reportUnresolved := ref.Role == analysis.RoleType || ref.Qualifier == "" && (ref.Role == analysis.RoleCall || ref.Role == analysis.RoleRead || ref.Role == analysis.RoleWrite)
-		if implicitNames[ref.Name] {
+		if i.generation.Load() > 0 && !i.Progress().Ready {
 			reportUnresolved = false
 		}
 		// An argument label is never unresolved on its own. It binds through
@@ -210,6 +239,12 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 		// the owner and says nothing about the label.
 		if ref.ArgumentLabel {
 			reportUnresolved = false
+		}
+		// Primitive and core default-import types remain language-defined even in
+		// a directly opened fragment where no stdlib/JDK archive was indexed.
+		// Their absent declarations are never evidence of an unresolved name.
+		if languageIntrinsicReference(ref, file.Language) {
+			continue
 		}
 		if reportUnresolved && file.Language == analysis.LanguageKotlin && ref.Role == analysis.RoleCall && i.generation.Load() > 0 && !i.Progress().Ready && len(i.byName[ref.Name]) == 0 {
 			// The stdlib/default-import archive is indexed concurrently with the
@@ -242,12 +277,16 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 			}
 		}
 		resolved := i.resolveLocked(file, ref)
+		allDeprecated := len(resolved) > 0
+		for _, candidate := range resolved {
+			allDeprecated = allDeprecated && candidate.Deprecated
+		}
 		if deprecationKey != "" {
-			deprecationCache[deprecationKey] = len(resolved) > 0 && resolved[0].Deprecated
+			deprecationCache[deprecationKey] = allDeprecated
 		}
 		if len(resolved) > 0 {
-			if resolved[0].Deprecated {
-				out = append(out, protocol.Diagnostic{Range: ref.Range, Severity: 2, Code: "deprecated", Source: "kotlsp", Message: resolved[0].Name + " is deprecated", Tags: []int{2}})
+			if allDeprecated {
+				out = append(out, protocol.Diagnostic{Range: ref.Range, Severity: 2, Code: "deprecated", Source: "kotlsp", Message: ref.Name + " is deprecated", Tags: []int{2}})
 			}
 			continue
 		}
@@ -280,10 +319,13 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 		// then is how a cold start showed errors on kotlin.annotation.Target.
 		// An index with no workspace scan at all is a deliberate in-memory
 		// one and is complete by construction.
-		if i.generation.Load() > 0 && !i.librariesScanned.Load() {
+		if !i.absenceProvesUnresolvedLocked(file) || i.hasUnmodelledGeneratedSourcesFor(file) {
 			continue
 		}
 		if !predictionsApplyTo(file) {
+			continue
+		}
+		if ref.Role == analysis.RoleType && referenceInsideUnresolvedSupertypeOwner(file, ref, resolvesType) {
 			continue
 		}
 		// A name the index knows but could not bind here is the common case
@@ -291,23 +333,40 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 		// -- and is exactly what the scope engine exists for: it proves that
 		// no declaration of the name can be visible at this position, or it
 		// abstains. Type references stay with the type rule.
-		if len(i.byName[ref.Name]) > 0 && (ref.Role == analysis.RoleType || !i.fastDiagnosticsEligibleLocked(file) || !i.nameProvablyUnresolvedLocked(scopeContext, ref)) {
+		// An explicit import declares the name even when the index holds no
+		// declaration for it (a top-level function inside a library facade
+		// class, for instance). Whether that import resolves is the import
+		// rule's question, and the compiler's; the reference itself is bound.
+		if importDeclaresName(file, ref.Name) {
+			continue
+		}
+		knownName := len(i.byName[ref.Name]) > 0 || len(i.fileSymbolsByName[file.URI][ref.Name]) > 0
+		if knownName && (ref.Role == analysis.RoleType || !i.fastDiagnosticsEligibleLocked(file) || !i.nameProvablyUnresolvedLocked(scopeContext, ref)) {
 			continue
 		}
 		// A name with no declaration anywhere may still be a package: the
 		// first segments of `java.io.IOException` are references too.
-		if scopeContext.isPackageSegment(i, ref.Name) || scopeContext.isDeclarationName(ref.StartByte) {
+		packageSegment := scopeContext.isPackageSegment(i, ref.Name)
+		if ref.Qualifier == "" {
+			packageSegment = scopeContext.isRootPackageSegment(i, ref.Name)
+		}
+		if packageSegment || scopeContext.isDeclarationName(ref.StartByte) {
 			continue
 		}
 		data := map[string]any{"name": ref.Name}
 		if ids := i.byName[ref.Name]; len(ids) > 0 {
-			fqns := make([]string, 0, len(ids))
+			fqns := make([]string, 0, min(len(ids), 64))
 			seen := map[string]bool{}
-			for _, id := range ids {
-				symbol := i.symbols[id]
-				if symbol.FQN != "" && !seen[symbol.FQN] && analysis.IsTypeKind(symbol.Kind) {
-					seen[symbol.FQN] = true
-					fqns = append(fqns, symbol.FQN)
+			if len(ids) <= 4096 {
+				for _, id := range ids {
+					symbol := i.symbols[id]
+					if symbol.FQN != "" && !seen[symbol.FQN] && analysis.IsTypeKind(symbol.Kind) {
+						seen[symbol.FQN] = true
+						fqns = append(fqns, symbol.FQN)
+						if len(fqns) >= 64 {
+							break
+						}
+					}
 				}
 			}
 			sort.Strings(fqns)
@@ -329,8 +388,18 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 // referenceInUnparsedRegion reports whether a reference falls inside a span the
 // parser flagged as a syntax error.
 func referenceInUnparsedRegion(file *analysis.ParsedFile, target protocol.Range) bool {
+	owner := protocol.Range{}
+	hasOwner := false
+	for _, symbol := range file.Symbols {
+		if symbol.Synthetic || !rangeContains(symbol.Range, target) {
+			continue
+		}
+		if !hasOwner || rangeContains(owner, symbol.Range) {
+			owner, hasOwner = symbol.Range, true
+		}
+	}
 	for _, diagnostic := range file.Diagnostics {
-		if diagnostic.Severity == 1 && diagnostic.Code == "syntax" && rangesOverlap(diagnostic.Range, target) {
+		if diagnostic.Severity == 1 && diagnostic.Code == "syntax" && (rangesOverlap(diagnostic.Range, target) || hasOwner && rangesOverlap(diagnostic.Range, owner)) {
 			return true
 		}
 	}
@@ -365,8 +434,8 @@ func (i *Index) deprecationCacheKeyLocked(file *analysis.ParsedFile, reference a
 		}
 	}
 	qualifier := reference.Qualifier
-	if document := i.docs[file.URI]; document != nil {
-		if textual := expressionQualifierBefore(document.Text, reference.StartByte); textual != "" {
+	if text := i.documentTextLocked(file.URI); text != "" {
+		if textual := expressionQualifierBefore(text, reference.StartByte); textual != "" {
 			qualifier = textual
 		}
 	}
@@ -437,6 +506,72 @@ func isImplicitImport(path string, language analysis.Language) bool {
 	}
 	for _, prefix := range []string{"kotlin.", "kotlin.annotation.", "kotlin.collections.", "kotlin.comparisons.", "kotlin.io.", "kotlin.ranges.", "kotlin.sequences.", "kotlin.text.", "kotlin.jvm.", "java.lang."} {
 		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func languageIntrinsicType(name string, language analysis.Language) bool {
+	name = simpleType(name)
+	if language == analysis.LanguageJava {
+		switch name {
+		case "void", "boolean", "byte", "short", "int", "long", "char", "float", "double",
+			"Object", "String", "StringBuilder", "StringBuffer", "Class", "System", "Math", "Number",
+			"Boolean", "Byte", "Short", "Integer", "Long", "Character", "Float", "Double", "Void",
+			"Throwable", "Exception", "RuntimeException", "Error", "Enum", "Iterable", "Runnable", "AutoCloseable", "Deprecated", "Override", "SuppressWarnings":
+			return true
+		}
+		return false
+	}
+	switch name {
+	case "Any", "Nothing", "Unit", "String", "CharSequence", "Throwable", "Cloneable", "Number", "Comparable", "Enum", "Annotation",
+		"Boolean", "Char", "Byte", "Short", "Int", "Long", "Float", "Double", "UByte", "UShort", "UInt", "ULong",
+		"BooleanArray", "CharArray", "ByteArray", "ShortArray", "IntArray", "LongArray", "FloatArray", "DoubleArray", "UByteArray", "UShortArray", "UIntArray", "ULongArray", "Array",
+		"Iterable", "Iterator", "Collection", "List", "MutableList", "Set", "MutableSet", "Map", "MutableMap", "Map.Entry", "Pair", "Triple", "Result",
+		"Exception", "RuntimeException", "IllegalArgumentException", "IllegalStateException", "IndexOutOfBoundsException", "UnsupportedOperationException":
+		return true
+	}
+	return false
+}
+
+func languageIntrinsicReference(ref analysis.Reference, language analysis.Language) bool {
+	if ref.Role == analysis.RoleType {
+		return languageIntrinsicType(ref.Name, language)
+	}
+	if ref.Role == analysis.RoleCall && languageIntrinsicType(ref.Name, language) {
+		return true
+	}
+	if language != analysis.LanguageKotlin || ref.Qualifier != "" || ref.Role != analysis.RoleCall && ref.Role != analysis.RoleRead {
+		return false
+	}
+	switch ref.Name {
+	case "TODO", "error", "require", "requireNotNull", "check", "checkNotNull", "lazy", "run", "with",
+		"print", "println", "readLine", "arrayOf", "emptyArray", "listOf", "mutableListOf", "emptyList",
+		"setOf", "mutableSetOf", "emptySet", "mapOf", "mutableMapOf", "emptyMap", "sequenceOf":
+		return true
+	}
+	return false
+}
+
+// absenceProvesUnresolvedLocked reports whether a name or import with no
+// declaration anywhere in the index is thereby unresolved. An index populated
+// only through Open has no scan in flight and no archive still being
+// published: its universe is complete by construction, so absence is proof
+// immediately. A scanned workspace must first finish (and be authoritative)
+// before a missing declaration can mean anything.
+func (i *Index) absenceProvesUnresolvedLocked(file *analysis.ParsedFile) bool {
+	if i.generation.Load() == 0 {
+		return true
+	}
+	return i.semanticUniverseCompleteLocked(file)
+}
+
+// importDeclaresName reports whether the file explicitly imports name, by its
+// own name or by alias. The scope engine treats such a name as bound.
+func importDeclaresName(file *analysis.ParsedFile, name string) bool {
+	for _, imported := range file.Imports {
+		if imported.LocalName() == name || imported.Alias == name {
 			return true
 		}
 	}

@@ -4,6 +4,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/shinyvision/kotlsp/internal/lexical"
 )
 
 // Where a position sits lexically decides what may be completed there. Offering
@@ -72,146 +74,17 @@ func (r region) contains(offset int) bool {
 //
 // Regions are emitted in the order their bodies end, so a template's code
 // region arrives before the literal containing it.
-func lexRegions(text string, kotlin bool, visit func(region)) {
-	// Each open literal is a frame; a template block pushes a frame of its own
-	// so that a string inside `${...}` nests correctly.
-	type frame struct {
-		kind       byte // '"' single-quoted, 't' triple-quoted, '{' template block
-		bodyStart  int
-		braceDepth int
-	}
-	var stack []frame
-	for at := 0; at < len(text); at++ {
-		value := text[at]
-		if len(stack) > 0 && stack[len(stack)-1].kind != '{' {
-			top := &stack[len(stack)-1]
-			if top.kind == '"' && value == '\\' {
-				at++
-				continue
-			}
-			// A single-quoted literal ends at its quote, and an unterminated
-			// one ends at the line break rather than swallowing the file.
-			if top.kind == '"' && (value == '"' || value == '\n') {
-				visit(region{start: top.bodyStart, end: at, outerStart: top.bodyStart - 1, outerEnd: at + 1, kind: regionLiteral})
-				stack = stack[:len(stack)-1]
-				continue
-			}
-			if top.kind == 't' && value == '"' && at+2 < len(text) && text[at+1] == '"' && text[at+2] == '"' {
-				visit(region{start: top.bodyStart, end: at, outerStart: top.bodyStart - 3, outerEnd: at + 3, kind: regionLiteral})
-				stack = stack[:len(stack)-1]
-				at += 2
-				continue
-			}
-			if kotlin && value == '$' && at+1 < len(text) {
-				if text[at+1] == '{' {
-					stack = append(stack, frame{kind: '{', bodyStart: at + 1})
-					at++
-					continue
-				}
-				// The simple form binds the identifier and nothing after it.
-				if start := at + 1; isTemplateNameStart(text, start) {
-					end := start
-					for end < len(text) && isIdentifierByteFast(text[end]) {
-						end++
-					}
-					visit(region{start: start, end: end, outerStart: start, outerEnd: end, kind: regionCode, nested: true})
-					at = end - 1
-				}
-			}
-			continue
-		}
-		// Code, possibly inside a template block.
-		if value == '/' && at+1 < len(text) && text[at+1] == '/' {
-			end := at + 2
-			for end < len(text) && text[end] != '\n' {
-				end++
-			}
-			visit(region{start: at + 2, end: end, outerStart: at, outerEnd: min(end+1, len(text)), kind: regionLineComment})
-			at = end
-			continue
-		}
-		if value == '/' && at+1 < len(text) && text[at+1] == '*' {
-			kind := regionBlockComment
-			bodyStart := at + 2
-			// `/**` opens a doc comment, but `/**/` is an empty block comment.
-			if at+2 < len(text) && text[at+2] == '*' && !(at+3 < len(text) && text[at+3] == '/') {
-				kind = regionDocComment
-				bodyStart = at + 3
-			}
-			depth := 1
-			end := at + 2
-			for end < len(text) && depth > 0 {
-				// Kotlin nests block comments; Java does not.
-				if kotlin && text[end] == '/' && end+1 < len(text) && text[end+1] == '*' {
-					depth++
-					end += 2
-					continue
-				}
-				if text[end] == '*' && end+1 < len(text) && text[end+1] == '/' {
-					depth--
-					if depth == 0 {
-						break
-					}
-					end += 2
-					continue
-				}
-				end++
-			}
-			if bodyStart > end {
-				bodyStart = end
-			}
-			visit(region{start: bodyStart, end: end, outerStart: at, outerEnd: min(end+2, len(text)), kind: kind})
-			at = end + 1
-			continue
-		}
-		if value == '"' {
-			if at+2 < len(text) && text[at+1] == '"' && text[at+2] == '"' {
-				stack = append(stack, frame{kind: 't', bodyStart: at + 3})
-				at += 2
-			} else {
-				stack = append(stack, frame{kind: '"', bodyStart: at + 1})
-			}
-			continue
-		}
-		if value == '\'' {
-			end := at + 1
-			for end < len(text) && text[end] != '\'' && text[end] != '\n' {
-				if text[end] == '\\' {
-					end++
-				}
-				end++
-			}
-			visit(region{start: at + 1, end: min(end, len(text)), outerStart: at, outerEnd: min(end+1, len(text)), kind: regionLiteral})
-			at = end
-			continue
-		}
-		if len(stack) > 0 {
-			top := &stack[len(stack)-1]
-			if value == '{' {
-				top.braceDepth++
-			} else if value == '}' {
-				if top.braceDepth == 0 {
-					visit(region{start: top.bodyStart, end: at + 1, outerStart: top.bodyStart, outerEnd: at + 1, kind: regionCode, nested: true})
-					stack = stack[:len(stack)-1]
-					continue
-				}
-				top.braceDepth--
-			}
-		}
-	}
-	// Whatever is still open runs to the end of the file.
-	for index := len(stack) - 1; index >= 0; index-- {
-		kind := regionLiteral
-		nested := false
-		if stack[index].kind == '{' {
-			kind, nested = regionCode, true
-		}
-		visit(region{start: stack[index].bodyStart, end: len(text), outerStart: stack[index].bodyStart, outerEnd: len(text), kind: kind, nested: nested})
-	}
-}
-
-func isTemplateNameStart(text string, at int) bool {
-	return at < len(text) && (isIdentifierByteFast(text[at]) && !(text[at] >= '0' && text[at] <= '9'))
+func lexRegions(text string, kotlin bool, visit func(region)) bool {
+	return lexical.ScanRegionsBounded(text, kotlin, 100_000, func(value lexical.Region) {
+		visit(region{
+			start:      value.Start,
+			end:        value.End,
+			outerStart: value.OuterStart,
+			outerEnd:   value.OuterEnd,
+			kind:       regionKind(value.Kind),
+			nested:     value.Nested,
+		})
+	})
 }
 
 // codeMask marks every byte of source that is code: outside comments and
@@ -225,17 +98,23 @@ func codeMask(text string, kotlin bool) []bool {
 	// Regions arrive innermost first -- a string inside `${...}` closes before
 	// the template does -- so the first region to claim a byte wins and the
 	// enclosing one cannot mark it back.
-	decided := make([]bool, len(text))
-	lexRegions(text, kotlin, func(r region) {
+	decided := make([]byte, (len(text)+7)/8)
+	complete := lexRegions(text, kotlin, func(r region) {
 		code := r.kind == regionCode
 		for index := max(r.outerStart, 0); index < r.outerEnd && index < len(mask); index++ {
-			if decided[index] {
+			bit := byte(1 << uint(index&7))
+			if decided[index>>3]&bit != 0 {
 				continue
 			}
-			decided[index] = true
+			decided[index>>3] |= bit
 			mask[index] = code
 		}
 	})
+	if !complete {
+		for index := range mask {
+			mask[index] = false
+		}
+	}
 	return mask
 }
 
@@ -282,7 +161,7 @@ func CompletionPositionAt(text string, offset int, kotlin bool) CompletionPositi
 	// though the byte at the cursor is the closing quote.
 	anchor := offset - len(identifierPrefixBefore(text, offset))
 	var innermost *region
-	lexRegions(text, kotlin, func(r region) {
+	complete := lexRegions(text, kotlin, func(r region) {
 		if !r.contains(anchor) {
 			return
 		}
@@ -291,6 +170,9 @@ func CompletionPositionAt(text string, offset int, kotlin bool) CompletionPositi
 			innermost = &candidate
 		}
 	})
+	if !complete {
+		return CompletionPosition{Scope: CompletionNone}
+	}
 	if innermost == nil || innermost.kind == regionCode {
 		return CompletionPosition{Scope: CompletionCode}
 	}

@@ -31,6 +31,11 @@ func TestStatusReportsIndexingAndValidation(t *testing.T) {
 		} `json:"indexing"`
 		Validation         []map[string]any `json:"validation"`
 		DiagnosticsTrigger string           `json:"diagnosticsTrigger"`
+		MemoryBudget       struct {
+			ObservedRSS                 bool   `json:"observedRSS"`
+			ObservedProcessTreeRSSBytes uint64 `json:"observedProcessTreeRSSBytes"`
+			GoHeapAllocBytes            uint64 `json:"goHeapAllocBytes"`
+		} `json:"memoryBudget"`
 	}
 	if unmarshalErr := json.Unmarshal(encoded, &status); unmarshalErr != nil {
 		t.Fatal(unmarshalErr)
@@ -40,6 +45,9 @@ func TestStatusReportsIndexingAndValidation(t *testing.T) {
 	}
 	if status.DiagnosticsTrigger != "change" {
 		t.Fatalf("default trigger reported as %q", status.DiagnosticsTrigger)
+	}
+	if status.MemoryBudget.GoHeapAllocBytes == 0 || status.MemoryBudget.ObservedRSS && status.MemoryBudget.ObservedProcessTreeRSSBytes == 0 {
+		t.Fatalf("runtime memory observations were not reported: %s", encoded)
 	}
 }
 

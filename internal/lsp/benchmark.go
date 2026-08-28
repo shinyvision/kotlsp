@@ -9,8 +9,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,10 +24,15 @@ import (
 
 type benchmarkResult struct {
 	Method string
+	First  time.Duration
 	Min    time.Duration
 	P50    time.Duration
 	P95    time.Duration
+	P99    time.Duration
 	Worst  time.Duration
+	Alloc  uint64
+	Heap   uint64
+	RSS    uint64
 	// Informational results document unavoidable/background lower bounds but
 	// are not complete JSON-RPC response latency gates.
 	Informational bool
@@ -39,6 +46,7 @@ type benchmarkFixture struct {
 	LibraryURI    protocol.URI
 	ExportDir     string
 	WatermarkPath string
+	Source        string
 }
 
 func RunBenchmarkCLI(ctx context.Context, args []string, out io.Writer) error {
@@ -47,6 +55,7 @@ func RunBenchmarkCLI(ctx context.Context, args []string, out io.Writer) error {
 	workspace := fs.String("workspace", ".", "Kotlin/Java workspace to index")
 	iterations := fs.Int("iterations", 100, "iterations per LSP request")
 	wait := fs.Duration("index-timeout", 2*time.Minute, "maximum wait for background source indexing")
+	requireCompiler := fs.Bool("require-compiler-pass", true, "require every source language present in the workspace to complete an authoritative compiler pass")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -55,7 +64,7 @@ func RunBenchmarkCLI(ctx context.Context, args []string, out io.Writer) error {
 	}
 	root := uriutil.File(*workspace)
 	s := NewServer(ctx, log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	var appliedEdits atomic.Int64
 	s.clientCall = func(_ context.Context, method string, params, result any) error {
 		if method != "workspace/applyEdit" {
@@ -97,6 +106,11 @@ func RunBenchmarkCLI(ctx context.Context, args []string, out io.Writer) error {
 		return fmt.Errorf("source index did not become ready in %s", *wait)
 	}
 	indexReadyDuration := time.Since(indexWaitStarted)
+	if *requireCompiler {
+		if err := waitForBenchmarkCompilerPass(ctx, s, time.Now().Add(*wait)); err != nil {
+			return err
+		}
+	}
 	fixture, cleanup, err := makeBenchmarkFixture(ctx, s, *workspace)
 	if err != nil {
 		return err
@@ -116,6 +130,7 @@ func RunBenchmarkCLI(ctx context.Context, args []string, out io.Writer) error {
 		"textDocument/documentHighlight":    mustJSON(map[string]any{"textDocument": map[string]any{"uri": uri}, "position": pos}),
 		"textDocument/documentSymbol":       mustJSON(map[string]any{"textDocument": map[string]any{"uri": uri}}),
 		"workspace/symbol":                  mustJSON(map[string]any{"query": sym.Name}),
+		"workspace/symbol broad":            mustJSON(map[string]any{"query": ""}),
 		"textDocument/formatting":           mustJSON(map[string]any{"textDocument": map[string]any{"uri": uri}, "options": map[string]any{"tabSize": 4, "insertSpaces": true}}),
 		"textDocument/rangeFormatting":      mustJSON(map[string]any{"textDocument": map[string]any{"uri": uri}, "range": sym.Range, "options": map[string]any{"tabSize": 4, "insertSpaces": true}}),
 		"textDocument/codeAction":           mustJSON(map[string]any{"textDocument": map[string]any{"uri": uri}, "range": sym.SelectionRange, "context": map[string]any{"diagnostics": []any{}}}),
@@ -141,8 +156,8 @@ func RunBenchmarkCLI(ctx context.Context, args []string, out io.Writer) error {
 		requests["workspace/executeCommand:"+command] = mustJSON(map[string]any{"command": command, "arguments": benchmarkCommandArgs(command, fixture)})
 	}
 	results := make([]benchmarkResult, 0, len(requests)+1)
-	results = append(results, benchmarkResult{Method: "initialize", Min: initDuration, P50: initDuration, P95: initDuration, Worst: initDuration})
-	results = append(results, benchmarkResult{Method: "workspace/indexReady (background lower bound)", Min: indexReadyDuration, P50: indexReadyDuration, P95: indexReadyDuration, Worst: indexReadyDuration, Informational: true})
+	results = append(results, benchmarkResult{Method: "initialize", First: initDuration, Min: initDuration, P50: initDuration, P95: initDuration, P99: initDuration, Worst: initDuration})
+	results = append(results, benchmarkResult{Method: "workspace/indexReady (cold background lower bound)", First: indexReadyDuration, Min: indexReadyDuration, P50: indexReadyDuration, P95: indexReadyDuration, P99: indexReadyDuration, Worst: indexReadyDuration, Informational: true})
 	methods := make([]string, 0, len(requests))
 	for method := range requests {
 		methods = append(methods, method)
@@ -152,9 +167,14 @@ func RunBenchmarkCLI(ctx context.Context, args []string, out io.Writer) error {
 		method := label
 		if at := indexColon(label); at >= 0 {
 			method = "workspace/executeCommand"
+		} else if strings.HasPrefix(label, "workspace/symbol ") {
+			method = "workspace/symbol"
 		}
 		raw := requests[label]
 		durations := make([]time.Duration, *iterations)
+		allocations := make([]uint64, *iterations)
+		var heapPeak uint64
+		var rssPeak uint64
 		for n := 0; n < *iterations; n++ {
 			iterationRaw := raw
 			if label == "workspace/executeCommand:jetbrains.kotlin.completion.apply" {
@@ -173,9 +193,19 @@ func RunBenchmarkCLI(ctx context.Context, args []string, out io.Writer) error {
 				s.modSessionCreated[1] = time.Now()
 				s.modMu.Unlock()
 			}
+			var memoryBefore, memoryAfter runtime.MemStats
+			runtime.ReadMemStats(&memoryBefore)
 			begin := time.Now()
 			result, responseErr := s.Request(ctx, method, iterationRaw)
 			durations[n] = time.Since(begin)
+			runtime.ReadMemStats(&memoryAfter)
+			allocations[n] = memoryAfter.TotalAlloc - memoryBefore.TotalAlloc
+			if memoryAfter.HeapAlloc > heapPeak {
+				heapPeak = memoryAfter.HeapAlloc
+			}
+			if rss := processTreeRSSBytes(); rss > rssPeak {
+				rssPeak = rss
+			}
 			if responseErr != nil {
 				return fmt.Errorf("%s iteration %d returned JSON-RPC error %d: %s", label, n+1, responseErr.Code, responseErr.Message)
 			}
@@ -183,20 +213,39 @@ func RunBenchmarkCLI(ctx context.Context, args []string, out io.Writer) error {
 				return fmt.Errorf("%s iteration %d: %w", label, n+1, err)
 			}
 		}
-		sort.Slice(durations, func(a, b int) bool { return durations[a] < durations[b] })
-		results = append(results, benchmarkResult{Method: label, Min: durations[0], P50: durations[len(durations)/2], P95: durations[(len(durations)-1)*95/100], Worst: durations[len(durations)-1]})
+		first := durations[0]
+		warm := append([]time.Duration(nil), durations...)
+		if len(warm) > 1 {
+			warm = warm[1:]
+		}
+		sort.Slice(warm, func(a, b int) bool { return warm[a] < warm[b] })
+		var allocationTotal uint64
+		for _, allocation := range allocations {
+			allocationTotal += allocation
+		}
+		results = append(results, benchmarkResult{Method: label, First: first, Min: warm[0], P50: benchmarkPercentile(warm, 50), P95: benchmarkPercentile(warm, 95), P99: benchmarkPercentile(warm, 99), Worst: warm[len(warm)-1], Alloc: allocationTotal / uint64(len(allocations)), Heap: heapPeak, RSS: rssPeak})
 	}
-	fmt.Fprintf(out, "%-58s %10s %10s %10s %10s\n", "METHOD", "MIN", "P50", "P95", "WORST")
+	mixed, err := benchmarkMixedTypingAndQueries(ctx, s, fixture, *iterations, requests["textDocument/completion"])
+	if err != nil {
+		return err
+	}
+	results = append(results, mixed)
+	incremental, err := benchmarkIncrementalTypingAndQueries(ctx, s, fixture, *iterations, requests["textDocument/completion"])
+	if err != nil {
+		return err
+	}
+	results = append(results, incremental)
+	fmt.Fprintf(out, "%-58s %10s %10s %10s %10s %10s %10s %11s %11s %11s\n", "METHOD", "FIRST", "MIN", "P50", "P95", "P99", "WORST", "ALLOC/OP", "HEAP PEAK", "TREE RSS")
 	failed := false
 	for _, r := range results {
 		status := ""
 		if r.Informational {
 			status = " INFO"
-		} else if r.Worst >= latencyLimit {
+		} else if r.First >= latencyLimit || r.Worst >= latencyLimit {
 			status = " FAIL"
 			failed = true
 		}
-		fmt.Fprintf(out, "%-58s %10s %10s %10s %10s%s\n", r.Method, r.Min.Round(time.Microsecond), r.P50.Round(time.Microsecond), r.P95.Round(time.Microsecond), r.Worst.Round(time.Microsecond), status)
+		fmt.Fprintf(out, "%-58s %10s %10s %10s %10s %10s %10s %11s %11s %11s%s\n", r.Method, r.First.Round(time.Microsecond), r.Min.Round(time.Microsecond), r.P50.Round(time.Microsecond), r.P95.Round(time.Microsecond), r.P99.Round(time.Microsecond), r.Worst.Round(time.Microsecond), benchmarkBytes(r.Alloc), benchmarkBytes(r.Heap), benchmarkBytes(r.RSS), status)
 	}
 	if failed {
 		return fmt.Errorf("latency gate failed: one or more operations reached 100ms")
@@ -204,8 +253,205 @@ func RunBenchmarkCLI(ctx context.Context, args []string, out io.Writer) error {
 	if appliedEdits.Load() < 4 {
 		return fmt.Errorf("server-initiated edit validation failed: observed %d workspace/applyEdit requests, want at least four extraction edits", appliedEdits.Load())
 	}
-	fmt.Fprintf(out, "PASS: all %d request/command paths completed below 100ms (%d iterations each)\n", len(results), *iterations)
+	progress := s.index.Progress()
+	fmt.Fprintf(out, "PASS: all %d request/command paths completed below 100ms (%d iterations each); corpus indexed %d source files and %d libraries\n", len(results), *iterations, progress.FilesParsed, progress.LibrariesParsed)
 	return nil
+}
+
+func waitForBenchmarkCompilerPass(ctx context.Context, s *Server, deadline time.Time) error {
+	files, truncated := s.index.WorkspaceFilesContext(ctx, 250000)
+	if truncated {
+		return fmt.Errorf("compiler benchmark corpus exceeds the 250000-file inspection limit")
+	}
+	required := make(map[string]bool)
+	for _, file := range files {
+		lower := strings.ToLower(string(file.URI))
+		if strings.HasSuffix(lower, ".java") {
+			required["java"] = true
+		} else if strings.HasSuffix(lower, ".kt") || strings.HasSuffix(lower, ".kts") {
+			required["kotlin"] = true
+		}
+	}
+	for len(required) > 0 && time.Now().Before(deadline) {
+		for _, status := range s.index.CompilerStatus() {
+			if !required[status.Language] || status.Passes == 0 {
+				continue
+			}
+			if status.LastOutcome != "succeeded" {
+				return fmt.Errorf("%s compiler benchmark pass %s: %s", status.Language, status.LastOutcome, status.LastError)
+			}
+			delete(required, status.Language)
+		}
+		if len(required) == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	if len(required) > 0 {
+		languages := make([]string, 0, len(required))
+		for language := range required {
+			languages = append(languages, language)
+		}
+		sort.Strings(languages)
+		return fmt.Errorf("compiler benchmark pass did not succeed for %s before timeout", strings.Join(languages, ", "))
+	}
+	return nil
+}
+
+func benchmarkMixedTypingAndQueries(ctx context.Context, s *Server, fixture benchmarkFixture, iterations int, completion json.RawMessage) (benchmarkResult, error) {
+	durations := make([]time.Duration, iterations)
+	allocations := make([]uint64, iterations)
+	current := fixture.Source
+	version := 1
+	var heapPeak uint64
+	var rssPeak uint64
+	for iteration := 0; iteration < iterations; iteration++ {
+		next := current
+		if strings.HasSuffix(current, "// benchmark edit\n") {
+			next = strings.TrimSuffix(current, "// benchmark edit\n")
+		} else {
+			next += "// benchmark edit\n"
+		}
+		version++
+		params := protocol.DidChangeTextDocumentParams{TextDocument: protocol.VersionedTextDocumentIdentifier{URI: fixture.URI, Version: version}, ContentChanges: []protocol.TextDocumentContentChangeEvent{{Text: next}}}
+		var memoryBefore, memoryAfter runtime.MemStats
+		runtime.ReadMemStats(&memoryBefore)
+		begin := time.Now()
+		var wait sync.WaitGroup
+		wait.Add(1)
+		var changeErr error
+		go func() {
+			defer wait.Done()
+			_, changeErr = s.index.Change(ctx, params)
+		}()
+		result, responseErr := s.Request(ctx, "textDocument/completion", completion)
+		wait.Wait()
+		durations[iteration] = time.Since(begin)
+		runtime.ReadMemStats(&memoryAfter)
+		allocations[iteration] = memoryAfter.TotalAlloc - memoryBefore.TotalAlloc
+		if memoryAfter.HeapAlloc > heapPeak {
+			heapPeak = memoryAfter.HeapAlloc
+		}
+		if rss := processTreeRSSBytes(); rss > rssPeak {
+			rssPeak = rss
+		}
+		if changeErr != nil {
+			return benchmarkResult{}, fmt.Errorf("mixed workload edit %d: %w", iteration+1, changeErr)
+		}
+		if responseErr != nil {
+			return benchmarkResult{}, fmt.Errorf("mixed workload completion %d: %s", iteration+1, responseErr.Message)
+		}
+		if err := validateBenchmarkResult("textDocument/completion", result); err != nil {
+			return benchmarkResult{}, fmt.Errorf("mixed workload completion %d: %w", iteration+1, err)
+		}
+		current = next
+	}
+	first := durations[0]
+	warm := append([]time.Duration(nil), durations...)
+	if len(warm) > 1 {
+		warm = warm[1:]
+	}
+	sort.Slice(warm, func(left, right int) bool { return warm[left] < warm[right] })
+	var allocationTotal uint64
+	for _, allocation := range allocations {
+		allocationTotal += allocation
+	}
+	return benchmarkResult{Method: "mixed: concurrent full-text edit + completion", First: first, Min: warm[0], P50: benchmarkPercentile(warm, 50), P95: benchmarkPercentile(warm, 95), P99: benchmarkPercentile(warm, 99), Worst: warm[len(warm)-1], Alloc: allocationTotal / uint64(len(allocations)), Heap: heapPeak, RSS: rssPeak}, nil
+}
+
+func benchmarkIncrementalTypingAndQueries(ctx context.Context, s *Server, fixture benchmarkFixture, iterations int, completion json.RawMessage) (benchmarkResult, error) {
+	const marker = "// incremental benchmark edit\n"
+	durations := make([]time.Duration, iterations)
+	allocations := make([]uint64, iterations)
+	var heapPeak uint64
+	var rssPeak uint64
+	document, ok := s.index.Document(fixture.URI)
+	if !ok {
+		return benchmarkResult{}, fmt.Errorf("incremental workload fixture disappeared")
+	}
+	version := document.Version
+	for iteration := 0; iteration < iterations; iteration++ {
+		document, ok = s.index.Document(fixture.URI)
+		if !ok {
+			return benchmarkResult{}, fmt.Errorf("incremental workload fixture disappeared at iteration %d", iteration+1)
+		}
+		start, end, replacement := len(document.Text), len(document.Text), marker
+		if strings.HasSuffix(document.Text, marker) {
+			start, replacement = len(document.Text)-len(marker), ""
+		}
+		version++
+		change := protocol.TextDocumentContentChangeEvent{Range: &protocol.Range{Start: document.Position(start), End: document.Position(end)}, Text: replacement}
+		params := protocol.DidChangeTextDocumentParams{TextDocument: protocol.VersionedTextDocumentIdentifier{URI: fixture.URI, Version: version}, ContentChanges: []protocol.TextDocumentContentChangeEvent{change}}
+		var memoryBefore, memoryAfter runtime.MemStats
+		runtime.ReadMemStats(&memoryBefore)
+		begin := time.Now()
+		var wait sync.WaitGroup
+		wait.Add(1)
+		var changeErr error
+		go func() {
+			defer wait.Done()
+			_, changeErr = s.index.Change(ctx, params)
+		}()
+		result, responseErr := s.Request(ctx, "textDocument/completion", completion)
+		wait.Wait()
+		durations[iteration] = time.Since(begin)
+		runtime.ReadMemStats(&memoryAfter)
+		allocations[iteration] = memoryAfter.TotalAlloc - memoryBefore.TotalAlloc
+		if memoryAfter.HeapAlloc > heapPeak {
+			heapPeak = memoryAfter.HeapAlloc
+		}
+		if rss := processTreeRSSBytes(); rss > rssPeak {
+			rssPeak = rss
+		}
+		if changeErr != nil {
+			return benchmarkResult{}, fmt.Errorf("incremental workload edit %d: %w", iteration+1, changeErr)
+		}
+		if responseErr != nil {
+			return benchmarkResult{}, fmt.Errorf("incremental workload completion %d: %s", iteration+1, responseErr.Message)
+		}
+		if validateErr := validateBenchmarkResult("textDocument/completion", result); validateErr != nil {
+			return benchmarkResult{}, fmt.Errorf("incremental workload completion %d: %w", iteration+1, validateErr)
+		}
+	}
+	first := durations[0]
+	warm := append([]time.Duration(nil), durations...)
+	if len(warm) > 1 {
+		warm = warm[1:]
+	}
+	sort.Slice(warm, func(left, right int) bool { return warm[left] < warm[right] })
+	var allocationTotal uint64
+	for _, allocation := range allocations {
+		allocationTotal += allocation
+	}
+	return benchmarkResult{Method: "mixed: incremental edit + concurrent completion", First: first, Min: warm[0], P50: benchmarkPercentile(warm, 50), P95: benchmarkPercentile(warm, 95), P99: benchmarkPercentile(warm, 99), Worst: warm[len(warm)-1], Alloc: allocationTotal / uint64(len(allocations)), Heap: heapPeak, RSS: rssPeak}, nil
+}
+
+func benchmarkPercentile(sorted []time.Duration, percentile int) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	index := (len(sorted) - 1) * percentile / 100
+	return sorted[index]
+}
+
+func benchmarkBytes(value uint64) string {
+	if value == 0 {
+		return "-"
+	}
+	if value >= 1<<30 {
+		return fmt.Sprintf("%.1fGiB", float64(value)/float64(1<<30))
+	}
+	if value >= 1<<20 {
+		return fmt.Sprintf("%.1fMiB", float64(value)/float64(1<<20))
+	}
+	if value >= 1<<10 {
+		return fmt.Sprintf("%.1fKiB", float64(value)/float64(1<<10))
+	}
+	return fmt.Sprintf("%dB", value)
 }
 
 func benchmarkKotlinCompletionArgs(s *Server, completionParams json.RawMessage) ([]any, error) {
@@ -317,6 +563,7 @@ func makeBenchmarkFixture(ctx context.Context, s *Server, workspace string) (ben
 		URI: uri, Symbol: symbol, Position: doc.Position(typeOffset),
 		ExtractRange: doc.Range(extractOffset, extractOffset+1), LibraryURI: libraryURI,
 		ExportDir: exportDir, WatermarkPath: filepath.Join(exportDir, "watermark"),
+		Source: source,
 	}, cleanup, nil
 }
 

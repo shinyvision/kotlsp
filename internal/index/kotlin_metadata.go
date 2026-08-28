@@ -1,6 +1,7 @@
 package index
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
@@ -32,10 +33,18 @@ type kotlinBinaryMetadata struct {
 	Constructors []kotlinMetadataCallable
 	Functions    []kotlinMetadataCallable
 	Visibility   string
+	Schema       kotlinMetadataSchema
+	Valid        bool
+}
+
+type kotlinMetadataSchema struct {
+	Major int
+	Minor int
 }
 
 func decodeKotlinBinaryMetadata(metadata *classfile.KotlinMetadata) kotlinBinaryMetadata {
-	if metadata == nil || len(metadata.Data1) == 0 {
+	schema, supported := kotlinMetadataSchemaFor(metadata)
+	if metadata == nil || len(metadata.Data1) == 0 || !supported {
 		return kotlinBinaryMetadata{}
 	}
 	data := decodeKotlinMetadataBytes(metadata.Data1)
@@ -44,18 +53,59 @@ func decodeKotlinBinaryMetadata(metadata *classfile.KotlinMetadata) kotlinBinary
 		return kotlinBinaryMetadata{}
 	}
 	message := data[prefix+int(nameTableSize):]
-	var decoded kotlinBinaryMetadata
-	protobufFields(message, func(number int, wire int, integer uint64, value []byte) {
+	decoded := kotlinBinaryMetadata{Schema: schema, Valid: true}
+	valid := protobufFieldsStrict(message, func(number int, wire int, integer uint64, value []byte) {
 		switch {
 		case metadata.Kind == 1 && number == 1 && wire == 0:
 			decoded.Visibility = kotlinMetadataVisibility(integer)
 		case metadata.Kind == 1 && number == 8 && wire == 2:
-			decoded.Constructors = append(decoded.Constructors, decodeKotlinCallable(value, metadata.Data2, true))
+			callable, ok := decodeKotlinCallable(value, metadata.Data2, true)
+			if !ok {
+				decoded.Valid = false
+			} else {
+				decoded.Constructors = append(decoded.Constructors, callable)
+			}
 		case metadata.Kind == 1 && number == 9 && wire == 2, (metadata.Kind == 2 || metadata.Kind == 5) && number == 3 && wire == 2:
-			decoded.Functions = append(decoded.Functions, decodeKotlinCallable(value, metadata.Data2, false))
+			callable, ok := decodeKotlinCallable(value, metadata.Data2, false)
+			if !ok {
+				decoded.Valid = false
+			} else {
+				decoded.Functions = append(decoded.Functions, callable)
+			}
 		}
 	})
+	decoded.Valid = decoded.Valid && valid
+	if !decoded.Valid {
+		return kotlinBinaryMetadata{Schema: schema}
+	}
 	return decoded
+}
+
+func supportedKotlinMetadataVersion(version []int) bool {
+	_, ok := kotlinMetadataSchemaFor(&classfile.KotlinMetadata{MetadataVersion: version})
+	return ok
+}
+
+func kotlinMetadataSchemaFor(metadata *classfile.KotlinMetadata) (kotlinMetadataSchema, bool) {
+	if metadata == nil || len(metadata.MetadataVersion) < 2 {
+		return kotlinMetadataSchema{}, false
+	}
+	major, minor := metadata.MetadataVersion[0], metadata.MetadataVersion[1]
+	// These are the schema families whose field layout this decoder knows.
+	// A newer minor can add/reinterpret fields just as a new major can; reject
+	// both until a fixture for that schema is added. Patch releases do not alter
+	// protobuf layout.
+	switch major {
+	case 1:
+		if minor >= 0 && minor <= 9 {
+			return kotlinMetadataSchema{Major: major, Minor: minor}, true
+		}
+	case 2:
+		if minor >= 0 && minor <= 2 {
+			return kotlinMetadataSchema{Major: major, Minor: minor}, true
+		}
+	}
+	return kotlinMetadataSchema{Major: major, Minor: minor}, false
 }
 
 func decodeKotlinMetadataBytes(data []string) []byte {
@@ -95,13 +145,14 @@ func decodeKotlinMetadataBytes(data []string) []byte {
 	return decoded
 }
 
-func decodeKotlinCallable(message []byte, stringsTable []string, constructor bool) kotlinMetadataCallable {
+func decodeKotlinCallable(message []byte, stringsTable []string, constructor bool) (kotlinMetadataCallable, bool) {
 	callable := kotlinMetadataCallable{}
+	semanticValid := true
 	flags, hasCurrentFlags := uint64(6), false
 	if constructor {
 		callable.Name = "<init>"
 	}
-	protobufFields(message, func(number int, wire int, integer uint64, value []byte) {
+	structuralValid := protobufFieldsStrict(message, func(number int, wire int, integer uint64, value []byte) {
 		switch {
 		case number == 9 && wire == 0:
 			flags, hasCurrentFlags = integer, true
@@ -110,55 +161,80 @@ func decodeKotlinCallable(message []byte, stringsTable []string, constructor boo
 		case !constructor && number == 2 && wire == 0:
 			callable.Name = kotlinMetadataString(stringsTable, integer)
 		case !constructor && number == 3 && wire == 2:
-			callable.ReturnType = decodeKotlinMetadataType(value)
+			var valid bool
+			callable.ReturnType, valid = decodeKotlinMetadataType(value)
+			semanticValid = semanticValid && valid
 		case constructor && number == 2 && wire == 2, !constructor && number == 6 && wire == 2:
-			callable.Parameters = append(callable.Parameters, decodeKotlinMetadataParameter(value, stringsTable))
+			parameter, ok := decodeKotlinMetadataParameter(value, stringsTable)
+			semanticValid = semanticValid && ok
+			callable.Parameters = append(callable.Parameters, parameter)
 		case !constructor && (number == 5 && wire == 2 || number == 8 && wire == 0):
 			callable.Receiver = true
 		case !constructor && number == 100 && wire == 2:
-			protobufFields(value, func(field int, fieldWire int, fieldInteger uint64, _ []byte) {
+			if !protobufFieldsStrict(value, func(field int, fieldWire int, fieldInteger uint64, _ []byte) {
 				if field == 1 && fieldWire == 0 {
 					callable.JVMName = kotlinMetadataString(stringsTable, fieldInteger)
 				}
-			})
+			}) {
+				semanticValid = false
+			}
 		}
 	})
 	callable.Visibility = kotlinMetadataVisibility(flags)
-	return callable
+	if !constructor && callable.Name == "" {
+		semanticValid = false
+	}
+	return callable, structuralValid && semanticValid
 }
 
-func decodeKotlinMetadataParameter(message []byte, stringsTable []string) kotlinMetadataParameter {
+func decodeKotlinMetadataParameter(message []byte, stringsTable []string) (kotlinMetadataParameter, bool) {
 	parameter := kotlinMetadataParameter{}
-	protobufFields(message, func(number int, wire int, integer uint64, value []byte) {
+	semanticValid := true
+	valid := protobufFieldsStrict(message, func(number int, wire int, integer uint64, value []byte) {
 		switch {
 		case number == 1 && wire == 0:
 			parameter.HasDefault = integer&2 != 0
 		case number == 2 && wire == 0:
 			parameter.Name = kotlinMetadataString(stringsTable, integer)
 		case number == 3 && wire == 2:
-			parameter.Type = decodeKotlinMetadataType(value)
+			var typeValid bool
+			parameter.Type, typeValid = decodeKotlinMetadataType(value)
+			semanticValid = semanticValid && typeValid
 		}
 	})
-	return parameter
+	return parameter, valid && semanticValid && parameter.Name != ""
 }
 
-func decodeKotlinMetadataType(message []byte) kotlinMetadataType {
+func decodeKotlinMetadataType(message []byte) (kotlinMetadataType, bool) {
+	work := 0
+	return decodeKotlinMetadataTypeAt(message, 0, &work)
+}
+
+func decodeKotlinMetadataTypeAt(message []byte, depth int, work *int) (kotlinMetadataType, bool) {
+	if depth > 64 || *work >= 4096 {
+		return kotlinMetadataType{}, false
+	}
+	*work++
 	typ := kotlinMetadataType{Present: len(message) > 0}
-	protobufFields(message, func(number int, wire int, integer uint64, value []byte) {
+	semanticValid := true
+	structuralValid := protobufFieldsStrict(message, func(number int, wire int, integer uint64, value []byte) {
 		switch {
 		case number == 3 && wire == 0:
 			typ.Nullable = integer != 0
 		case number == 2 && wire == 2:
 			argument := kotlinMetadataType{}
-			protobufFields(value, func(argumentField int, argumentWire int, _ uint64, argumentValue []byte) {
+			argumentValid := protobufFieldsStrict(value, func(argumentField int, argumentWire int, _ uint64, argumentValue []byte) {
 				if argumentField == 2 && argumentWire == 2 {
-					argument = decodeKotlinMetadataType(argumentValue)
+					var valid bool
+					argument, valid = decodeKotlinMetadataTypeAt(argumentValue, depth+1, work)
+					semanticValid = semanticValid && valid
 				}
 			})
+			semanticValid = semanticValid && argumentValid
 			typ.Arguments = append(typ.Arguments, argument)
 		}
 	})
-	return typ
+	return typ, structuralValid && semanticValid
 }
 
 func kotlinMetadataVisibility(flags uint64) string {
@@ -184,10 +260,14 @@ func kotlinMetadataString(table []string, index uint64) string {
 }
 
 func protobufFields(message []byte, visit func(number int, wire int, integer uint64, value []byte)) {
+	_ = protobufFieldsStrict(message, visit)
+}
+
+func protobufFieldsStrict(message []byte, visit func(number int, wire int, integer uint64, value []byte)) bool {
 	for offset := 0; offset < len(message); {
 		tag, size := protobufVarint(message[offset:])
-		if size == 0 {
-			return
+		if size == 0 || tag>>3 == 0 {
+			return false
 		}
 		offset += size
 		number, wire := int(tag>>3), int(tag&7)
@@ -195,20 +275,20 @@ func protobufFields(message []byte, visit func(number int, wire int, integer uin
 		case 0:
 			integer, length := protobufVarint(message[offset:])
 			if length == 0 {
-				return
+				return false
 			}
 			offset += length
 			visit(number, wire, integer, nil)
 		case 1:
 			if offset+8 > len(message) {
-				return
+				return false
 			}
 			visit(number, wire, 0, message[offset:offset+8])
 			offset += 8
 		case 2:
 			length, prefix := protobufVarint(message[offset:])
 			if prefix == 0 || length > uint64(len(message)-offset-prefix) {
-				return
+				return false
 			}
 			offset += prefix
 			value := message[offset : offset+int(length)]
@@ -216,14 +296,15 @@ func protobufFields(message []byte, visit func(number int, wire int, integer uin
 			visit(number, wire, 0, value)
 		case 5:
 			if offset+4 > len(message) {
-				return
+				return false
 			}
 			visit(number, wire, 0, message[offset:offset+4])
 			offset += 4
 		default:
-			return
+			return false
 		}
 	}
+	return true
 }
 
 func protobufVarint(data []byte) (uint64, int) {
@@ -240,12 +321,22 @@ func protobufVarint(data []byte) (uint64, int) {
 	return 0, 0
 }
 
-func applyKotlinBinaryMetadata(parsed *analysis.ParsedFile, class *classfile.Class) {
+func applyKotlinBinaryMetadata(parsed *analysis.ParsedFile, class *classfile.Class) error {
 	metadata := class.KotlinMetadata
 	if metadata == nil {
-		return
+		return nil
+	}
+	schema, supported := kotlinMetadataSchemaFor(metadata)
+	if !supported {
+		return fmt.Errorf("unsupported Kotlin metadata schema %v", metadata.MetadataVersion)
 	}
 	decoded := decodeKotlinBinaryMetadata(metadata)
+	if !decoded.Valid {
+		// The bytecode declarations remain authoritative Java-visible symbols.
+		// Do not manufacture Kotlin properties/defaults/nullability from an
+		// unknown or malformed metadata schema.
+		return fmt.Errorf("malformed Kotlin metadata schema %d.%d", schema.Major, schema.Minor)
+	}
 	ownerFQN := strings.ReplaceAll(strings.ReplaceAll(class.InternalName, "/", "."), "$", ".")
 	ownerID := ""
 	for index := range parsed.Symbols {
@@ -276,7 +367,7 @@ func applyKotlinBinaryMetadata(parsed *analysis.ParsedFile, class *classfile.Cla
 		}
 	}
 	if metadata.Kind != 2 && metadata.Kind != 5 {
-		return
+		return nil
 	}
 	for index := range parsed.Symbols {
 		if parsed.Symbols[index].ContainerID == ownerID || parsed.Symbols[index].ID == ownerID {
@@ -344,7 +435,10 @@ func applyKotlinBinaryMetadata(parsed *analysis.ParsedFile, class *classfile.Cla
 			break
 		}
 	}
-	appendKotlinFileProperties(parsed, ownerID, packageName)
+	// Properties/type aliases require their actual metadata records. Bean-name
+	// reconstruction is intentionally not used as a substitute: arbitrary Java
+	// accessors are not proof of Kotlin source properties.
+	return nil
 }
 
 func applyKotlinCallableParameters(symbols []analysis.Symbol, ownerID, name string, callable kotlinMetadataCallable, constructor bool) {
@@ -516,52 +610,6 @@ func topLevelGenericArgumentRanges(value string, start, end int) [][2]int {
 	return ranges
 }
 
-func appendKotlinFileProperties(parsed *analysis.ParsedFile, ownerID, packageName string) {
-	existing := make(map[string]bool)
-	setters := make(map[string]bool)
-	for _, symbol := range parsed.Symbols {
-		if symbol.ContainerID == "" && symbol.Kind == analysis.KindProperty {
-			existing[symbol.Name] = true
-		}
-		if symbol.ContainerID == ownerID && symbol.Kind == analysis.KindMethod && strings.HasPrefix(symbol.Name, "set") && len(symbol.Parameters) == 1 {
-			if name, ok := decapitalizeBean(strings.TrimPrefix(symbol.Name, "set")); ok {
-				setters[name] = true
-			}
-		}
-	}
-	initial := len(parsed.Symbols)
-	for index := 0; index < initial; index++ {
-		getter := parsed.Symbols[index]
-		if getter.ContainerID != ownerID || getter.Kind != analysis.KindMethod || len(getter.Parameters) != 0 {
-			continue
-		}
-		name, ok := javaBeanGetterName(getter)
-		if !ok || existing[name] {
-			continue
-		}
-		existing[name] = true
-		property := getter
-		property.ID = getter.ID + "#kotlin-top-level-property"
-		property.OriginID = getter.ID
-		property.Name, property.Kind = name, analysis.KindProperty
-		property.Language, property.InteropLanguage = analysis.LanguageKotlin, analysis.LanguageKotlin
-		property.ContainerID, property.ContainerName = "", ""
-		property.Package = packageName
-		property.FQN = name
-		if packageName != "" {
-			property.FQN = packageName + "." + name
-		}
-		property.Type = kotlinizeBinaryType(property.Type)
-		property.Parameters = nil
-		property.Modifiers = []string{"val"}
-		if setters[name] {
-			property.Modifiers = []string{"var"}
-		}
-		property.Signature = property.Modifiers[0] + " " + name + ": " + property.Type
-		parsed.Symbols = append(parsed.Symbols, property)
-	}
-}
-
 func isContinuationType(value string) bool {
 	base, _ := splitInstantiatedType(value)
 	return simpleType(base) == "Continuation"
@@ -585,36 +633,43 @@ func kotlinizeBinaryType(value string) string {
 	if value == "" {
 		return value
 	}
-	value = kotlinBinaryTypeReplacer.Replace(value)
-	words := map[string]string{"byte": "Byte", "short": "Short", "int": "Int", "long": "Long", "float": "Float", "double": "Double", "boolean": "Boolean", "char": "Char", "void": "Unit"}
+	value = strings.ReplaceAll(strings.ReplaceAll(value, "? extends ", "out "), "? super ", "in ")
 	var result strings.Builder
 	for index := 0; index < len(value); {
-		if !isIdentRune(rune(value[index])) {
+		if !isBinaryTypeTokenByte(value[index]) {
 			result.WriteByte(value[index])
 			index++
 			continue
 		}
 		end := index + 1
-		for end < len(value) && isIdentRune(rune(value[end])) {
+		for end < len(value) && isBinaryTypeTokenByte(value[end]) {
 			end++
 		}
-		word := value[index:end]
-		if replacement := words[word]; replacement != "" {
-			word = replacement
+		token := value[index:end]
+		if replacement := kotlinBinaryTypeAliases[token]; replacement != "" {
+			token = replacement
 		}
-		result.WriteString(word)
+		result.WriteString(token)
 		index = end
 	}
 	return result.String()
 }
 
-var kotlinBinaryTypeReplacer = strings.NewReplacer(
-	"java.lang.String", "String", "java.lang.Object", "Any", "java.lang.Boolean", "Boolean",
-	"java.lang.Byte", "Byte", "java.lang.Short", "Short", "java.lang.Integer", "Int",
-	"java.lang.Long", "Long", "java.lang.Float", "Float", "java.lang.Double", "Double",
-	"java.lang.Character", "Char", "java.lang.Void", "Unit", "java.util.List", "List",
-	"java.util.Set", "Set", "java.util.Map", "Map", "? extends ", "out ", "? super ", "in ",
-)
+func isBinaryTypeTokenByte(value byte) bool {
+	return value == '_' || value == '$' || value == '.' || value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
+}
+
+var kotlinBinaryTypeAliases = map[string]string{
+	"byte": "Byte", "short": "Short", "int": "Int", "long": "Long",
+	"float": "Float", "double": "Double", "boolean": "Boolean", "char": "Char", "void": "Unit",
+	"java.lang.String": "String", "java.lang.Object": "Any", "java.lang.Boolean": "Boolean",
+	"java.lang.Byte": "Byte", "java.lang.Short": "Short", "java.lang.Integer": "Int",
+	"java.lang.Long": "Long", "java.lang.Float": "Float", "java.lang.Double": "Double",
+	"java.lang.Character": "Char", "java.lang.Void": "Unit", "java.lang.CharSequence": "CharSequence",
+	"java.lang.Number": "Number", "java.lang.Throwable": "Throwable",
+	"java.util.Collection": "Collection", "java.util.List": "List", "java.util.Set": "Set", "java.util.Map": "Map",
+	"java.lang.Iterable": "Iterable",
+}
 
 // KotlinDisplayType renders a JVM/Java type using the concise Kotlin spelling
 // used by cross-language signature help while preserving nested nullability.

@@ -5,12 +5,21 @@ import (
 	"strings"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
+	"github.com/shinyvision/kotlsp/internal/lexical"
 )
 
 func (i *Index) typeOfNameLocked(file *analysis.ParsedFile, name string, at int) string {
 	if name == "this" || name == "super" {
 		if enclosing := i.enclosingTypeLocked(file, at); enclosing.ID != "" {
-			if name == "super" && len(enclosing.Supertypes) > 0 {
+			if name == "super" {
+				// An unqualified Kotlin super expression is ambiguous when the
+				// declaration has more than one direct supertype. Java has one
+				// superclass plus interfaces, but the syntax model does not retain
+				// enough information to distinguish those here. Abstain rather than
+				// choosing whichever declaration happened to be indexed first.
+				if len(enclosing.Supertypes) != 1 {
+					return ""
+				}
 				return simpleType(enclosing.Supertypes[0])
 			}
 			return enclosing.Name
@@ -25,16 +34,15 @@ func (i *Index) typeOfNameLocked(file *analysis.ParsedFile, name string, at int)
 				nonNullSmartCast = true
 			} else if !seenSmartCasts[smartCast.Type] {
 				seenSmartCasts[smartCast.Type] = true
-				if bestSmartCast != "" {
-					bestSmartCast += " & "
+				if bestSmartCast == "" {
+					bestSmartCast = smartCast.Type
+				} else {
+					// Every fact in scope holds at once: `value is A && value is B`
+					// refines to the intersection, which the hierarchy walk
+					// understands through splitIntersectionTypes.
+					bestSmartCast += " & " + smartCast.Type
 				}
-				bestSmartCast += smartCast.Type
 			}
-		}
-	}
-	if bestSmartCast != "" {
-		if bestSmartCast != "!" {
-			return bestSmartCast
 		}
 	}
 	best := ""
@@ -57,8 +65,12 @@ func (i *Index) typeOfNameLocked(file *analysis.ParsedFile, name string, at int)
 		}
 		break
 	}
+	stableSmartCast := bestSymbol != nil && i.kotlinSmartCastStableLocked(file, *bestSymbol, at)
+	if stableSmartCast && bestSmartCast != "" {
+		return bestSmartCast
+	}
 	if best != "" {
-		if nonNullSmartCast {
+		if stableSmartCast && nonNullSmartCast {
 			return strings.TrimSuffix(strings.TrimSpace(best), "?")
 		}
 		return best
@@ -68,10 +80,35 @@ func (i *Index) typeOfNameLocked(file *analysis.ParsedFile, name string, at int)
 			return contextual
 		}
 	}
-	if symbols := i.resolveTypeSymbolsLocked(file, name); len(symbols) > 0 {
+	if symbols := i.resolveTypeSymbolsAtLocked(file, name, at); len(symbols) == 1 {
 		return symbols[0].FQN
 	}
 	return ""
+}
+
+// kotlinSmartCastStableLocked enforces the part of Kotlin's stability contract
+// the fast model can prove. Parameters and local vals are immutable bindings;
+// mutable locals, properties/getters, fields, and unresolved writes abstain.
+// This deliberately narrows the optimization instead of pretending that a
+// syntax span is a complete control-flow/stability proof.
+func (i *Index) kotlinSmartCastStableLocked(file *analysis.ParsedFile, symbol analysis.Symbol, at int) bool {
+	if file.Language != analysis.LanguageKotlin || symbol.URI != file.URI || at < symbol.StartByte {
+		return false
+	}
+	stableBinding := symbol.Kind == analysis.KindParameter || symbol.Kind == analysis.KindVariable && containsString(symbol.Modifiers, "val")
+	if !stableBinding {
+		return false
+	}
+	for _, reference := range file.References {
+		if reference.Role != analysis.RoleWrite || reference.Name != symbol.Name || reference.StartByte <= symbol.StartByte || reference.StartByte >= at {
+			continue
+		}
+		resolved := i.resolveLocked(file, reference)
+		if len(resolved) != 1 || resolved[0].ID == symbol.ID {
+			return false
+		}
+	}
+	return true
 }
 
 func (i *Index) inferredConventionBindingTypeLocked(file *analysis.ParsedFile, symbol analysis.Symbol) string {
@@ -99,6 +136,40 @@ func (i *Index) inferredConventionBindingTypeLocked(file *analysis.ParsedFile, s
 }
 
 func (i *Index) inferExpressionTypeLocked(file *analysis.ParsedFile, expression string, at int) string {
+	return i.inferExpressionResultLocked(file, expression, at).Type
+}
+
+// inferExpressionResultLocked exposes whether the measured syntax fast path
+// proved a type or merely derived a conservative candidate. Callers which can
+// mutate source or choose one overload may require inferenceExact; ordinary
+// display features can use a conservative result. Unknown syntax remains an
+// explicit abstention for the background compiler rather than fabricated Any.
+func (i *Index) inferExpressionResultLocked(file *analysis.ParsedFile, expression string, at int) inferredExpressionType {
+	return i.inferExpressionResultDepthLocked(file, expression, at, 0)
+}
+
+func (i *Index) inferExpressionResultDepthLocked(file *analysis.ParsedFile, expression string, at, depth int) inferredExpressionType {
+	ir := parseExpressionIR(expression, file.Language)
+	if (ir.Kind == expressionBinary || ir.Kind == expressionUnary) && operatorTypable(ir.Operator) {
+		// Operator expressions are typed from their operands: the language's
+		// numeric promotion and boolean/string rules are the proof, so the
+		// textual fast paths (which would read `f(1) + 2` as `f(1)`) never see
+		// them. Anything the rules do not cover abstains.
+		return i.inferOperatorExpressionLocked(file, ir, at, depth)
+	}
+	typ := i.inferExpressionTypeValueLocked(file, expression, at)
+	if typ == "" {
+		return inferredExpressionType{Expression: ir}
+	}
+	confidence := inferenceConservative
+	switch ir.Kind {
+	case expressionLiteral, expressionCast:
+		confidence = inferenceExact
+	}
+	return inferredExpressionType{Type: typ, Confidence: confidence, Expression: ir}
+}
+
+func (i *Index) inferExpressionTypeValueLocked(file *analysis.ParsedFile, expression string, at int) string {
 	expression = strings.TrimSpace(strings.TrimSuffix(expression, ";"))
 	expression = unwrapEnclosingParentheses(expression)
 	if file.Language == analysis.LanguageKotlin {
@@ -111,26 +182,7 @@ func (i *Index) inferExpressionTypeLocked(file *analysis.ParsedFile, expression 
 				}
 			}
 			if delegateType := i.inferExpressionTypeLocked(file, delegate, at); delegateType != "" {
-				for _, instantiated := range i.instantiatedTypeHierarchyLocked(file, delegateType) {
-					owner, arguments := instantiated.symbol, instantiated.arguments
-					for _, id := range i.byContainerMember[memberKey(owner.Name, "getValue")] {
-						getter := i.symbols[id]
-						if getter.ContainerID == owner.ID && analysis.IsCallableKind(getter.Kind) && getter.Type != "" && i.accessibleLocked(file, *getter, at) {
-							return substituteTypeParameters(getter.Type, owner.TypeParameters, arguments)
-						}
-					}
-				}
-				for _, container := range i.typeAndSupertypesLocked(file, delegateType) {
-					for _, id := range i.byReceiverMember[memberKey(container, "getValue")] {
-						getter := i.symbols[id]
-						if getter.Type == "" || !analysis.IsCallableKind(getter.Kind) || !i.accessibleLocked(file, *getter, at) || !i.extensionVisibleLocked(file, *getter, at) {
-							continue
-						}
-						if bindings, applicable := i.extensionReceiverBindingsLocked(file, *getter, delegateType); applicable {
-							return substituteTypeBindings(getter.Type, bindings)
-						}
-					}
-				}
+				return i.memberResultTypeLocked(file, delegateType, "getValue", at)
 			}
 		}
 		if inferred := i.inferKotlinCompositeExpressionLocked(file, expression, at); inferred != "" {
@@ -148,9 +200,15 @@ func (i *Index) inferExpressionTypeLocked(file *analysis.ParsedFile, expression 
 				parameterTypes := make([]string, 0)
 				for _, parameter := range splitTopLevelExpressions(parameters, ',') {
 					if colon := strings.LastIndexByte(parameter, ':'); colon >= 0 {
-						parameterTypes = append(parameterTypes, strings.TrimSpace(parameter[colon+1:]))
+						typ := strings.TrimSpace(parameter[colon+1:])
+						if typ == "" {
+							return ""
+						}
+						parameterTypes = append(parameterTypes, typ)
 					} else if parameter != "" {
-						parameterTypes = append(parameterTypes, "Any")
+						// Untyped lambda parameters are contextual. Inventing Any here
+						// poisons overload selection and refactoring evidence.
+						return ""
 					}
 				}
 				return "(" + strings.Join(parameterTypes, ", ") + ") -> " + result
@@ -158,17 +216,31 @@ func (i *Index) inferExpressionTypeLocked(file *analysis.ParsedFile, expression 
 		}
 		if strings.HasPrefix(expression, "::") {
 			name := strings.Trim(strings.TrimSpace(strings.TrimPrefix(expression, "::")), "`")
+			var resolved string
+			matches := 0
 			for _, id := range i.byName[name] {
 				callable := i.symbols[id]
-				if !analysis.IsCallableKind(callable.Kind) || callable.Type == "" || !i.accessibleLocked(file, *callable, at) {
+				if !analysis.IsCallableKind(callable.Kind) || callable.Type == "" || !i.accessibleLocked(file, *callable, at) || !i.simpleNameInScopeLocked(file, *callable) {
 					continue
 				}
 				parameterTypes := make([]string, 0, len(callable.Parameters))
 				for _, parameter := range callable.Parameters {
+					if parameter.Type == "" {
+						parameterTypes = nil
+						break
+					}
 					parameterTypes = append(parameterTypes, parameter.Type)
 				}
-				return "(" + strings.Join(parameterTypes, ", ") + ") -> " + callable.Type
+				if parameterTypes == nil {
+					continue
+				}
+				resolved = "(" + strings.Join(parameterTypes, ", ") + ") -> " + callable.Type
+				matches++
+				if matches > 1 {
+					return ""
+				}
 			}
+			return resolved
 		}
 	} else if inferred := i.inferJavaCompositeExpressionLocked(file, expression, at); inferred != "" {
 		return inferred
@@ -207,7 +279,7 @@ func (i *Index) inferExpressionTypeLocked(file *analysis.ParsedFile, expression 
 			return "char"
 		}
 		return "Char"
-	case numericExpression(expression):
+	case numericExpression(expression, file.Language == analysis.LanguageKotlin):
 		if strings.ContainsAny(expression, ".eEfFdD") {
 			if file.Language == analysis.LanguageJava {
 				return "double"
@@ -228,18 +300,44 @@ func (i *Index) inferExpressionTypeLocked(file *analysis.ParsedFile, expression 
 	if strings.HasPrefix(expression, "new ") {
 		expression = strings.TrimSpace(strings.TrimPrefix(expression, "new "))
 	}
+	if firstTopLevelIndexOpen(expression) > 0 && strings.HasSuffix(expression, "]") || file.Language == analysis.LanguageKotlin && strings.HasSuffix(expression, "::class") {
+		// Indexed access and class literals are member-chain forms the
+		// expression typer already proves through operator/get lookups.
+		return i.typeOfExpressionLocked(file, expression, at)
+	}
 	open := strings.IndexByte(expression, '(')
 	if open < 0 {
 		if !strings.ContainsAny(expression, " +-*/%?:[]{}") {
 			if !strings.Contains(expression, ".") {
-				return i.declaredTypeOfNameLocked(file, expression, at)
+				// A name can have an inferred type (for example `val repository =
+				// factory()`). Qualified resolution uses this expression path, so
+				// consulting only explicit declarations made completion understand
+				// the receiver while go-to-definition silently lost it. The lexical
+				// lookup excludes a declaration from its own initializer through its
+				// scope bounds, which also prevents recursive self-inference.
+				return i.typeOfNameLocked(file, expression, at)
 			}
 			return i.typeOfExpressionLocked(file, expression, at)
 		}
 		return ""
 	}
+	close := callClosingParen(expression, open)
+	if close >= len(expression) {
+		// callClosingParen intentionally returns len on malformed input so its
+		// low-level callers can avoid negative slices. A type proof, however,
+		// must not treat an unterminated invocation as a real call.
+		return ""
+	}
+	if chain := splitTopLevelMemberChain(expression); len(chain) > 1 {
+		return i.typeOfExpressionLocked(file, expression, at)
+	}
 	callee := strings.TrimSpace(expression[:open])
+	calleeQualifier := ""
 	if dot := strings.LastIndexByte(callee, '.'); dot >= 0 {
+		// `Context().apply { }` names an extension or member through its
+		// receiver; resolving the callee as an unqualified name would rank every
+		// `apply` in the universe instead of the receiver's own candidates.
+		calleeQualifier = strings.TrimSuffix(strings.TrimSpace(callee[:dot]), "?")
 		callee = callee[dot+1:]
 	}
 	callee = strings.Trim(callee, "`")
@@ -260,37 +358,50 @@ func (i *Index) inferExpressionTypeLocked(file *analysis.ParsedFile, expression 
 		}
 		break
 	}
-	callValues := splitTopLevelCallArguments(expression[open+1 : callClosingParen(expression, open)])
-	switch base {
-	case "listOf", "emptyList":
-		return kotlinCollectionFactoryType(i, file, "List", explicitArguments, callValues, at)
-	case "mutableListOf":
-		return kotlinCollectionFactoryType(i, file, "MutableList", explicitArguments, callValues, at)
-	case "setOf", "emptySet":
-		return kotlinCollectionFactoryType(i, file, "Set", explicitArguments, callValues, at)
-	case "mutableSetOf":
-		return kotlinCollectionFactoryType(i, file, "MutableSet", explicitArguments, callValues, at)
-	case "mapOf", "emptyMap":
-		return i.kotlinMapFactoryTypeLocked(file, "Map", explicitArguments, callValues, at)
-	case "mutableMapOf":
-		return i.kotlinMapFactoryTypeLocked(file, "MutableMap", explicitArguments, callValues, at)
-	case "arrayOf":
-		return kotlinCollectionFactoryType(i, file, "Array", explicitArguments, callValues, at)
+	callValues := splitTopLevelCallArguments(expression[open+1 : close])
+	callCandidates := i.resolveLocked(file, analysis.Reference{
+		Name:        base,
+		Qualifier:   calleeQualifier,
+		URI:         file.URI,
+		StartByte:   at,
+		EndByte:     at + len(base),
+		ContainerID: i.containerIDAtLocked(file, at),
+		Role:        analysis.RoleCall,
+		Arity:       len(callValues),
+	})
+	if i.kotlinCollectionFactoryAvailableLocked(base, callCandidates) {
+		switch base {
+		case "listOf", "emptyList":
+			return kotlinCollectionFactoryType(i, file, "List", explicitArguments, callValues, at)
+		case "mutableListOf":
+			return kotlinCollectionFactoryType(i, file, "MutableList", explicitArguments, callValues, at)
+		case "setOf", "emptySet":
+			return kotlinCollectionFactoryType(i, file, "Set", explicitArguments, callValues, at)
+		case "mutableSetOf":
+			return kotlinCollectionFactoryType(i, file, "MutableSet", explicitArguments, callValues, at)
+		case "mapOf", "emptyMap":
+			return i.kotlinMapFactoryTypeLocked(file, "Map", explicitArguments, callValues, at)
+		case "mutableMapOf":
+			return i.kotlinMapFactoryTypeLocked(file, "MutableMap", explicitArguments, callValues, at)
+		case "arrayOf":
+			return kotlinCollectionFactoryType(i, file, "Array", explicitArguments, callValues, at)
+		}
 	}
-	if types := i.resolveTypeSymbolsLocked(file, base); len(types) > 0 {
+	if types := i.resolveTypeSymbolsAtLocked(file, base, at); len(types) == 1 && constructibleTypeForInference(types[0], file.Language) && callCandidatesPermitConstructor(callCandidates) {
 		owner := types[0]
 		arguments := explicitArguments
 		if len(arguments) == 0 && len(owner.TypeParameters) > 0 {
-			callArguments := splitTopLevelCallArguments(expression[open+1 : callClosingParen(expression, open)])
+			callArguments := callValues
 			constructorOwners := []analysis.Symbol{owner}
 			if owner.Kind == analysis.KindTypeAlias && owner.Type != "" {
 				underlying, _ := splitInstantiatedType(owner.Type)
-				constructorOwners = append(constructorOwners, i.resolveTypeSymbolsLocked(file, underlying)...)
+				constructorOwners = append(constructorOwners, i.resolveTypeSymbolsAtLocked(file, underlying, at)...)
 			}
+			matchingConstructors := 0
 			for _, constructorOwner := range constructorOwners {
-				for _, id := range i.byContainerMember[memberKey(constructorOwner.Name, constructorOwner.Name)] {
+				for _, id := range i.byContainerMember[memberKey(constructorOwner.ID, constructorOwner.Name)] {
 					constructor := i.symbols[id]
-					if constructor.Kind != analysis.KindConstructor || constructor.ContainerID != constructorOwner.ID {
+					if constructor.Kind != analysis.KindConstructor || constructor.ContainerID != constructorOwner.ID || !i.accessibleLocked(file, *constructor, at) || !matchesArityForLanguage(*constructor, len(callArguments), file.Language) {
 						continue
 					}
 					inferred := make(map[string]string)
@@ -299,22 +410,28 @@ func (i *Index) inferExpressionTypeLocked(file *analysis.ParsedFile, expression 
 							break
 						}
 						actual := i.inferExpressionTypeLocked(file, callArguments[index], at)
-						inferTypeParameterBindings(parameter.Type, actual, owner.TypeParameters, inferred)
+						i.inferTypeParameterBindingsLocked(file, parameter.Type, actual, owner.TypeParameters, inferred)
 					}
+					candidateArguments := make([]string, 0, len(owner.TypeParameters))
 					for _, typeParameter := range owner.TypeParameters {
 						if inferred[typeParameter] == "" {
-							arguments = nil
+							candidateArguments = nil
 							break
 						}
-						arguments = append(arguments, inferred[typeParameter])
+						candidateArguments = append(candidateArguments, inferred[typeParameter])
 					}
-					if len(arguments) > 0 {
-						break
+					if len(candidateArguments) == 0 {
+						continue
 					}
+					matchingConstructors++
+					if matchingConstructors > 1 {
+						return ""
+					}
+					arguments = candidateArguments
 				}
-				if len(arguments) > 0 {
-					break
-				}
+			}
+			if matchingConstructors != 1 {
+				return ""
 			}
 		}
 		if len(arguments) > 0 {
@@ -322,50 +439,88 @@ func (i *Index) inferExpressionTypeLocked(file *analysis.ParsedFile, expression 
 		}
 		return owner.Name
 	}
-	for _, id := range i.byName[base] {
-		candidate := i.symbols[id]
-		if !i.accessibleLocked(file, *candidate, at) {
-			continue
-		}
-		if analysis.IsTypeKind(candidate.Kind) {
-			return candidate.Name
-		}
-		if analysis.IsCallableKind(candidate.Kind) && candidate.Type != "" {
-			result := candidate.Type
-			if len(candidate.TypeParameters) > 0 {
-				arguments := explicitArguments
-				if len(arguments) == 0 {
-					values := splitTopLevelCallArguments(expression[open+1 : callClosingParen(expression, open)])
-					inferred := make(map[string]string, len(candidate.TypeParameters))
-					for parameterIndex, parameter := range candidate.Parameters {
-						if parameterIndex >= len(values) {
-							break
-						}
-						actual := i.inferExpressionTypeLocked(file, values[parameterIndex], at)
-						inferTypeParameterBindings(parameter.Type, actual, candidate.TypeParameters, inferred)
-					}
-					for _, parameter := range candidate.TypeParameters {
-						if inferred[parameter] == "" {
-							arguments = nil
-							break
-						}
-						arguments = append(arguments, inferred[parameter])
-					}
-				}
-				result = substituteTypeParameters(result, candidate.TypeParameters, arguments)
+	if len(callCandidates) != 1 || !analysis.IsCallableKind(callCandidates[0].Kind) || callCandidates[0].Type == "" {
+		return ""
+	}
+	candidate := callCandidates[0]
+	result := candidate.Type
+	if len(candidate.TypeParameters) == 0 {
+		return result
+	}
+	arguments := explicitArguments
+	if len(arguments) == 0 {
+		inferred := make(map[string]string, len(candidate.TypeParameters))
+		for parameterIndex, parameter := range candidate.Parameters {
+			if parameterIndex >= len(callValues) {
+				break
 			}
-			return result
+			actual := i.inferExpressionTypeLocked(file, callValues[parameterIndex], at)
+			i.inferTypeParameterBindingsLocked(file, parameter.Type, actual, candidate.TypeParameters, inferred)
+		}
+		for _, parameter := range candidate.TypeParameters {
+			if inferred[parameter] == "" {
+				return ""
+			}
+			arguments = append(arguments, inferred[parameter])
 		}
 	}
-	return ""
+	return substituteTypeParameters(result, candidate.TypeParameters, arguments)
+}
+
+func (i *Index) kotlinCollectionFactoryAvailableLocked(name string, candidates []analysis.Symbol) bool {
+	switch name {
+	case "listOf", "emptyList", "mutableListOf", "setOf", "emptySet", "mutableSetOf", "mapOf", "emptyMap", "mutableMapOf", "arrayOf":
+	default:
+		return false
+	}
+	// Keep useful built-in types when a small workspace has no indexed stdlib,
+	// but never let the spelling shortcut override a visible user declaration.
+	if len(candidates) == 0 {
+		return true
+	}
+	if len(candidates) != 1 {
+		return false
+	}
+	fqn := candidates[0].FQN
+	return fqn == "kotlin."+name || fqn == "kotlin.collections."+name
+}
+
+func callCandidatesPermitConstructor(candidates []analysis.Symbol) bool {
+	for _, candidate := range candidates {
+		if analysis.IsCallableKind(candidate.Kind) && candidate.Kind != analysis.KindConstructor {
+			return false
+		}
+	}
+	return true
+}
+
+func constructibleTypeForInference(symbol analysis.Symbol, language analysis.Language) bool {
+	switch symbol.Kind {
+	case analysis.KindClass, analysis.KindRecord, analysis.KindTypeAlias:
+		return true
+	case analysis.KindAnnotation:
+		return language == analysis.LanguageKotlin
+	default:
+		return false
+	}
 }
 
 func kotlinCollectionFactoryType(i *Index, file *analysis.ParsedFile, collection string, explicit, values []string, at int) string {
 	arguments := append([]string(nil), explicit...)
+	if len(arguments) > 1 {
+		return ""
+	}
 	if len(arguments) == 0 {
 		var element string
 		for _, value := range values {
-			element = i.commonExpressionTypeLocked(file, element, i.inferExpressionTypeLocked(file, value, at))
+			inferred := i.inferExpressionTypeLocked(file, value, at)
+			if inferred == "" {
+				return ""
+			}
+			element = i.commonExpressionTypeLocked(file, element, inferred)
+			if element == "" {
+				return ""
+			}
 		}
 		if element == "" {
 			element = "Nothing"
@@ -377,12 +532,25 @@ func kotlinCollectionFactoryType(i *Index, file *analysis.ParsedFile, collection
 
 func (i *Index) kotlinMapFactoryTypeLocked(file *analysis.ParsedFile, collection string, explicit, values []string, at int) string {
 	arguments := append([]string(nil), explicit...)
-	if len(arguments) < 2 {
+	if len(arguments) != 0 && len(arguments) != 2 {
+		return ""
+	}
+	if len(arguments) == 0 {
 		keyType, valueType := "", ""
 		for _, value := range values {
-			if separator := topLevelWordIndex(value, "to"); separator >= 0 {
-				keyType = i.commonExpressionTypeLocked(file, keyType, i.inferExpressionTypeLocked(file, value[:separator], at))
-				valueType = i.commonExpressionTypeLocked(file, valueType, i.inferExpressionTypeLocked(file, value[separator+len("to"):], at))
+			separator := topLevelWordIndex(value, "to")
+			if separator < 0 {
+				return ""
+			}
+			key := i.inferExpressionTypeLocked(file, value[:separator], at)
+			mapped := i.inferExpressionTypeLocked(file, value[separator+len("to"):], at)
+			if key == "" || mapped == "" {
+				return ""
+			}
+			keyType = i.commonExpressionTypeLocked(file, keyType, key)
+			valueType = i.commonExpressionTypeLocked(file, valueType, mapped)
+			if keyType == "" || valueType == "" {
+				return ""
 			}
 		}
 		if keyType == "" {
@@ -461,7 +629,12 @@ func (i *Index) inferKotlinCompositeExpressionLocked(file *analysis.ParsedFile, 
 		}
 	}
 	for _, name := range []string{"run", "with"} {
-		if !strings.HasPrefix(strings.TrimSpace(expression), name) {
+		trimmed := strings.TrimSpace(expression)
+		if !strings.HasPrefix(trimmed, name) {
+			continue
+		}
+		remainder := strings.TrimSpace(strings.TrimPrefix(trimmed, name))
+		if name == "with" && !strings.HasPrefix(remainder, "(") || name == "run" && !strings.HasPrefix(remainder, "{") && !strings.HasPrefix(remainder, "(") {
 			continue
 		}
 		brace := topLevelExpressionOperator(expression, "{")
@@ -476,7 +649,7 @@ func (i *Index) inferKotlinCompositeExpressionLocked(file *analysis.ParsedFile, 
 		receiver := ""
 		if name == "with" {
 			if open := strings.IndexByte(expression, '('); open >= 0 {
-				if end := callClosingParen(expression, open); end > open {
+				if end := callClosingParen(expression, open); end > open && end < len(expression) {
 					receiver = i.inferExpressionTypeLocked(file, expression[open+1:end], at)
 				}
 			}
@@ -568,25 +741,100 @@ func (i *Index) commonExpressionTypeLocked(file *analysis.ParsedFile, left, righ
 	if right == "" {
 		return left
 	}
-	if sameJvmType(left, right) {
-		if !strings.HasSuffix(left, "?") || !strings.HasSuffix(right, "?") {
-			return strings.TrimSuffix(left, "?")
+	nullable := file.Language == analysis.LanguageKotlin && (strings.HasSuffix(left, "?") || strings.HasSuffix(right, "?"))
+	leftBase, rightBase := strings.TrimSuffix(left, "?"), strings.TrimSuffix(right, "?")
+	applyNullability := func(value string) string {
+		value = strings.TrimSuffix(strings.TrimSpace(value), "?")
+		if nullable && value != "" && value != "Nothing" {
+			value += "?"
 		}
-		return left
+		return value
 	}
-	if i.isSubtypeLocked(file, left, right) {
-		return right
+	if file.Language == analysis.LanguageKotlin {
+		if simpleType(leftBase) == "Nothing" {
+			return applyNullability(rightBase)
+		}
+		if simpleType(rightBase) == "Nothing" {
+			return applyNullability(leftBase)
+		}
 	}
-	if i.isSubtypeLocked(file, right, left) {
-		return left
+	if identical, known := i.typesIdenticalAtLocked(file, leftBase, rightBase, -1); known && identical {
+		return applyNullability(leftBase)
 	}
-	if file.Language == analysis.LanguageJava {
-		return "Object"
+	leftOwners := i.instantiatedTypeHierarchyLocked(file, leftBase)
+	rightOwners := i.instantiatedTypeHierarchyLocked(file, rightBase)
+	type ownerAtDistance struct {
+		owner    instantiatedTypeOwner
+		distance int
 	}
-	return "Any"
+	rightByID := make(map[string][]ownerAtDistance, len(rightOwners))
+	for _, owner := range rightOwners {
+		previous := rightByID[owner.symbol.ID]
+		if len(previous) == 0 || owner.distance < previous[0].distance {
+			rightByID[owner.symbol.ID] = []ownerAtDistance{{owner: owner, distance: owner.distance}}
+		} else if owner.distance == previous[0].distance {
+			rightByID[owner.symbol.ID] = append(previous, ownerAtDistance{owner: owner, distance: owner.distance})
+		}
+	}
+	bestScore := int(^uint(0) >> 1)
+	bestName := ""
+	bestOwnerID := ""
+	bestAmbiguous := false
+	for _, owner := range leftOwners {
+		for _, rightOwner := range rightByID[owner.symbol.ID] {
+			score := owner.distance + rightOwner.distance
+			candidateName := commonInstantiatedOwnerName(file.Language, owner, rightOwner.owner)
+			if score < bestScore {
+				bestScore, bestName, bestOwnerID = score, candidateName, owner.symbol.ID
+				bestAmbiguous = false
+			} else if score == bestScore && (owner.symbol.ID != bestOwnerID || candidateName != bestName) {
+				// Multiple unrelated owners or distinct instantiations at the
+				// same graph distance require language variance/intersection
+				// rules. Traversal order is not a LUB proof.
+				bestAmbiguous = true
+			}
+		}
+	}
+	if bestScore != int(^uint(0)>>1) && !bestAmbiguous {
+		return applyNullability(bestName)
+	}
+	// Missing dependency graph data is an unknown, not proof that Object/Any is
+	// the least upper bound. Callers can abstain instead of exporting a broad,
+	// falsely precise type.
+	return ""
+}
+
+func commonInstantiatedOwnerName(language analysis.Language, left, right instantiatedTypeOwner) string {
+	name := left.symbol.FQN
+	if name == "" {
+		name = left.symbol.Name
+	}
+	if len(left.arguments) != len(right.arguments) || len(left.arguments) == 0 {
+		return name
+	}
+	arguments := make([]string, len(left.arguments))
+	for index := range arguments {
+		// Declaration-site variance is not available for every binary and
+		// source owner. Recursively LUB-ing invariant arguments invents an
+		// unsound List<Common>; preserve only exact arguments and otherwise use
+		// the language's explicit unknown projection.
+		if sameJvmType(left.arguments[index], right.arguments[index]) {
+			arguments[index] = left.arguments[index]
+		} else if language == analysis.LanguageKotlin {
+			arguments[index] = "*"
+		} else {
+			arguments[index] = "?"
+		}
+	}
+	return instantiatedTypeName(name, arguments)
 }
 
 func topLevelExpressionOperator(expression, operator string) int {
+	if strings.TrimSpace(operator) == operator {
+		if index := lexical.TopLevelTokenIndex(expression, operator, true); index >= 0 {
+			return index
+		}
+	}
 	parens, brackets, braces, angles := 0, 0, 0, 0
 	for index := 0; index+len(operator) <= len(expression); index++ {
 		if parens == 0 && brackets == 0 && braces == 0 && angles == 0 && strings.HasPrefix(expression[index:], operator) {
@@ -632,32 +880,7 @@ func topLevelWordIndex(expression, word string) int {
 }
 
 func splitTopLevelExpressions(expression string, separator byte) []string {
-	var out []string
-	start, parens, brackets, braces := 0, 0, 0, 0
-	for index := 0; index <= len(expression); index++ {
-		if index == len(expression) || expression[index] == separator && parens == 0 && brackets == 0 && braces == 0 {
-			if value := strings.TrimSpace(expression[start:index]); value != "" {
-				out = append(out, value)
-			}
-			start = index + 1
-			continue
-		}
-		switch expression[index] {
-		case '(':
-			parens++
-		case ')':
-			parens--
-		case '[':
-			brackets++
-		case ']':
-			brackets--
-		case '{':
-			braces++
-		case '}':
-			braces--
-		}
-	}
-	return out
+	return lexical.SplitTopLevel(expression, string(separator), true)
 }
 
 func unwrapExpressionBlock(expression string) string {
@@ -683,65 +906,19 @@ func (i *Index) declaredTypeOfNameLocked(file *analysis.ParsedFile, name string,
 }
 
 func callClosingParen(expression string, open int) int {
-	depth := 0
-	for index := open; index < len(expression); index++ {
-		switch expression[index] {
-		case '(':
-			depth++
-		case ')':
-			depth--
-			if depth == 0 {
-				return index
-			}
-		}
+	if close := lexical.MatchingDelimiter(expression, open, "(", ")", true); close >= 0 {
+		return close
 	}
 	return len(expression)
 }
 
 func splitTopLevelCallArguments(value string) []string {
-	start, parens, brackets, braces, angles := 0, 0, 0, 0, 0
-	var result []string
-	for index := 0; index <= len(value); index++ {
-		if index == len(value) || value[index] == ',' && parens == 0 && brackets == 0 && braces == 0 && angles == 0 {
-			if argument := strings.TrimSpace(value[start:index]); argument != "" {
-				result = append(result, argument)
-			}
-			start = index + 1
-			continue
-		}
-		switch value[index] {
-		case '(':
-			parens++
-		case ')':
-			parens--
-		case '[':
-			brackets++
-		case ']':
-			brackets--
-		case '{':
-			braces++
-		case '}':
-			braces--
-		case '<':
-			angles++
-		case '>':
-			angles--
-		}
-	}
-	return result
+	return lexical.SplitTopLevel(value, ",", true)
 }
 
-func numericExpression(value string) bool {
-	if value == "" {
-		return false
-	}
-	for index, r := range value {
-		if r >= '0' && r <= '9' || strings.ContainsRune("._xXbBeEfFdDlL+-", r) && index > 0 {
-			continue
-		}
-		return false
-	}
-	return true
+func numericExpression(value string, kotlin bool) bool {
+	tokens, complete := lexical.TokenizeBounded(value, kotlin, 2)
+	return complete && len(tokens) == 1 && tokens[0].Kind == lexical.Number && tokens[0].Start == 0 && tokens[0].End == len(value)
 }
 
 func (i *Index) typeOfExpressionLocked(file *analysis.ParsedFile, expression string, at int) string {
@@ -793,7 +970,13 @@ func (i *Index) typeOfExpressionLocked(file *analysis.ParsedFile, expression str
 			call = true
 			memberName = strings.TrimSpace(member[:open])
 			close := callClosingParen(member, open)
+			if close >= len(member) {
+				return ""
+			}
 			callArguments = splitTopLevelCallArguments(member[open+1 : close])
+			if callArguments == nil {
+				callArguments = make([]string, 0)
+			}
 		} else if open := strings.IndexByte(member, '{'); open >= 0 && strings.HasSuffix(strings.TrimSpace(member), "}") {
 			call = true
 			memberName = strings.TrimSpace(member[:open])
@@ -834,55 +1017,18 @@ func (i *Index) typeOfExpressionLocked(file *analysis.ParsedFile, expression str
 				}
 			}
 		}
-		for _, instantiated := range i.instantiatedTypeHierarchyLocked(file, typ) {
-			if next != "" {
-				break
-			}
-			owner, arguments := instantiated.symbol, instantiated.arguments
-			for _, id := range i.byContainerMember[memberKey(owner.Name, memberName)] {
-				symbol := i.symbols[id]
-				if symbol.ContainerID == owner.ID && symbol.Type != "" && (call == analysis.IsCallableKind(symbol.Kind) || !call && !analysis.IsCallableKind(symbol.Kind)) && i.accessibleLocked(file, *symbol, at) {
-					next = substituteTypeParameters(symbol.Type, owner.TypeParameters, arguments)
-					break
-				}
-			}
-			if next != "" {
-				break
+		if next == "" {
+			var found bool
+			next, found = i.uniqueDirectMemberResultTypeLocked(file, typ, memberName, call, len(callArguments), at)
+			if found && next == "" {
+				return ""
 			}
 		}
 		if next == "" && file.Language == analysis.LanguageKotlin {
-			for _, container := range i.typeAndSupertypesLocked(file, typ) {
-				for _, id := range i.byReceiverMember[memberKey(container, memberName)] {
-					extension := i.symbols[id]
-					if extension.Type == "" || call != analysis.IsCallableKind(extension.Kind) || !i.accessibleLocked(file, *extension, at) || !i.extensionVisibleLocked(file, *extension, at) {
-						continue
-					}
-					bindings, applicable := i.extensionReceiverBindingsLocked(file, *extension, typ)
-					if !applicable || call && !matchesArityForLanguage(*extension, len(callArguments), file.Language) {
-						continue
-					}
-					parameters := make(map[string]bool, len(extension.TypeParameters))
-					for _, parameter := range extension.TypeParameters {
-						parameters[parameter] = true
-					}
-					for index, argument := range callArguments {
-						if index >= len(extension.Parameters) {
-							break
-						}
-						actual := i.inferExpressionTypeLocked(file, argument, at)
-						if !matchTypePattern(extension.Parameters[index].Type, actual, parameters, bindings) {
-							applicable = false
-							break
-						}
-					}
-					if applicable {
-						next = substituteTypeBindings(extension.Type, bindings)
-						break
-					}
-				}
-				if next != "" {
-					break
-				}
+			var ambiguous bool
+			next, ambiguous = i.uniqueExtensionResultTypeLocked(file, typ, memberName, call, callArguments, at)
+			if ambiguous {
+				return ""
 			}
 		}
 		typ = next
@@ -894,29 +1040,101 @@ func (i *Index) typeOfExpressionLocked(file *analysis.ParsedFile, expression str
 }
 
 func (i *Index) memberResultTypeLocked(file *analysis.ParsedFile, receiverType, name string, at int) string {
-	for _, instantiated := range i.instantiatedTypeHierarchyLocked(file, receiverType) {
-		owner, arguments := instantiated.symbol, instantiated.arguments
-		for _, id := range i.byContainerMember[memberKey(owner.Name, name)] {
-			member := i.symbols[id]
-			if member.ContainerID == owner.ID && analysis.IsCallableKind(member.Kind) && member.Type != "" && i.accessibleLocked(file, *member, at) {
-				return substituteTypeParameters(member.Type, owner.TypeParameters, arguments)
-			}
-		}
+	if result, found := i.uniqueDirectMemberResultTypeLocked(file, receiverType, name, true, -1, at); found {
+		return result
 	}
 	if file.Language == analysis.LanguageKotlin {
-		for _, container := range i.typeAndSupertypesLocked(file, receiverType) {
-			for _, id := range i.byReceiverMember[memberKey(container, name)] {
-				member := i.symbols[id]
-				if member.Type == "" || !analysis.IsCallableKind(member.Kind) || !i.accessibleLocked(file, *member, at) || !i.extensionVisibleLocked(file, *member, at) {
-					continue
-				}
-				if bindings, applicable := i.extensionReceiverBindingsLocked(file, *member, receiverType); applicable {
-					return substituteTypeBindings(member.Type, bindings)
-				}
-			}
+		if result, ambiguous := i.uniqueExtensionResultTypeLocked(file, receiverType, name, true, nil, at); !ambiguous {
+			return result
 		}
 	}
 	return ""
+}
+
+// uniqueDirectMemberResultTypeLocked returns the result from the nearest
+// declaring type only when exactly one accessible member matches. found is
+// true even for an ambiguous set so callers do not incorrectly fall through
+// to an extension method when a real member shadows it.
+func (i *Index) uniqueDirectMemberResultTypeLocked(file *analysis.ParsedFile, receiverType, name string, callable bool, arity, at int) (result string, found bool) {
+	for _, instantiated := range i.instantiatedTypeHierarchyLocked(file, receiverType) {
+		owner, arguments := instantiated.symbol, instantiated.arguments
+		matches := 0
+		for _, id := range i.byContainerMember[memberKey(owner.ID, name)] {
+			member := i.symbols[id]
+			if member.ContainerID != owner.ID || member.Type == "" || callable != analysis.IsCallableKind(member.Kind) || !i.accessibleLocked(file, *member, at) {
+				continue
+			}
+			if callable && arity >= 0 && !matchesArityForLanguage(*member, arity, file.Language) {
+				continue
+			}
+			matches++
+			if matches == 1 {
+				result = substituteTypeParameters(member.Type, owner.TypeParameters, arguments)
+			} else {
+				result = ""
+			}
+		}
+		if matches > 0 {
+			return result, true
+		}
+	}
+	return "", false
+}
+
+// uniqueExtensionResultTypeLocked applies the parts of extension overload
+// filtering the source model can prove. The second result reports ambiguity;
+// no result and no ambiguity means that no extension was applicable.
+func (i *Index) uniqueExtensionResultTypeLocked(file *analysis.ParsedFile, receiverType, name string, callable bool, callArguments []string, at int) (result string, ambiguous bool) {
+	seen := make(map[string]bool)
+	matches := 0
+	hierarchy := i.instantiatedTypeHierarchyLocked(file, receiverType)
+	owners := make([]analysis.Symbol, 0, len(hierarchy))
+	for _, instantiated := range hierarchy {
+		owners = append(owners, instantiated.symbol)
+	}
+	if len(owners) == 0 {
+		owners = spellingReceiverOwners(receiverType)
+	}
+	for _, owner := range owners {
+		for _, id := range i.extensionMemberCandidatesLocked(owner, name) {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			extension := i.symbols[id]
+			if extension.Type == "" || callable != analysis.IsCallableKind(extension.Kind) || !i.accessibleLocked(file, *extension, at) || !i.extensionVisibleLocked(file, *extension, at) {
+				continue
+			}
+			bindings, applicable := i.extensionReceiverBindingsLocked(file, *extension, receiverType)
+			if !applicable || callable && callArguments != nil && !matchesArityForLanguage(*extension, len(callArguments), file.Language) {
+				continue
+			}
+			parameters := make(map[string]bool, len(extension.TypeParameters))
+			for _, parameter := range extension.TypeParameters {
+				parameters[parameter] = true
+			}
+			for index, argument := range callArguments {
+				if index >= len(extension.Parameters) {
+					break
+				}
+				actual := i.inferExpressionTypeLocked(file, argument, at)
+				if actual == "" || !matchTypePattern(extension.Parameters[index].Type, actual, parameters, bindings) {
+					applicable = false
+					break
+				}
+			}
+			if !applicable {
+				continue
+			}
+			matches++
+			if matches == 1 {
+				result = substituteTypeBindings(extension.Type, bindings)
+			} else {
+				return "", true
+			}
+		}
+	}
+	return result, false
 }
 
 func (i *Index) invocationResultTypeLocked(file *analysis.ParsedFile, receiverType string, at int) string {
@@ -942,19 +1160,9 @@ func (i *Index) indexedExpressionTypeLocked(file *analysis.ParsedFile, expressio
 		if strings.HasSuffix(strings.TrimSpace(typ), "[]") {
 			typ = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(typ), "[]"))
 		} else {
-			next := ""
-			for _, instantiated := range i.instantiatedTypeHierarchyLocked(file, typ) {
-				owner, arguments := instantiated.symbol, instantiated.arguments
-				for _, id := range i.byContainerMember[memberKey(owner.Name, "get")] {
-					symbol := i.symbols[id]
-					if symbol.ContainerID == owner.ID && analysis.IsCallableKind(symbol.Kind) && symbol.Type != "" && i.accessibleLocked(file, *symbol, at) {
-						next = substituteTypeParameters(symbol.Type, owner.TypeParameters, arguments)
-						break
-					}
-				}
-				if next != "" {
-					break
-				}
+			next, found := i.uniqueDirectMemberResultTypeLocked(file, typ, "get", true, 1, at)
+			if found && next == "" {
+				return ""
 			}
 			if next == "" {
 				base, arguments := splitInstantiatedType(typ)
@@ -1058,4 +1266,192 @@ func kotlinNullableMemberAccessAllowed(source string, memberStart int) bool {
 		return true
 	}
 	return memberStart >= 3 && memberStart <= len(source) && source[memberStart-1] == '.' && source[memberStart-2] == '!' && source[memberStart-3] == '!'
+}
+
+// operatorTypable lists the operators whose result type follows from operand
+// types alone. Elvis, `to`, casts and type tests keep their dedicated paths.
+func operatorTypable(operator string) bool {
+	switch operator {
+	case "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=", "&&", "||", "!":
+		return true
+	}
+	return false
+}
+
+// inferOperatorExpressionLocked applies JLS 5.6.2 binary numeric promotion or
+// Kotlin's numeric operator conventions to operand evidence. Confidence is
+// exact only when every operand is exact; any operand without evidence, or
+// any combination the rules do not define, abstains rather than guessing.
+func (i *Index) inferOperatorExpressionLocked(file *analysis.ParsedFile, ir expressionIR, at, depth int) inferredExpressionType {
+	result := inferredExpressionType{Expression: ir}
+	if depth > 64 {
+		return result
+	}
+	kotlin := file.Language == analysis.LanguageKotlin
+	boolean := "Boolean"
+	if !kotlin {
+		boolean = "boolean"
+	}
+	operands := make([]inferredExpressionType, 0, len(ir.Children))
+	confidence := inferenceExact
+	for _, child := range ir.Children {
+		operand := i.inferExpressionResultDepthLocked(file, child.Text, at, depth+1)
+		if operand.Confidence == inferenceUnknown {
+			confidence = inferenceUnknown
+		} else if operand.Confidence < confidence {
+			confidence = operand.Confidence
+		}
+		operands = append(operands, operand)
+	}
+	typed := func(typ string) inferredExpressionType {
+		if typ == "" {
+			return result
+		}
+		result.Type, result.Confidence = typ, confidence
+		if result.Confidence == inferenceUnknown {
+			result.Confidence = inferenceConservative
+		}
+		return result
+	}
+	switch ir.Kind {
+	case expressionUnary:
+		if len(operands) != 1 || operands[0].Type == "" {
+			return result
+		}
+		operand := operands[0].Type
+		switch ir.Operator {
+		case "!":
+			if isBooleanType(file.Language, operand) {
+				return typed(boolean)
+			}
+			if kotlin {
+				return typed(i.memberResultTypeLocked(file, operand, "not", at))
+			}
+		case "-", "+":
+			if rank, ok := numericRank(file.Language, operand); ok {
+				return typed(numericTypeForRank(file.Language, max(rank, numericRankInt)))
+			}
+			if kotlin {
+				name := map[string]string{"-": "unaryMinus", "+": "unaryPlus"}[ir.Operator]
+				return typed(i.memberResultTypeLocked(file, operand, name, at))
+			}
+		}
+		return result
+	case expressionBinary:
+		if len(operands) != 2 {
+			return result
+		}
+		left, right := operands[0].Type, operands[1].Type
+		switch ir.Operator {
+		case "==", "!=", "<", ">", "<=", ">=":
+			// Equality and comparison always yield a boolean; operand
+			// evidence only affects confidence.
+			if confidence == inferenceUnknown {
+				confidence = inferenceConservative
+			}
+			return typed(boolean)
+		case "&&", "||":
+			if confidence == inferenceUnknown {
+				confidence = inferenceConservative
+			}
+			return typed(boolean)
+		}
+		if left == "" || right == "" {
+			return result
+		}
+		if ir.Operator == "+" {
+			if kotlin && isStringType(file.Language, left) || !kotlin && (isStringType(file.Language, left) || isStringType(file.Language, right)) {
+				return typed("String")
+			}
+		}
+		leftRank, leftNumeric := numericRank(file.Language, left)
+		rightRank, rightNumeric := numericRank(file.Language, right)
+		if leftNumeric && rightNumeric {
+			return typed(numericTypeForRank(file.Language, max(leftRank, rightRank, numericRankInt)))
+		}
+		if kotlin {
+			leftChar, rightChar := simpleType(strings.TrimSpace(left)) == "Char", simpleType(strings.TrimSpace(right)) == "Char"
+			switch {
+			case leftChar && rightChar && ir.Operator == "-":
+				return typed("Int")
+			case leftChar && rightNumeric && rightRank == numericRankInt && (ir.Operator == "+" || ir.Operator == "-"):
+				return typed("Char")
+			case !leftChar:
+				name := map[string]string{"+": "plus", "-": "minus", "*": "times", "/": "div", "%": "rem"}[ir.Operator]
+				if name != "" && !leftNumeric {
+					return typed(i.memberResultTypeLocked(file, left, name, at))
+				}
+			}
+		}
+	}
+	return result
+}
+
+const (
+	numericRankByte = iota + 1
+	numericRankShort
+	numericRankInt
+	numericRankLong
+	numericRankFloat
+	numericRankDouble
+)
+
+func numericRank(language analysis.Language, typ string) (int, bool) {
+	name := simpleType(strings.TrimSpace(typ))
+	if language == analysis.LanguageJava {
+		switch name {
+		case "byte", "Byte":
+			return numericRankByte, true
+		case "short", "Short":
+			return numericRankShort, true
+		case "char", "Character", "int", "Integer":
+			return numericRankInt, true
+		case "long", "Long":
+			return numericRankLong, true
+		case "float", "Float":
+			return numericRankFloat, true
+		case "double", "Double":
+			return numericRankDouble, true
+		}
+		return 0, false
+	}
+	switch name {
+	case "Byte":
+		return numericRankByte, true
+	case "Short":
+		return numericRankShort, true
+	case "Int":
+		return numericRankInt, true
+	case "Long":
+		return numericRankLong, true
+	case "Float":
+		return numericRankFloat, true
+	case "Double":
+		return numericRankDouble, true
+	}
+	return 0, false
+}
+
+func numericTypeForRank(language analysis.Language, rank int) string {
+	kotlin := []string{"", "Byte", "Short", "Int", "Long", "Float", "Double"}
+	java := []string{"", "byte", "short", "int", "long", "float", "double"}
+	if rank < numericRankByte || rank > numericRankDouble {
+		return ""
+	}
+	if language == analysis.LanguageJava {
+		return java[rank]
+	}
+	return kotlin[rank]
+}
+
+func isBooleanType(language analysis.Language, typ string) bool {
+	name := simpleType(strings.TrimSpace(typ))
+	if language == analysis.LanguageJava {
+		return name == "boolean" || name == "Boolean"
+	}
+	return name == "Boolean"
+}
+
+func isStringType(language analysis.Language, typ string) bool {
+	return simpleType(strings.TrimSpace(typ)) == "String"
 }

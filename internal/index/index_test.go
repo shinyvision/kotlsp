@@ -400,6 +400,116 @@ func TestTypeDefinitionAndHierarchyUseQualifiedTypeIdentity(t *testing.T) {
 	if len(implementations) != 1 || implementations[0].URI != aURI || implementations[0].FQN != "a.Child" {
 		t.Fatalf("qualified implementations = %#v", implementations)
 	}
+	var aWidget, aChild analysis.Symbol
+	for _, symbol := range idx.SymbolsInFile(aURI) {
+		switch symbol.FQN {
+		case "a.Widget":
+			aWidget = symbol
+		case "a.Child":
+			aChild = symbol
+		}
+	}
+	if supertypes := idx.Supertypes(aChild); len(supertypes) != 1 || supertypes[0].ID != aWidget.ID {
+		t.Fatalf("qualified supertypes = %#v", supertypes)
+	}
+	if subtypes := idx.Subtypes(aWidget); len(subtypes) != 1 || subtypes[0].ID != aChild.ID {
+		t.Fatalf("qualified subtypes = %#v", subtypes)
+	}
+}
+
+func TestNestedSupertypeResolutionUsesLexicalOwnerIdentity(t *testing.T) {
+	idx := New(nil)
+	defer idx.Close()
+	uri := protocol.URI("file:///workspace/Nested.kt")
+	source := "class A { open class Base; class Child : Base() }\nclass B { open class Base; class Child : Base() }\n"
+	idx.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: source})
+	var bBase, bChild analysis.Symbol
+	for _, symbol := range idx.SymbolsInFile(uri) {
+		if symbol.ContainerName != "B" {
+			continue
+		}
+		switch symbol.Name {
+		case "Base":
+			bBase = symbol
+		case "Child":
+			bChild = symbol
+		}
+	}
+	if bBase.ID == "" || bChild.ID == "" {
+		t.Fatalf("nested B declarations were not indexed: %#v", idx.SymbolsInFile(uri))
+	}
+	if supertypes := idx.Supertypes(bChild); len(supertypes) != 1 || supertypes[0].ID != bBase.ID {
+		t.Fatalf("B.Child supertype = %#v, want B.Base %q", supertypes, bBase.ID)
+	}
+}
+
+func TestOwnerlessTypeLookupCannotLeakNestedTypeAcrossSibling(t *testing.T) {
+	idx := New(nil)
+	defer idx.Close()
+	uri := protocol.URI("file:///workspace/NestedVisibility.kt")
+	source := "class A { class Hidden; val valid: Hidden? = null }\nclass B { val invalid: Hidden? = null }\n"
+	idx.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: source})
+	document := textdoc.NewDocument(uri, "kotlin", 1, source)
+	valid := idx.TypeDefinitions(uri, document.Position(strings.Index(source, "valid")))
+	if len(valid) != 1 || valid[0].Name != "Hidden" || valid[0].ContainerName != "A" {
+		t.Fatalf("lexically visible nested type = %#v", valid)
+	}
+	if invalid := idx.TypeDefinitions(uri, document.Position(strings.Index(source, "invalid"))); len(invalid) != 0 {
+		t.Fatalf("sibling nested type leaked into B: %#v", invalid)
+	}
+}
+
+func TestLocalTypeLookupHonorsDeclarationOrder(t *testing.T) {
+	idx := New(nil)
+	defer idx.Close()
+	uri := protocol.URI("file:///workspace/LocalOrder.java")
+	source := "class LocalOrder { void use() { Later before = null; class Later {} Later after = null; } }"
+	idx.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "java", Version: 1, Text: source})
+	document := textdoc.NewDocument(uri, "java", 1, source)
+	if before := idx.TypeDefinitions(uri, document.Position(strings.Index(source, "before"))); len(before) != 0 {
+		t.Fatalf("later local class resolved before its declaration: %#v", before)
+	}
+	after := idx.TypeDefinitions(uri, document.Position(strings.Index(source, "after")))
+	if len(after) != 1 || after[0].Name != "Later" {
+		t.Fatalf("local class did not resolve after its declaration: %#v", after)
+	}
+}
+
+func TestHierarchyExhaustsTypeAliasEdgesBeforeNextDistance(t *testing.T) {
+	idx := New(nil)
+	defer idx.Close()
+	uri := protocol.URI("file:///workspace/AliasDistance.kt")
+	source := "open class Root\nopen class Via : Root()\ntypealias Alias = Root\n"
+	idx.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: source})
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	file := idx.files[uri]
+	owners := idx.instantiatedTypeHierarchyLocked(file, "Via & Alias")
+	for _, owner := range owners {
+		if owner.symbol.Name == "Root" {
+			if owner.distance != 0 {
+				t.Fatalf("Root distance = %d, want zero-cost Alias distance 0", owner.distance)
+			}
+			return
+		}
+	}
+	t.Fatalf("Root missing from hierarchy: %#v", owners)
+}
+
+func TestJvmTypeIdentityPreservesQualifiedNames(t *testing.T) {
+	if sameJvmType("a.Widget", "b.Widget") {
+		t.Fatal("different qualified types collapsed to one JVM identity")
+	}
+	for _, pair := range [][2]string{
+		{"String", "java.lang.String"},
+		{"kotlin.String", "java.lang.String"},
+		{"kotlin.collections.List<String>", "java.util.List<Integer>"},
+		{"kotlin.Int[]", "int[]"},
+	} {
+		if !sameJvmType(pair[0], pair[1]) {
+			t.Errorf("JVM aliases %q and %q did not match", pair[0], pair[1])
+		}
+	}
 }
 
 func TestTypeDefinitionInfersKotlinAndJavaLocalTypes(t *testing.T) {
@@ -818,22 +928,30 @@ func TestOverloadResolutionUsesTypedNameArguments(t *testing.T) {
 	}
 }
 
-func TestLargeFallbackRetainsCallDefinitions(t *testing.T) {
+func TestLargeFallbackRetainsCallDefinitionsAndProvesPath(t *testing.T) {
 	idx := New(nil)
 	uri := protocol.URI("file:///workspace/Generated.kt")
 	var source strings.Builder
 	source.WriteString("class Generated {\n")
-	for number := 0; number < 16000; number++ {
+	for number := 0; number < 200000; number++ {
 		source.WriteString("fun value")
 		source.WriteString(integer(number))
 		source.WriteString("(input: Int): Int = input + 1\n")
 	}
 	source.WriteString("fun use(): Int = value0(1)\n}\n")
 	text := source.String()
-	if len(text) < 512<<10 {
+	if len(text) < 8<<20 {
 		t.Fatalf("fixture did not exercise large fallback: %d bytes", len(text))
 	}
 	idx.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: text})
+	parsed, ok := idx.Parsed(uri)
+	if !ok || parsed.ParseMode != "large" {
+		mode := "<missing>"
+		if parsed != nil {
+			mode = parsed.ParseMode
+		}
+		t.Fatalf("large fixture used parse mode %q", mode)
+	}
 	doc := textdoc.NewDocument(uri, "kotlin", 1, text)
 	definitions := idx.Definitions(uri, doc.Position(strings.LastIndex(text, "value0")))
 	if len(definitions) != 1 || definitions[0].Name != "value0" {
@@ -1036,6 +1154,22 @@ func TestDefinitionFindsInheritedMemberAcrossJavaKotlinBoundary(t *testing.T) {
 		jpa, _ := idx.Parsed(jpaURI)
 		list, _ := idx.Parsed(listURI)
 		t.Fatalf("inherited library member definitions = %#v; use=%#v repo=%#v jpa=%#v list=%#v", definitions, parsed, repository, jpa, list)
+	}
+}
+
+func TestDefinitionResolvesImportedSupertypeInDeclaringFileContext(t *testing.T) {
+	idx := New(nil)
+	declarationURI := protocol.URI("file:///workspace/repository/ImportedBase.java")
+	repositoryURI := protocol.URI("file:///workspace/domain/UserRepository.kt")
+	useURI := protocol.URI("file:///workspace/web/Controller.kt")
+	idx.Open(context.Background(), protocol.TextDocumentItem{URI: declarationURI, LanguageID: "java", Version: 1, Text: "package repository; public interface ImportedBase<T> { <S extends T> S save(S value); }"})
+	idx.Open(context.Background(), protocol.TextDocumentItem{URI: repositoryURI, LanguageID: "kotlin", Version: 1, Text: "package domain\nimport repository.ImportedBase\ninterface UserRepository : ImportedBase<String>"})
+	use := "package web\nimport domain.UserRepository\nclass Controller(val repository: UserRepository) { fun run(value: String) = repository.save(value) }"
+	idx.Open(context.Background(), protocol.TextDocumentItem{URI: useURI, LanguageID: "kotlin", Version: 1, Text: use})
+	doc := textdoc.NewDocument(useURI, "kotlin", 1, use)
+	definitions := idx.Definitions(useURI, doc.Position(strings.LastIndex(use, "save")))
+	if !containsSymbol(definitions, "save", analysis.KindMethod, declarationURI) {
+		t.Fatalf("imported source supertype member definitions = %#v", definitions)
 	}
 }
 
@@ -1491,6 +1625,26 @@ func TestCompilerUnitsRespectModuleAndSourceSetVisibility(t *testing.T) {
 	}
 }
 
+func TestCompilerUnitsRejectAmbiguousSourceOwnership(t *testing.T) {
+	root := t.TempDir()
+	sourceRoot := filepath.Join(root, "src")
+	uri := uriutil.File(filepath.Join(sourceRoot, "Use.kt"))
+	idx := New(nil)
+	defer idx.Close()
+	idx.setModules([]ModuleInfo{
+		{Name: ":first", Root: root, Dir: root, SourceRoots: []string{sourceRoot}, SourceSets: map[string][]string{"main": {sourceRoot}}},
+		{Name: ":second", Root: root, Dir: root, SourceRoots: []string{sourceRoot}, SourceSets: map[string][]string{"main": {sourceRoot}}},
+	})
+	idx.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: "class Use\n"})
+	if _, err := idx.compilerUnitsContext(context.Background(), idx.WorkspaceFiles()); err == nil {
+		t.Fatal("ambiguous module ownership was silently compiled")
+	}
+	idx.setModules([]ModuleInfo{{Name: ":only", Root: root, Dir: root, SourceRoots: []string{sourceRoot}, SourceSets: map[string][]string{"main": {sourceRoot}, "test": {sourceRoot}}}})
+	if _, err := idx.compilerUnitsContext(context.Background(), idx.WorkspaceFiles()); err == nil {
+		t.Fatal("ambiguous source-set ownership was silently compiled")
+	}
+}
+
 func TestJavacDiagnosticsDoNotResolveUnrelatedModuleSources(t *testing.T) {
 	if _, err := exec.LookPath("javac"); err != nil {
 		t.Skip("javac is unavailable")
@@ -1857,7 +2011,7 @@ func TestKotlinMetadataDecodesDefaultsAndFileFacadeFunctions(t *testing.T) {
 	classMessage := append([]byte{66, byte(len(constructor))}, constructor...)
 	classData := append([]byte{0}, classMessage...) // empty delimited JVM name table
 	classData = append([]byte{0}, classData...)     // direct-byte BitEncoding marker
-	decoded := decodeKotlinBinaryMetadata(&classfile.KotlinMetadata{Kind: 1, Data1: []string{string(classData)}, Data2: []string{"optional", "required"}})
+	decoded := decodeKotlinBinaryMetadata(&classfile.KotlinMetadata{Kind: 1, MetadataVersion: []int{2, 0, 0}, Data1: []string{string(classData)}, Data2: []string{"optional", "required"}})
 	if len(decoded.Constructors) != 1 || len(decoded.Constructors[0].Parameters) != 2 || !decoded.Constructors[0].Parameters[0].HasDefault || decoded.Constructors[0].Parameters[1].HasDefault {
 		t.Fatalf("decoded constructor metadata = %#v", decoded)
 	}
@@ -1868,7 +2022,7 @@ func TestKotlinMetadataDecodesDefaultsAndFileFacadeFunctions(t *testing.T) {
 	function = append(function, 64, 0) // receiver_type_id
 	packageMessage := append([]byte{26, byte(len(function))}, function...)
 	packageData := append([]byte{0, 0}, packageMessage...)
-	metadata := &classfile.KotlinMetadata{Kind: 2, Data1: []string{string(packageData)}, Data2: []string{"extend", "value"}}
+	metadata := &classfile.KotlinMetadata{Kind: 2, MetadataVersion: []int{2, 0, 0}, Data1: []string{string(packageData)}, Data2: []string{"extend", "value"}}
 	parsed := &analysis.ParsedFile{Language: analysis.LanguageJava, Package: "demo", Symbols: []analysis.Symbol{
 		{ID: "owner", Name: "FileKt", FQN: "demo.FileKt", Kind: analysis.KindClass},
 		{ID: "method", Name: "extend", FQN: "demo.FileKt.extend", Kind: analysis.KindMethod, ContainerID: "owner", ContainerName: "FileKt", Type: "String", Parameters: []analysis.Parameter{{Name: "receiver", Type: "Target"}, {Name: "value", Type: "int"}}},
@@ -1880,6 +2034,37 @@ func TestKotlinMetadataDecodesDefaultsAndFileFacadeFunctions(t *testing.T) {
 	topLevel := parsed.Symbols[2]
 	if topLevel.FQN != "demo.extend" || topLevel.ReceiverType != "Target" || len(topLevel.Parameters) != 1 || topLevel.InteropLanguage != analysis.LanguageKotlin {
 		t.Fatalf("top-level extension view = %#v", topLevel)
+	}
+}
+
+func TestKotlinBinaryTypesAreTransformedByToken(t *testing.T) {
+	if got := KotlinDisplayType("com.example.java.lang.StringBox<java.lang.String>"); got != "com.example.java.lang.StringBox<String>" {
+		t.Fatalf("token-aware Kotlin type = %q", got)
+	}
+	if supportedKotlinMetadataVersion([]int{3, 0, 0}) {
+		t.Fatal("unknown Kotlin metadata major version was accepted")
+	}
+	if supportedKotlinMetadataVersion([]int{2, 3, 0}) {
+		t.Fatal("unknown Kotlin metadata minor version was accepted")
+	}
+	if supportedKotlinMetadataVersion([]int{2}) {
+		t.Fatal("metadata without a minor schema version was accepted")
+	}
+}
+
+func TestKotlinMetadataFailsClosedForUnknownAndMalformedSchemas(t *testing.T) {
+	for _, metadata := range []*classfile.KotlinMetadata{
+		{Kind: 1, MetadataVersion: []int{2, 3, 0}, Data1: []string{"future"}},
+		{Kind: 1, MetadataVersion: []int{2, 2, 0}, Data1: []string{"\x00\x80"}},
+	} {
+		parsed := &analysis.ParsedFile{Language: analysis.LanguageJava, Symbols: []analysis.Symbol{{ID: "owner", Name: "Binary", FQN: "demo.Binary", Kind: analysis.KindClass}}}
+		err := applyKotlinBinaryMetadata(parsed, &classfile.Class{InternalName: "demo/Binary", KotlinMetadata: metadata})
+		if err == nil {
+			t.Fatalf("invalid metadata %#v was accepted", metadata.MetadataVersion)
+		}
+		if len(parsed.Symbols) != 1 || parsed.Symbols[0].ID != "owner" || parsed.Symbols[0].Language != analysis.LanguageUnknown {
+			t.Fatalf("invalid metadata mutated bytecode symbols: %#v", parsed.Symbols)
+		}
 	}
 }
 
@@ -1917,13 +2102,19 @@ func TestClassfileNullabilityAnnotationsEnrichBinarySymbols(t *testing.T) {
 func TestKotlinMetadataNestedNullabilityVisibilityAndJVMName(t *testing.T) {
 	// Type.Argument.type -> Type(nullable=true).
 	nestedNullable := []byte{18, 4, 18, 2, 24, 1}
-	shape := decodeKotlinMetadataType(nestedNullable)
+	shape, valid := decodeKotlinMetadataType(nestedNullable)
+	if !valid {
+		t.Fatal("valid nested Kotlin metadata type was rejected")
+	}
 	if got := applyKotlinMetadataType("List<String>", shape); got != "List<String?>" {
 		t.Fatalf("nested Kotlin metadata type = %q, shape %#v", got, shape)
 	}
 	// flags=INTERNAL, name=sourceName, JVM method signature name=sourceName$main.
 	function := []byte{72, 0, 16, 0, 162, 6, 2, 8, 1}
-	callable := decodeKotlinCallable(function, []string{"sourceName", "sourceName$main"}, false)
+	callable, valid := decodeKotlinCallable(function, []string{"sourceName", "sourceName$main"}, false)
+	if !valid {
+		t.Fatal("valid Kotlin callable metadata was rejected")
+	}
 	if callable.Name != "sourceName" || callable.JVMName != "sourceName$main" || callable.Visibility != "internal" {
 		t.Fatalf("Kotlin callable JVM metadata = %#v", callable)
 	}
@@ -2338,7 +2529,16 @@ func TestKMPSourceSetGraphAndExpectActualFamilies(t *testing.T) {
 	}
 	idx := New(nil)
 	defer idx.Close()
-	idx.setModules(discoverModules([]string{root}))
+	modules := discoverModules([]string{root})
+	for moduleIndex := range modules {
+		modules[moduleIndex].BuildModelAuthoritative = true
+		modules[moduleIndex].SourceSetDependsOn = map[string][]string{
+			"jvmMain":    {"commonMain"},
+			"commonTest": {"commonMain"},
+			"jvmTest":    {"jvmMain", "commonTest"},
+		}
+	}
+	idx.setModules(modules)
 	commonURI := uriutil.File(filepath.Join(roots["commonMain"], "Platform.kt"))
 	jvmURI := uriutil.File(filepath.Join(roots["jvmMain"], "Platform.kt"))
 	commonTestURI := uriutil.File(filepath.Join(roots["commonTest"], "PlatformTest.kt"))
@@ -2527,4 +2727,84 @@ func integer(value int) string {
 		value /= 10
 	}
 	return string(digits[n:])
+}
+
+// Kotlin arguments spelled with Kotlin builtins must stay applicable to Java
+// parameters spelled with their JVM classes: kotlin.String is java.lang.String,
+// every non-null reference is a java.lang.Object, and String is a CharSequence.
+func TestKotlinArgumentsApplyToJavaPlatformTypedParameters(t *testing.T) {
+	idx := New(nil)
+	defer idx.Close()
+	javaURI := protocol.URI("file:///workspace/Model.java")
+	idx.Open(context.Background(), protocol.TextDocumentItem{URI: javaURI, LanguageID: "java", Version: 1, Text: "package web;\npublic interface Model {\n  Model addAttribute(String name, Object value);\n  Model addAttribute(Object value);\n  String encode(CharSequence raw);\n}\n"})
+	kotlinURI := protocol.URI("file:///workspace/Use.kt")
+	source := "package web\nclass Form\nfun use(model: Model, token: String) {\n model.addAttribute(\"form\", Form())\n model.addAttribute(\"token\", token)\n model.encode(token)\n}\n"
+	idx.Open(context.Background(), protocol.TextDocumentItem{URI: kotlinURI, LanguageID: "kotlin", Version: 1, Text: source})
+	doc := textdoc.NewDocument(kotlinURI, "kotlin", 1, source)
+	for _, probe := range []struct {
+		needle     string
+		parameters int
+	}{{"addAttribute(\"form\"", 2}, {"addAttribute(\"token\"", 2}, {"encode(", 1}} {
+		definitions := idx.Definitions(kotlinURI, doc.Position(strings.Index(source, probe.needle)))
+		if len(definitions) != 1 || definitions[0].URI != javaURI || len(definitions[0].Parameters) != probe.parameters {
+			t.Errorf("%s definition = %#v", probe.needle, definitions)
+		}
+	}
+}
+
+// A call qualified by a constructor call with a trailing lambda argument
+// (`Foo(false).apply { }`) reaches the parser without a qualifier; the
+// balanced source expression before the dot must still drive resolution
+// instead of falling back to an unqualified name lookup.
+func TestTrailingLambdaCallOnConstructorCallResolvesThroughTextualQualifier(t *testing.T) {
+	idx := New(nil)
+	defer idx.Close()
+	uri := protocol.URI("file:///workspace/Scoped.kt")
+	source := "class Scanner(flag: Boolean) { fun include() {} }\nfun <T> T.apply(block: T.() -> Unit): T { block(); return this }\nfun use() {\n val scanner = Scanner(false).apply {\n  include()\n }\n}\n"
+	idx.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: source})
+	doc := textdoc.NewDocument(uri, "kotlin", 1, source)
+	definitions := idx.Definitions(uri, doc.Position(strings.Index(source, "apply {")))
+	if len(definitions) != 1 || definitions[0].Name != "apply" || definitions[0].ReceiverType != "T" {
+		t.Fatalf("apply definition = %#v", definitions)
+	}
+}
+
+// A document outside every module (an editor scratch file, a stale library
+// mirror) belongs to no compilation unit and must not abort validation of the
+// units that exist.
+func TestCompilerUnitsSkipDocumentsOutsideEveryModule(t *testing.T) {
+	root := t.TempDir()
+	sourceRoot := filepath.Join(root, "src")
+	idx := New(nil)
+	defer idx.Close()
+	idx.setModules([]ModuleInfo{{Name: ":only", Root: root, Dir: root, SourceRoots: []string{sourceRoot}, SourceSets: map[string][]string{"main": {sourceRoot}}}})
+	idx.Open(context.Background(), protocol.TextDocumentItem{URI: uriutil.File(filepath.Join(sourceRoot, "Use.kt")), LanguageID: "kotlin", Version: 1, Text: "class Use\n"})
+	idx.Open(context.Background(), protocol.TextDocumentItem{URI: uriutil.File(filepath.Join(t.TempDir(), "Elsewhere.kt")), LanguageID: "kotlin", Version: 1, Text: "class Elsewhere\n"})
+	units, err := idx.compilerUnitsContext(context.Background(), idx.WorkspaceFiles())
+	if err != nil {
+		t.Fatalf("units: %v", err)
+	}
+	total := 0
+	for _, unit := range units {
+		total += len(unit.Primary)
+	}
+	if len(units) != 1 || total != 1 {
+		t.Fatalf("units = %d with %d primaries, want the one owned document", len(units), total)
+	}
+}
+
+// A file under the library source mirror, whichever layout version wrote it,
+// is a read-only library view and never enters the workspace document set.
+func TestOpenIgnoresLibraryMirrorFilesOfAnyVersion(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	idx := New(nil)
+	defer idx.Close()
+	cacheRoot, _ := os.UserCacheDir()
+	stale := filepath.Join(cacheRoot, "kotlsp", "sources", "v1", "lib-sources.jar-0123456789ab", "org", "example", "Old.java")
+	if parsed := idx.Open(context.Background(), protocol.TextDocumentItem{URI: uriutil.File(stale), LanguageID: "java", Version: 1, Text: "package org.example; public class Old {}\n"}); parsed != nil {
+		t.Fatal("stale mirror file was opened as a workspace document")
+	}
+	if len(idx.OpenDocuments()) != 0 || len(idx.WorkspaceFiles()) != 0 {
+		t.Fatalf("mirror file entered the index: %v", idx.OpenDocuments())
+	}
 }

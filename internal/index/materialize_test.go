@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
 	"github.com/shinyvision/kotlsp/internal/protocol"
@@ -178,6 +179,32 @@ func TestMirrorIsRebuiltWhenTheParseComesFromCache(t *testing.T) {
 	}
 }
 
+func TestArchiveCacheIdentityIncludesContent(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	path := filepath.Join(t.TempDir(), "same.jar")
+	stamp := time.Unix(1_700_000_000, 0)
+	if err := os.WriteFile(path, []byte("aaaa"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	first, ok := archiveCachePath(sourceArchive{path: path})
+	if !ok {
+		t.Fatal("first cache identity unavailable")
+	}
+	if err := os.WriteFile(path, []byte("bbbb"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	second, ok := archiveCachePath(sourceArchive{path: path})
+	if !ok || first == second {
+		t.Fatalf("content replacement reused cache path: %q == %q", first, second)
+	}
+}
+
 func TestMirroredPathsOutsideTheCacheAreNotRewritten(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	idx := New(nil)
@@ -190,5 +217,64 @@ func TestMirroredPathsOutsideTheCacheAreNotRewritten(t *testing.T) {
 	idx.AddLibraryBatch([]LibraryFile{{Source: LibrarySource{Archive: "/cache/library-sources.jar", Entry: "demo/Service.java", LanguageID: "java"}, Parsed: *parsed}})
 	if _, ok := idx.LibraryFileURI(uri); ok {
 		t.Fatal("an archive that does not exist on disk must not yield a mirrored path")
+	}
+}
+
+func TestMirrorEntryPathRejectsArchiveTraversal(t *testing.T) {
+	root := t.TempDir()
+	for _, entry := range []string{
+		"../escape.java",
+		"nested/../../escape.java",
+		"..\\escape.java",
+		"/absolute.java",
+		"C:\\absolute.java",
+		"",
+	} {
+		if path, ok := mirrorEntryPath(root, entry, false); ok {
+			t.Errorf("unsafe archive entry %q resolved to %q", entry, path)
+		}
+	}
+	path, ok := mirrorEntryPath(root, "safe/nested/Thing.class", true)
+	if !ok {
+		t.Fatal("safe archive entry was rejected")
+	}
+	want := filepath.Join(root, "safe", "nested", "Thing.java")
+	if path != want {
+		t.Fatalf("safe mirror path = %q, want %q", path, want)
+	}
+}
+
+func TestMirrorWriteRejectsSymlinkedParent(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	link := filepath.Join(root, "nested")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	target := filepath.Join(link, "escape.java")
+	if err := writeMirroredFile(root, target, "class Escape {}"); err == nil {
+		t.Fatal("mirror write followed a symlinked parent")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "escape.java")); !os.IsNotExist(err) {
+		t.Fatalf("out-of-root file was created: %v", err)
+	}
+}
+
+func TestMirrorWriteRejectsSymlinkedLeaf(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.java")
+	if err := os.WriteFile(outside, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "Thing.java")
+	if err := os.Symlink(outside, target); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := writeMirroredFile(root, target, "class Thing {}"); err == nil {
+		t.Fatal("mirror write accepted a symlinked leaf")
+	}
+	content, err := os.ReadFile(outside)
+	if err != nil || string(content) != "unchanged" {
+		t.Fatalf("symlink target changed: %q, %v", content, err)
 	}
 }

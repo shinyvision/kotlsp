@@ -19,8 +19,9 @@ func init() {
 			"CONDITION_TYPE_MISMATCH", "BREAK_OR_CONTINUE_OUTSIDE_A_LOOP",
 			"CREATING_AN_INSTANCE_OF_ABSTRACT_CLASS", "ENUM_CLASS_CONSTRUCTOR_CALL", "INTERFACE_AS_FUNCTION",
 		},
-		languages: []analysis.Language{analysis.LanguageKotlin},
-		apply:     kotlinBodyShapes,
+		languages:          []analysis.Language{analysis.LanguageKotlin},
+		usesWorkspaceIndex: true,
+		apply:              kotlinBodyShapes,
 	})
 }
 
@@ -447,7 +448,7 @@ func (i *Index) impossibleInstantiations(c *unresolvedNameContext, document inte
 		}
 		// A companion 'invoke' makes Name(...) a call.
 		companionInvoke := false
-		for _, id := range i.byContainerName[target.Name] {
+		for _, id := range i.byContainerName[target.ID] {
 			nested := i.symbols[id]
 			if nested == nil || nested.ContainerID != target.ID || nested.Kind != analysis.KindObject {
 				continue

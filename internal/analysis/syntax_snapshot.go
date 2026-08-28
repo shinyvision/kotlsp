@@ -14,127 +14,11 @@ static void kotlsp_release_native_heap(void) {
 	malloc_trim(0);
 #endif
 }
-
-// These declarations are the stable public tree-sitter ABI. Keeping the
-// traversal in C avoids a cgo round trip for every node property and sibling
-// in large generated source files.
-typedef struct {
-	uint32_t context[4];
-	const void *id;
-	const void *tree;
-} TSNode;
-
-typedef struct {
-	const void *tree;
-	const void *id;
-	uint32_t context[3];
-} TSTreeCursor;
-
-typedef uint16_t TSSymbol;
-typedef uint16_t TSFieldId;
-
-extern TSTreeCursor ts_tree_cursor_new(TSNode node);
-extern void ts_tree_cursor_delete(TSTreeCursor *self);
-extern bool ts_tree_cursor_goto_first_child(TSTreeCursor *self);
-extern bool ts_tree_cursor_goto_next_sibling(TSTreeCursor *self);
-extern TSNode ts_tree_cursor_current_node(const TSTreeCursor *self);
-extern TSFieldId ts_tree_cursor_current_field_id(const TSTreeCursor *self);
-extern bool ts_node_is_named(TSNode self);
-extern bool ts_node_is_error(TSNode self);
-extern bool ts_node_is_missing(TSNode self);
-extern bool ts_node_has_error(TSNode self);
-extern TSSymbol ts_node_symbol(TSNode self);
-extern uint32_t ts_node_start_byte(TSNode self);
-extern uint32_t ts_node_end_byte(TSNode self);
-
-typedef struct {
-	TSNode node;
-	uint32_t parent;
-	uint32_t first_child;
-	uint32_t next_sibling;
-	uint32_t start_byte;
-	uint32_t end_byte;
-	uint16_t symbol;
-	uint16_t field;
-	uint8_t flags;
-} KotlspSyntaxNode;
-
-typedef struct {
-	KotlspSyntaxNode *nodes;
-	uint32_t count;
-	uint32_t capacity;
-	bool failed;
-} KotlspSyntaxBuffer;
-
-static bool kotlsp_syntax_reserve(KotlspSyntaxBuffer *buffer) {
-	if (buffer->count < buffer->capacity) return true;
-	uint32_t capacity = buffer->capacity == 0 ? 1024 : buffer->capacity * 2;
-	KotlspSyntaxNode *nodes = (KotlspSyntaxNode *)realloc(buffer->nodes, (size_t)capacity * sizeof(KotlspSyntaxNode));
-	if (nodes == NULL) {
-		buffer->failed = true;
-		return false;
-	}
-	buffer->nodes = nodes;
-	buffer->capacity = capacity;
-	return true;
-}
-
-static uint32_t kotlsp_syntax_visit(KotlspSyntaxBuffer *buffer, TSNode node, uint32_t parent, uint16_t field) {
-	if (!kotlsp_syntax_reserve(buffer)) return UINT32_MAX;
-	uint32_t index = buffer->count++;
-	KotlspSyntaxNode *entry = &buffer->nodes[index];
-	entry->node = node;
-	entry->parent = parent;
-	entry->first_child = UINT32_MAX;
-	entry->next_sibling = UINT32_MAX;
-	entry->start_byte = ts_node_start_byte(node);
-	entry->end_byte = ts_node_end_byte(node);
-	entry->symbol = ts_node_symbol(node);
-	entry->field = field;
-	entry->flags = (ts_node_is_error(node) ? 1 : 0) |
-		(ts_node_is_missing(node) ? 2 : 0) |
-		(ts_node_has_error(node) ? 4 : 0) |
-		(ts_node_is_named(node) ? 8 : 0);
-
-	TSTreeCursor cursor = ts_tree_cursor_new(node);
-	uint32_t previous = UINT32_MAX;
-	if (ts_tree_cursor_goto_first_child(&cursor)) {
-		do {
-			TSNode child = ts_tree_cursor_current_node(&cursor);
-			uint32_t child_index = kotlsp_syntax_visit(buffer, child, index, ts_tree_cursor_current_field_id(&cursor));
-			if (child_index == UINT32_MAX) break;
-			if (previous == UINT32_MAX) {
-				buffer->nodes[index].first_child = child_index;
-			} else {
-				buffer->nodes[previous].next_sibling = child_index;
-			}
-			previous = child_index;
-		} while (ts_tree_cursor_goto_next_sibling(&cursor));
-	}
-	ts_tree_cursor_delete(&cursor);
-	return buffer->failed ? UINT32_MAX : index;
-}
-
-static KotlspSyntaxNode *kotlsp_syntax_snapshot(
-	uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3,
-	uintptr_t id, uintptr_t tree, uint32_t *count
-) {
-	TSNode root = {{c0, c1, c2, c3}, (const void *)id, (const void *)tree};
-	KotlspSyntaxBuffer buffer = {0};
-	kotlsp_syntax_visit(&buffer, root, UINT32_MAX, 0);
-	if (buffer.failed) {
-		free(buffer.nodes);
-		*count = 0;
-		return NULL;
-	}
-	*count = buffer.count;
-	return buffer.nodes;
-}
 */
 import "C"
 
 import (
-	"unsafe"
+	"context"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 )
@@ -150,15 +34,6 @@ func releaseLargeParseMemory() {
 }
 
 const noSyntaxNode = ^uint32(0)
-
-// rawSitterNode mirrors tree-sitter's public TSNode and the sole field in the
-// Go binding's sitter.Node. It lets the single C traversal return ordinary Go
-// binding nodes without calling back through cgo for each one.
-type rawSitterNode struct {
-	context [4]uint32
-	id      uintptr
-	tree    uintptr
-}
 
 type syntaxNode struct {
 	node        sitter.Node
@@ -177,58 +52,84 @@ type syntaxSnapshot struct {
 	byID  map[uintptr]uint32
 }
 
-func syntaxKindNames(language *sitter.Language) []string {
-	names := make([]string, language.NodeKindCount())
-	for index := range names {
-		names[index] = language.NodeKindForId(uint16(index))
-	}
-	return names
-}
-
-var (
-	javaSyntaxKindNames   = syntaxKindNames(javaLanguage)
-	kotlinSyntaxKindNames = syntaxKindNames(kotlinLanguage)
-)
-
-func newSyntaxSnapshot(root *sitter.Node, language Language) *syntaxSnapshot {
+func newSyntaxSnapshot(ctx context.Context, root *sitter.Node, language Language) *syntaxSnapshot {
 	if root == nil {
 		return nil
 	}
-	raw := *(*rawSitterNode)(unsafe.Pointer(root))
-	var count C.uint32_t
-	items := C.kotlsp_syntax_snapshot(
-		C.uint32_t(raw.context[0]), C.uint32_t(raw.context[1]),
-		C.uint32_t(raw.context[2]), C.uint32_t(raw.context[3]),
-		C.uintptr_t(raw.id), C.uintptr_t(raw.tree), &count,
-	)
-	if items == nil || count == 0 {
-		return nil
-	}
-	defer C.free(unsafe.Pointer(items))
-	cItems := unsafe.Slice(items, int(count))
-	names := javaSyntaxKindNames
+	fieldIDs := javaFieldIDs
 	if language == LanguageKotlin {
-		names = kotlinSyntaxKindNames
+		fieldIDs = kotlinFieldIDs
 	}
 	snapshot := &syntaxSnapshot{
-		nodes: make([]syntaxNode, len(cItems)),
-		byID:  make(map[uintptr]uint32, len(cItems)),
+		nodes: make([]syntaxNode, 0, 4096),
+		byID:  make(map[uintptr]uint32, 4096),
 	}
-	for index := range cItems {
-		item := &cItems[index]
-		node := *(*sitter.Node)(unsafe.Pointer(&item.node))
-		symbol := int(item.symbol)
-		kind := ""
-		if symbol >= 0 && symbol < len(names) {
-			kind = names[symbol]
+	appendNode := func(node sitter.Node, parent uint32, field uint16) uint32 {
+		flags := uint8(0)
+		if node.IsError() {
+			flags |= 1
 		}
-		snapshot.nodes[index] = syntaxNode{
-			node: node, kind: kind, parent: uint32(item.parent),
-			firstChild: uint32(item.first_child), nextSibling: uint32(item.next_sibling),
-			start: int(item.start_byte), end: int(item.end_byte), field: uint16(item.field),
-			flags: uint8(item.flags),
+		if node.IsMissing() {
+			flags |= 2
 		}
-		snapshot.byID[node.Id()] = uint32(index)
+		if node.HasError() {
+			flags |= 4
+		}
+		if node.IsNamed() {
+			flags |= 8
+		}
+		index := uint32(len(snapshot.nodes))
+		snapshot.nodes = append(snapshot.nodes, syntaxNode{
+			node: node, kind: node.Kind(), parent: parent,
+			firstChild: noSyntaxNode, nextSibling: noSyntaxNode,
+			start: int(node.StartByte()), end: int(node.EndByte()), field: field, flags: flags,
+		})
+		snapshot.byID[node.Id()] = index
+		return index
+	}
+	type frame struct {
+		index, next, count, last uint32
+	}
+	rootIndex := appendNode(*root, noSyntaxNode, 0)
+	stack := []frame{{index: rootIndex, count: uint32(root.ChildCount()), last: noSyntaxNode}}
+	const maxSnapshotNodes = 1_000_000
+	for len(stack) > 0 {
+		if len(snapshot.nodes)&255 == 0 && ctx.Err() != nil {
+			return nil
+		}
+		current := &stack[len(stack)-1]
+		if current.next >= current.count {
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		parent := &snapshot.nodes[current.index].node
+		childPosition := current.next
+		current.next++
+		child := parent.Child(uint(childPosition))
+		if child == nil {
+			continue
+		}
+		field := uint16(0)
+		for _, candidate := range fieldIDs {
+			if candidate == 0 {
+				continue
+			}
+			if fieldChild := parent.ChildByFieldId(candidate); fieldChild != nil && fieldChild.Id() == child.Id() {
+				field = candidate
+				break
+			}
+		}
+		if len(snapshot.nodes) >= maxSnapshotNodes || len(stack) >= 65_536 {
+			return nil
+		}
+		childIndex := appendNode(*child, current.index, field)
+		if current.last == noSyntaxNode {
+			snapshot.nodes[current.index].firstChild = childIndex
+		} else {
+			snapshot.nodes[current.last].nextSibling = childIndex
+		}
+		current.last = childIndex
+		stack = append(stack, frame{index: childIndex, count: uint32(child.ChildCount()), last: noSyntaxNode})
 	}
 	return snapshot
 }

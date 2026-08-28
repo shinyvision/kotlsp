@@ -9,14 +9,16 @@ import (
 
 // A call to a callee the index can pin down exactly -- one candidate, in the
 // workspace, no varargs, no named arguments in play -- has a fixed shape: each
-// required parameter needs a value, and a literal argument has a type the
-// compiler will compare with the parameter's. Both are provable without
-// inference. Any ambiguity at all, and the rule abstains.
+// required parameter needs a value. Argument expressions are accepted only
+// when the index proves a unique builtin type (a literal, declared local,
+// constructor, or uniquely resolved call); unknown and flow-sensitive shapes
+// still abstain. Any callee ambiguity at all also abstains.
 func init() {
 	registerFastRule(fastRule{
-		codes:     []string{"NO_VALUE_FOR_PARAMETER", "ARGUMENT_TYPE_MISMATCH"},
-		languages: []analysis.Language{analysis.LanguageKotlin},
-		apply:     callShapeMismatches,
+		codes:              []string{"NO_VALUE_FOR_PARAMETER", "ARGUMENT_TYPE_MISMATCH"},
+		languages:          []analysis.Language{analysis.LanguageKotlin},
+		usesWorkspaceIndex: true,
+		apply:              callShapeMismatches,
 	})
 }
 
@@ -67,7 +69,11 @@ func callShapeMismatches(i *Index, file *analysis.ParsedFile) []protocol.Diagnos
 			if start < 0 || end > len(text) || start >= end {
 				continue
 			}
-			actual := literalKind(text[start:end])
+			expression := strings.TrimSpace(text[start:end])
+			actual := literalKind(expression)
+			if actual == "" {
+				actual = i.builtinExpectedTypeLocked(file, i.inferExpressionTypeLocked(file, expression, reference.StartByte))
+			}
 			if literalAcceptedBy(expected, actual) {
 				continue
 			}
@@ -87,6 +93,11 @@ func (i *Index) uniqueWorkspaceCalleeLocked(file *analysis.ParsedFile, reference
 	byName := *reference
 	byName.Arity = -1
 	byName.ResolvedID = ""
+	// This lookup identifies the declaration whose shape will be diagnosed. It
+	// must not run overload applicability against the very missing or mistyped
+	// arguments the rule is trying to report, or every erroneous call appears
+	// to have no callee and the rule can never fire.
+	byName.Role = analysis.RoleRead
 	candidates := i.resolveLocked(file, byName)
 	var callee analysis.Symbol
 	found := 0

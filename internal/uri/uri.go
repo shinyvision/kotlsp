@@ -18,6 +18,12 @@ func Path(value protocol.URI) (string, bool) {
 	if err != nil {
 		return "", false
 	}
+	if u.Host != "" && !strings.EqualFold(u.Host, "localhost") {
+		if runtime.GOOS != "windows" || strings.ContainsAny(u.Host, "/\\") {
+			return "", false
+		}
+		p = "//" + u.Host + "/" + strings.TrimPrefix(p, "/")
+	}
 	if runtime.GOOS == "windows" && len(p) >= 3 && p[0] == '/' && p[2] == ':' {
 		p = p[1:]
 	}
@@ -26,7 +32,15 @@ func Path(value protocol.URI) (string, bool) {
 
 func File(path string) protocol.URI {
 	path, _ = filepath.Abs(path)
-	u := url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
+	slashed := filepath.ToSlash(path)
+	if runtime.GOOS == "windows" && strings.HasPrefix(slashed, "//") {
+		rest := strings.TrimPrefix(slashed, "//")
+		if cut := strings.IndexByte(rest, '/'); cut > 0 {
+			u := url.URL{Scheme: "file", Host: rest[:cut], Path: "/" + rest[cut+1:]}
+			return protocol.URI(u.String())
+		}
+	}
+	u := url.URL{Scheme: "file", Path: slashed}
 	return protocol.URI(u.String())
 }
 

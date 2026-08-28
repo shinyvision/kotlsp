@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 
 	"github.com/shinyvision/kotlsp/internal/index"
@@ -16,25 +17,42 @@ import (
 // URI on the way in.
 var librarySourceMarker = []byte(index.LibrarySourceMarker)
 
+var librarySourceBaseMarker = []byte(index.LibrarySourceBaseMarker)
+
 // uriFields are the request payload members that carry a document URI in the
 // negotiated protocol.
 var uriFields = map[string]bool{"uri": true, "targetUri": true, "oldUri": true, "newUri": true}
 
 func (s *Server) externalURI(uri protocol.URI) protocol.URI {
-	if mirrored, ok := s.index.LibraryFileURI(uri); ok {
+	return s.externalURIContext(context.Background(), uri)
+}
+
+func (s *Server) externalURIContext(ctx context.Context, uri protocol.URI) protocol.URI {
+	if mirrored, ok := s.index.LibraryFileURIContext(ctx, uri); ok {
 		return mirrored
 	}
 	return uri
 }
 
 func (s *Server) externalLocation(location protocol.Location) protocol.Location {
-	location.URI = s.externalURI(location.URI)
+	return s.externalLocationContext(context.Background(), location)
+}
+
+func (s *Server) externalLocationContext(ctx context.Context, location protocol.Location) protocol.Location {
+	location.URI = s.externalURIContext(ctx, location.URI)
 	return location
 }
 
 func (s *Server) externalLocations(locations []protocol.Location) []protocol.Location {
+	return s.externalLocationsContext(context.Background(), locations)
+}
+
+func (s *Server) externalLocationsContext(ctx context.Context, locations []protocol.Location) []protocol.Location {
 	for n := range locations {
-		locations[n].URI = s.externalURI(locations[n].URI)
+		if ctx.Err() != nil {
+			return locations[:n]
+		}
+		locations[n].URI = s.externalURIContext(ctx, locations[n].URI)
 	}
 	return locations
 }
@@ -94,7 +112,7 @@ func (s *Server) internalURIs(payload any) bool {
 // opening one must not enter it into the workspace document set, where it would
 // be parsed as project source and published diagnostics of its own.
 func (s *Server) mirrorsLibraryFile(raw json.RawMessage) bool {
-	if len(raw) == 0 || !bytes.Contains(raw, librarySourceMarker) {
+	if len(raw) == 0 || !bytes.Contains(raw, librarySourceBaseMarker) {
 		return false
 	}
 	var payload struct {
@@ -103,6 +121,8 @@ func (s *Server) mirrorsLibraryFile(raw json.RawMessage) bool {
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return false
 	}
-	_, mapped := s.index.LibraryURIForFile(payload.TextDocument.URI)
-	return mapped
+	if _, mapped := s.index.LibraryURIForFile(payload.TextDocument.URI); mapped {
+		return true
+	}
+	return s.index.IsLibraryMirrorFile(payload.TextDocument.URI)
 }

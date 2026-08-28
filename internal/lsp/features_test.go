@@ -50,7 +50,7 @@ func TestExtractRefactorsProduceSyntacticallyValidKotlinAndJava(t *testing.T) {
 
 func TestCreateJavaMethodQuickFixInfersCallShapeAndContext(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/CreateMethod.java")
 	source := "class CreateMethod {\n    static String use(int count) {\n        String result = générer(count, 1, 2L, 1.5f, true, \"x\", \"y\");\n        return result;\n    }\n}\n"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "java", Version: 1, Text: source})
@@ -79,7 +79,7 @@ func TestCreateJavaMethodQuickFixInfersCallShapeAndContext(t *testing.T) {
 
 func TestCreateJavaMethodQuickFixRejectsUnresolvedVariable(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/NoCreateMethod.java")
 	source := "class NoCreateMethod { int use() { return missing; } }\n"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "java", Version: 1, Text: source})
@@ -93,7 +93,7 @@ func TestCreateJavaMethodQuickFixRejectsUnresolvedVariable(t *testing.T) {
 
 func TestSignatureHelpMapsNamedArgumentAndShowsSourceDefaults(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/NamedSignature.kt")
 	source := "fun signatureNamed(first: Int = 0, second: Int = 0, third: Int = 0) {}\nfun use() { signatureNamed(third = 3) }\n"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: source})
@@ -139,7 +139,7 @@ func TestConstructorSignatureHelpSelectsApplicableKotlinAndJavaOverload(t *testi
 		if fixture.language == "java" && !strings.Contains(help.Signatures[help.ActiveSignature].Label, "String value") {
 			t.Fatalf("Java constructor signature is not Java syntax: %q", help.Signatures[help.ActiveSignature].Label)
 		}
-		s.index.Close()
+		s.Close()
 	}
 }
 
@@ -222,7 +222,7 @@ func TestExtractFunctionInfersImplicitCapturedLocalType(t *testing.T) {
 
 func TestExtractFunctionInJavaEnumStaysAfterConstants(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/E.java")
 	source := "enum E { A;\n  int f(int x) { return x + 1; }\n}\n"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "java", Version: 1, Text: source})
@@ -291,7 +291,7 @@ func TestFileTemplateInterpolation(t *testing.T) {
 
 func TestHighWatermarkFollowsConfiguredFileWithoutDocumentNotification(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	markTestServerInitialized(s)
 	path := filepath.Join(t.TempDir(), "watermark")
 	if err := os.WriteFile(path, []byte("1\n"), 0o600); err != nil {
@@ -326,6 +326,18 @@ func TestFormatterPreservesRawStringContentAndIsIdempotent(t *testing.T) {
 	}
 	if again := formatSource(formatted, options, true); again != formatted {
 		t.Fatalf("formatter is not idempotent:\nfirst:\n%s\nsecond:\n%s", formatted, again)
+	}
+}
+
+func TestJavaFormatterPreservesTextBlockContentAndIsIdempotent(t *testing.T) {
+	source := "class Demo {\nString value() {\nString text = \"\"\"\n  { literal brace }\n    intentionally indented\n\"\"\";\nreturn text;\n}\n}\n"
+	options := protocol.FormattingOptions{TabSize: 4, InsertSpaces: true, TrimTrailingWhitespace: true, InsertFinalNewline: true}
+	formatted := formatSource(source, options, false)
+	if !strings.Contains(formatted, "  { literal brace }\n    intentionally indented\n") {
+		t.Fatalf("Java text-block content changed:\n%s", formatted)
+	}
+	if again := formatSource(formatted, options, false); again != formatted {
+		t.Fatalf("Java text-block formatting is not idempotent:\n%s", again)
 	}
 }
 
@@ -415,7 +427,7 @@ func TestFormatterSpacesControlKeywordsAndComparisonOperators(t *testing.T) {
 
 func TestRangeFormattingPreservesLinesOutsideSelection(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/Range.kt")
 	source := "class Demo{\nfun untouched( ):Int{return 1}\nfun target(value:Int):Int{return value+1}\n}\n"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: source})
@@ -442,9 +454,58 @@ func TestRangeFormattingPreservesLinesOutsideSelection(t *testing.T) {
 	}
 }
 
+func TestRangeFormattingAbstainsInsideMultilineContent(t *testing.T) {
+	for _, fixture := range []struct {
+		name   string
+		source string
+		needle string
+	}{
+		{"triple string", "val text = \"\"\"first\ncontent   { untouched\nlast\"\"\"\n", "content"},
+		{"Java text block", "class C { String text = \"\"\"\ncontent   { untouched\n\"\"\"; }\n", "content"},
+		{"nested comment", "/* outer\n/* inner */\ncontent   { untouched\n*/\nclass C\n", "content"},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			s := NewServer(context.Background(), log.New(io.Discard, "", 0))
+			defer s.Close()
+			uri := protocol.URI("file:///workspace/Range.kt")
+			languageID := "kotlin"
+			if strings.HasPrefix(fixture.name, "Java") {
+				uri = protocol.URI("file:///workspace/Range.java")
+				languageID = "java"
+			}
+			s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: languageID, Version: 1, Text: fixture.source})
+			doc := textdoc.NewDocument(uri, languageID, 1, fixture.source)
+			start := strings.Index(fixture.source, fixture.needle)
+			result, responseErr := s.rangeFormatting(context.Background(), mustJSON(map[string]any{
+				"textDocument": map[string]any{"uri": uri},
+				"range":        doc.Range(start, start+len(fixture.needle)),
+				"options":      map[string]any{"tabSize": 4, "insertSpaces": true},
+			}))
+			if responseErr != nil {
+				t.Fatal(responseErr)
+			}
+			if edits := result.([]protocol.TextEdit); len(edits) != 0 {
+				t.Fatalf("multiline content was rewritten: %#v", edits)
+			}
+		})
+	}
+}
+
+func TestFormatterTracksNestedKotlinBlockComments(t *testing.T) {
+	state := formatLexState{}
+	scanStructure("/* outer /* inner */", &state)
+	if state.BlockCommentDepth != 1 {
+		t.Fatalf("nested comment depth after inner close = %d", state.BlockCommentDepth)
+	}
+	scanStructure("still outer */", &state)
+	if state.BlockCommentDepth != 0 {
+		t.Fatalf("nested comment depth after outer close = %d", state.BlockCommentDepth)
+	}
+}
+
 func TestPullDiagnosticsEncodesEmptyItemsAsArray(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/Clean.kt")
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: "class Clean\n"})
 	result, responseErr := s.diagnostic(mustJSON(map[string]any{"textDocument": map[string]any{"uri": uri}}))
@@ -601,9 +662,12 @@ func TestInlayHintInfersConstructorAndFactoryTypes(t *testing.T) {
 	}
 }
 
-func TestJavaLambdaParameterTypeInlay(t *testing.T) {
+// A java.util.function target can only be typed once the JDK is indexed; a
+// remembered table of JDK shapes would be a guess outside the index, so the
+// hint abstains when nothing in the index declares the interface.
+func TestJavaLambdaParameterTypeInlayAbstainsWithoutIndexedJDK(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/Lambda.java")
 	source := "import java.util.function.Function; class Lambda { Function<String,String> f = x -> x.trim(); }"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "java", Version: 1, Text: source})
@@ -612,17 +676,17 @@ func TestJavaLambdaParameterTypeInlay(t *testing.T) {
 	if responseErr != nil {
 		t.Fatal(responseErr)
 	}
+	lambdaPosition := doc.Position(strings.Index(source, "x ->") + 1)
 	for _, hint := range result.([]protocol.InlayHint) {
-		if hint.Label == ": String" && hint.Position == doc.Position(strings.Index(source, "x ->")+1) {
-			return
+		if hint.Position == lambdaPosition {
+			t.Fatalf("unindexed JDK functional interface produced a lambda parameter hint: %#v", result)
 		}
 	}
-	t.Fatalf("Java lambda parameter hint missing: %#v", result)
 }
 
 func TestJavaVarGetsImplicitTypeInlay(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/Var.java")
 	source := "class Var { void use() { var text = \"hello\"; } }"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "java", Version: 1, Text: source})
@@ -641,7 +705,7 @@ func TestJavaVarGetsImplicitTypeInlay(t *testing.T) {
 
 func TestCustomJavaSAMParameterTypeInlay(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/CustomLambda.java")
 	source := "interface MyFunc { String run(Integer value); } class Use { MyFunc f = x -> x.toString(); }"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "java", Version: 1, Text: source})
@@ -652,6 +716,25 @@ func TestCustomJavaSAMParameterTypeInlay(t *testing.T) {
 	}
 	if hints := result.([]protocol.InlayHint); len(hints) == 0 || hints[0].Label != ": Integer" {
 		t.Fatalf("custom SAM lambda hint = %#v", hints)
+	}
+}
+
+func TestJavaLambdaHintAbstainsForNonFunctionalInterface(t *testing.T) {
+	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
+	defer s.Close()
+	uri := protocol.URI("file:///workspace/NotSAM.java")
+	source := "interface NotSAM { String first(Integer value); String second(Integer value); } class Use { NotSAM f = x -> x.toString(); }"
+	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "java", Version: 1, Text: source})
+	doc := textdoc.NewDocument(uri, "java", 1, source)
+	result, responseErr := s.inlayHints(mustJSON(map[string]any{"textDocument": map[string]any{"uri": uri}, "range": doc.Range(0, len(source))}))
+	if responseErr != nil {
+		t.Fatal(responseErr)
+	}
+	lambdaPosition := doc.Position(strings.Index(source, "x ->") + 1)
+	for _, hint := range result.([]protocol.InlayHint) {
+		if hint.Position == lambdaPosition {
+			t.Fatalf("non-functional interface produced a lambda parameter hint: %#v", result)
+		}
 	}
 }
 
@@ -686,7 +769,7 @@ func TestRenameIdentifierRulesAreLanguageSpecific(t *testing.T) {
 
 func TestRenameKotlinOperatorMatchesIntelliJStructuralEdits(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/OperatorRename.kt")
 	source := "class Box { operator fun plus(other: Box): Box = this }\nfun use(left: Box, right: Box) = left + right\n"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: source})
@@ -737,7 +820,7 @@ func TestModCommandChoiceSessionsAreOneShot(t *testing.T) {
 
 func TestExtractCodeActionUsesOpenKotlinWireAndAppliesThroughClient(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	markTestServerInitialized(s)
 	uri := protocol.URI("file:///workspace/Extract.kt")
 	source := "class Extract { fun value(): Int { return 1 + 2 } }\n"
@@ -788,7 +871,7 @@ func TestExtractCodeActionUsesOpenKotlinWireAndAppliesThroughClient(t *testing.T
 
 func TestCompletionApplyUsesLanguageSpecificWireAndLiveKotlinSession(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	markTestServerInitialized(s)
 	widgetURI := protocol.URI("file:///workspace/model/Widget.kt")
 	useURI := protocol.URI("file:///workspace/app/Use.kt")
@@ -866,7 +949,7 @@ func markTestServerInitialized(s *Server) {
 
 func TestCompletionAndWorkspaceSymbolsReturnEveryMatch(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/AllCandidates.kt")
 	var source strings.Builder
 	for number := range 350 {
@@ -911,7 +994,7 @@ func TestCompletionAndWorkspaceSymbolsReturnEveryMatch(t *testing.T) {
 
 func TestQualifiedCompletionSuppressesUnrelatedKeywords(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/Qualified.kt")
 	source := "class A { fun make() = A() }\nfun use(a: A) { a.ma }\n"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: source})
@@ -936,7 +1019,7 @@ func TestQualifiedCompletionSuppressesUnrelatedKeywords(t *testing.T) {
 
 func TestJavaAnnotationAttributeCompletion(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/Config.java")
 	source := "@interface Config { String path(); int count(); }\n@Config(pa) class Use {}\n"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "java", Version: 1, Text: source})
@@ -961,7 +1044,7 @@ func TestJavaAnnotationAttributeCompletion(t *testing.T) {
 
 func TestJavaAnnotationCompletionOmitsAlreadyAssignedAttribute(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/AssignedConfig.java")
 	source := "@interface Config { String path(); int count(); }\n@Config(path=\"x\", pa) class Use {}\n"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "java", Version: 1, Text: source})
@@ -977,7 +1060,7 @@ func TestJavaAnnotationCompletionOmitsAlreadyAssignedAttribute(t *testing.T) {
 
 func TestJavaLabelAndModuleReferenceCompletion(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	labelURI := protocol.URI("file:///workspace/C.java")
 	labelSource := "class C { void f(){ outer: while(true){ break ou; } } }"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: labelURI, LanguageID: "java", Version: 1, Text: labelSource})
@@ -1001,7 +1084,7 @@ func TestJavaLabelAndModuleReferenceCompletion(t *testing.T) {
 
 func TestJavaLabelCompletionRespectsLabeledStatementScope(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/LabelScope.java")
 	source := "class C { void a(){ first: while(true){} } void b(){ break fi; } }"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "java", Version: 1, Text: source})
@@ -1017,7 +1100,7 @@ func TestJavaLabelCompletionRespectsLabeledStatementScope(t *testing.T) {
 
 func TestAmbiguousImportChooseActionRetainsRealServerSideActions(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	uri := protocol.URI("file:///workspace/app/Use.kt")
 	source := "package app\nfun use(value: Widget) = value\n"
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: source})
@@ -1125,7 +1208,7 @@ func TestRenameTypeAlsoRenamesMatchingSourceFile(t *testing.T) {
 
 func TestDirectoryPackageMoveUpdatesQualifiedReferences(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	root := t.TempDir()
 	oldDir := filepath.Join(root, "src", "p")
 	newDir := filepath.Join(root, "src", "q")
@@ -1153,7 +1236,7 @@ func TestDirectoryPackageMoveUpdatesQualifiedReferences(t *testing.T) {
 
 func TestHoverReferenceRangeBelongsToRequestedDocument(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	declarationURI := protocol.URI("file:///workspace/Target.kt")
 	useURI := protocol.URI("file:///workspace/Use.kt")
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: declarationURI, LanguageID: "kotlin", Version: 1, Text: "class Target\n"})
@@ -1173,7 +1256,7 @@ func TestHoverReferenceRangeBelongsToRequestedDocument(t *testing.T) {
 
 func TestKotlinCompletionEscapesJavaKeywordMember(t *testing.T) {
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	defer s.index.Close()
+	defer s.Close()
 	javaURI := protocol.URI("file:///workspace/Weird.java")
 	kotlinURI := protocol.URI("file:///workspace/Use.kt")
 	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: javaURI, LanguageID: "java", Version: 1, Text: "public class Weird { public void is() {} }"})

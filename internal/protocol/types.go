@@ -184,6 +184,37 @@ type FullDocumentDiagnosticReport struct {
 	Items    []Diagnostic `json:"items"`
 }
 
+type WorkspaceDocumentDiagnosticReport struct {
+	URI      URI          `json:"uri"`
+	Version  *int         `json:"version,omitempty"`
+	Kind     string       `json:"kind"`
+	ResultID string       `json:"resultId,omitempty"`
+	Items    []Diagnostic `json:"items,omitempty"`
+}
+
+// MarshalJSON keeps the report's shape aligned with its kind: a full report
+// always carries an "items" array (an empty one for a clean document; clients
+// index it unconditionally), while an unchanged report carries none.
+func (r WorkspaceDocumentDiagnosticReport) MarshalJSON() ([]byte, error) {
+	type plain WorkspaceDocumentDiagnosticReport
+	if r.Kind == "full" {
+		items := r.Items
+		if items == nil {
+			items = []Diagnostic{}
+		}
+		return json.Marshal(struct {
+			plain
+			Items []Diagnostic `json:"items"`
+		}{plain(r), items})
+	}
+	r.Items = nil
+	return json.Marshal(plain(r))
+}
+
+type WorkspaceDiagnosticReport struct {
+	Items []WorkspaceDocumentDiagnosticReport `json:"items"`
+}
+
 type CodeAction struct {
 	Title       string         `json:"title"`
 	Kind        string         `json:"kind,omitempty"`
@@ -213,6 +244,17 @@ type FoldingRange struct {
 type SemanticTokens struct {
 	ResultID string   `json:"resultId,omitempty"`
 	Data     []uint32 `json:"data"`
+}
+
+type SemanticTokensEdit struct {
+	Start       int      `json:"start"`
+	DeleteCount int      `json:"deleteCount"`
+	Data        []uint32 `json:"data,omitempty"`
+}
+
+type SemanticTokensDelta struct {
+	ResultID string               `json:"resultId,omitempty"`
+	Edits    []SemanticTokensEdit `json:"edits"`
 }
 
 type InlayHintLabelPart struct {

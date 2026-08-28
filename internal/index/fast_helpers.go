@@ -219,7 +219,7 @@ func isKotlinClassLike(kind analysis.SymbolKind) bool {
 // typeMembersLocked lists the declared members of one type.
 func (i *Index) typeMembersLocked(owner analysis.Symbol) []*analysis.Symbol {
 	out := make([]*analysis.Symbol, 0, 8)
-	for _, id := range i.byContainerName[owner.Name] {
+	for _, id := range i.byContainerName[owner.ID] {
 		member := i.symbols[id]
 		if member == nil || member.ContainerID != owner.ID || member.Synthetic {
 			continue

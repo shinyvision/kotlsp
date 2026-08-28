@@ -11,13 +11,14 @@ import (
 	"time"
 
 	"github.com/shinyvision/kotlsp/internal/lsp"
+	"github.com/shinyvision/kotlsp/internal/resourcebudget"
 )
 
 var version = "dev"
 
 func main() {
 	debug.SetGCPercent(100)
-	debug.SetMemoryLimit(3 << 30)
+	debug.SetMemoryLimit(resourcebudget.GoSoftLimitBytes)
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "version", "--version", "-version":

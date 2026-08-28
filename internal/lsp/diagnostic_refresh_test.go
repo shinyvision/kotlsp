@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log"
 	"sync/atomic"
@@ -15,7 +16,7 @@ import (
 func diagnosticServer(t *testing.T, capabilities map[string]any) (*Server, *recordingConn) {
 	t.Helper()
 	s := NewServer(context.Background(), log.New(io.Discard, "", 0))
-	t.Cleanup(func() { s.index.Close() })
+	t.Cleanup(func() { s.Close() })
 	s.initializeReceived.Store(true)
 	s.initialized.Store(true)
 	recorder := &recordingConn{}
@@ -40,6 +41,23 @@ func TestDiagnosticsAreNotPushedToAPullingClient(t *testing.T) {
 	pushOnly.publishDiagnostics(protocol.URI("file:///workspace/A.kt"), []protocol.Diagnostic{{Message: "x"}})
 	if got := len(pushRecorder.snapshot()); got != 1 {
 		t.Fatalf("a client without pull support got %d notifications, want 1", got)
+	}
+}
+
+func TestWorkspaceDiagnosticsStreamsPartialResults(t *testing.T) {
+	s, recorder := diagnosticServer(t, map[string]any{"textDocument": map[string]any{"diagnostic": map[string]any{}}})
+	uri := protocol.URI("file:///workspace/Partial.kt")
+	s.index.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: "class Partial\n"})
+	result, responseErr := s.workspaceDiagnostics(context.Background(), json.RawMessage(`{"partialResultToken":"diagnostics-1"}`))
+	if responseErr != nil {
+		t.Fatal(responseErr)
+	}
+	if items := result.(protocol.WorkspaceDiagnosticReport).Items; len(items) != 0 {
+		t.Fatalf("final response repeated streamed diagnostics: %#v", items)
+	}
+	notifications := recorder.snapshot()
+	if len(notifications) != 1 || notifications[0]["__method"] != "$/progress" || notifications[0]["token"] != "diagnostics-1" {
+		t.Fatalf("partial diagnostic notification = %#v", notifications)
 	}
 }
 

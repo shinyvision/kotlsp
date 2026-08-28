@@ -34,7 +34,7 @@ func copyTree(t *testing.T, source, destination string) {
 		if readErr != nil {
 			return nil
 		}
-		return os.WriteFile(target, data, 0o644)
+		return os.WriteFile(target, data, info.Mode().Perm())
 	})
 	if err != nil {
 		t.Fatalf("copying the corpus: %v", err)

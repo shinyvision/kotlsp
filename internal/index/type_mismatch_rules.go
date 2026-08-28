@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
+	"github.com/shinyvision/kotlsp/internal/lexical"
 	"github.com/shinyvision/kotlsp/internal/protocol"
 )
 
@@ -28,6 +29,19 @@ func literalTypeMismatches(i *Index, file *analysis.ParsedFile) []protocol.Diagn
 	}
 	text := document.Text
 	var out []protocol.Diagnostic
+	type declaredTypeFacts struct{ builtin, nonNull string }
+	typeFacts := make(map[string]declaredTypeFacts)
+	factsFor := func(declared string) declaredTypeFacts {
+		if facts, exists := typeFacts[declared]; exists {
+			return facts
+		}
+		facts := declaredTypeFacts{
+			builtin: i.builtinExpectedTypeLocked(file, declared),
+			nonNull: i.nonNullDeclaredTypeLocked(file, declared),
+		}
+		typeFacts[declared] = facts
+		return facts
+	}
 	for index := range file.Symbols {
 		symbol := &file.Symbols[index]
 		// A top-level declaration also carries a synthetic JVM-facade view of
@@ -44,13 +58,14 @@ func literalTypeMismatches(i *Index, file *analysis.ParsedFile) []protocol.Diagn
 			if !ok {
 				continue
 			}
+			facts := factsFor(symbol.Type)
 			if strings.TrimSpace(text[start:end]) == "null" {
-				if nonNull := i.nonNullDeclaredTypeLocked(file, symbol.Type); nonNull != "" {
+				if nonNull := facts.nonNull; nonNull != "" {
 					out = append(out, nullForNonNull(document, start, end, nonNull))
 				}
 				continue
 			}
-			expected := i.builtinExpectedTypeLocked(file, symbol.Type)
+			expected := facts.builtin
 			if expected == "" {
 				continue
 			}
@@ -64,8 +79,9 @@ func literalTypeMismatches(i *Index, file *analysis.ParsedFile) []protocol.Diagn
 				Message: "Initializer type mismatch: expected '" + expected + "', actual '" + actual + "'.",
 			})
 		case analysis.KindFunction, analysis.KindMethod:
-			expected := i.builtinExpectedTypeLocked(file, symbol.Type)
-			nonNull := i.nonNullDeclaredTypeLocked(file, symbol.Type)
+			facts := factsFor(symbol.Type)
+			expected := facts.builtin
+			nonNull := facts.nonNull
 			if strings.TrimSpace(symbol.Type) == "" {
 				// A block body with no declared type returns Unit; any
 				// value returned from it is a mismatch.
@@ -124,18 +140,16 @@ func returnMismatches(document interface {
 		}
 		// Offsets below index into body as sliced, so it is cut, never trimmed.
 		body = body[:closing]
+		tokens, complete := lexical.TokenizeBounded(body, true, 100_000)
+		if !complete {
+			return nil
+		}
 		var out []protocol.Diagnostic
-		offset := 0
-		for offset < len(body) {
-			at := strings.Index(body[offset:], "return")
-			if at < 0 {
-				break
-			}
-			start := offset + at + len("return")
-			if at > 0 && isIdentifierByteFast(body[offset+at-1]) || start < len(body) && isIdentifierByteFast(body[start]) {
-				offset = start
+		for _, token := range tokens {
+			if token.Kind != lexical.Identifier || token.Text != "return" {
 				continue
 			}
+			start := token.End
 			for start < len(body) && (body[start] == ' ' || body[start] == '\t') {
 				start++
 			}
@@ -150,12 +164,11 @@ func returnMismatches(document interface {
 			} else if expected != "" && expected != "Unit" {
 				// A bare 'return' yields Unit.
 				out = append(out, protocol.Diagnostic{
-					Range: document.Range(tailStart+brace+1+offset+at, tailStart+brace+1+offset+at+len("return")), Severity: 1, Source: "kotlsp",
+					Range: document.Range(tailStart+brace+1+token.Start, tailStart+brace+1+token.End), Severity: 1, Source: "kotlsp",
 					Code:    "RETURN_TYPE_MISMATCH",
 					Message: "Return type mismatch: expected '" + expected + "', actual 'Unit'.",
 				})
 			}
-			offset = end
 		}
 		return out
 	}

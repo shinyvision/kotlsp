@@ -144,8 +144,14 @@ func waitForCompilerPass(t *testing.T, idx *Index, timeout time.Duration) bool {
 	passes := idx.CompilerPasses("kotlin")
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		// Findings stay in a private transaction until both language passes
+		// have finished, so a completed Kotlin pass alone is not an oracle yet.
 		if idx.CompilerPasses("kotlin") > passes {
-			return true
+			for _, status := range idx.CompilerStatus() {
+				if status.Published {
+					return true
+				}
+			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

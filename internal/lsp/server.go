@@ -32,35 +32,51 @@ import (
 const latencyLimit = 100 * time.Millisecond
 
 type Server struct {
-	ctx                     context.Context
-	conn                    *jsonrpc.Conn
-	index                   *index.Index
-	log                     *log.Logger
-	initializeReceived      atomic.Bool
-	initialized             atomic.Bool
-	shutdown                atomic.Bool
-	runMainCodeLens         atomic.Bool
-	rootMu                  sync.RWMutex
-	roots                   []protocol.URI
-	clientCaps              map[string]any
-	latencyMu               sync.Mutex
-	latency                 map[string]time.Duration
-	dap                     *dap.Server
-	watermark               atomic.Int64
-	watermarkPath           string
-	defaultJavaHome         string
-	modMu                   sync.Mutex
-	modSequence             atomic.Int64
-	modSessions             map[int64][]map[string]any
-	modSessionCreated       map[int64]time.Time
-	completionMu            sync.Mutex
-	completionSequence      atomic.Int64
-	completionGeneration    atomic.Int64
-	completionSessions      map[int64]completionApplication
-	progressActive          atomic.Bool
-	progressSequence        atomic.Int64
-	diagnosticRefreshActive atomic.Bool
-	compilerProgressActive  atomic.Bool
+	ctx                      context.Context
+	cancel                   context.CancelFunc
+	closeOnce                sync.Once
+	backgroundMu             sync.Mutex
+	backgroundWG             sync.WaitGroup
+	closing                  bool
+	conn                     *jsonrpc.Conn
+	index                    *index.Index
+	log                      *log.Logger
+	initializeReceived       atomic.Bool
+	initialized              atomic.Bool
+	shutdown                 atomic.Bool
+	runMainCodeLens          atomic.Bool
+	rootMu                   sync.RWMutex
+	roots                    []protocol.URI
+	clientCaps               map[string]any
+	latencyMu                sync.Mutex
+	latency                  map[string]time.Duration
+	dap                      *dap.Server
+	watermark                atomic.Int64
+	watermarkPath            string
+	defaultJavaHome          string
+	modMu                    sync.Mutex
+	modSequence              atomic.Int64
+	modSessions              map[int64][]map[string]any
+	modSessionCreated        map[int64]time.Time
+	completionMu             sync.Mutex
+	completionSequence       atomic.Int64
+	completionGeneration     atomic.Int64
+	completionSessions       map[int64]completionApplication
+	progressActive           atomic.Bool
+	progressSequence         atomic.Int64
+	diagnosticRefreshActive  atomic.Bool
+	diagnosticRefreshPending atomic.Bool
+	diagnosticIndexWait      atomic.Bool
+	compilerProgressActive   atomic.Bool
+	droppedNotifications     atomic.Uint64
+	fallbackWatcherStarted   atomic.Bool
+	fallbackWatcherHash      atomic.Uint64
+	fallbackRefreshMu        sync.Mutex
+	fallbackSourceMu         sync.Mutex
+	fallbackSources          map[protocol.URI]index.SourceFileStamp
+	semanticTokensMu         sync.Mutex
+	semanticTokenResults     map[string][]uint32
+	semanticTokenOrder       []string
 	// clientCall is injected by the benchmark and focused unit tests. Production
 	// traffic always uses conn; keeping the same request/response contract means
 	// server-initiated requests can never be silently treated as successful.
@@ -112,8 +128,7 @@ func Serve(ctx context.Context, in io.Reader, out io.Writer, logPath string) err
 	s := NewServer(ctx, logger)
 	conn := jsonrpc.NewConn(in, out, s)
 	s.conn = conn
-	defer s.index.Close()
-	defer s.closeDAP()
+	defer s.Close()
 	return conn.Run(ctx)
 }
 
@@ -121,7 +136,11 @@ func NewServer(ctx context.Context, logger *log.Logger) *Server {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
-	s := &Server{ctx: ctx, log: logger, latency: make(map[string]time.Duration), modSessions: make(map[int64][]map[string]any), modSessionCreated: make(map[int64]time.Time), completionSessions: make(map[int64]completionApplication)}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	serverCtx, cancel := context.WithCancel(ctx)
+	s := &Server{ctx: serverCtx, cancel: cancel, log: logger, latency: make(map[string]time.Duration), modSessions: make(map[int64][]map[string]any), modSessionCreated: make(map[int64]time.Time), completionSessions: make(map[int64]completionApplication)}
 	s.watermark.Store(time.Now().UnixMilli())
 	s.index = index.New(func(uri protocol.URI, diagnostics []protocol.Diagnostic) {
 		if s.conn != nil {
@@ -131,12 +150,52 @@ func NewServer(ctx context.Context, logger *log.Logger) *Server {
 	// Compiler validation finishes long after the edit that triggered it. A
 	// client that pulls diagnostics has to be told to ask again, or the
 	// recomputed set is never seen.
-	s.index.SetDiagnosticsListener(s.refreshDiagnostics)
+	s.index.SetDiagnosticsListener(s.queueDiagnosticRefresh)
 	return s
+}
+
+// Close is the server lifecycle barrier. Canceling the owned context first
+// stops progress/watch/refresh publishers; Index.Close then waits for every
+// registered index task before compiler hosts and syntax trees are released.
+func (s *Server) Close() {
+	s.closeOnce.Do(func() {
+		s.backgroundMu.Lock()
+		s.closing = true
+		if s.cancel != nil {
+			s.cancel()
+		}
+		s.backgroundMu.Unlock()
+		s.closeDAP()
+		s.backgroundWG.Wait()
+		s.index.Close()
+	})
+}
+
+func (s *Server) launchBackground(work func()) bool {
+	if work == nil {
+		return false
+	}
+	s.backgroundMu.Lock()
+	if s.closing || s.ctx.Err() != nil {
+		s.backgroundMu.Unlock()
+		return false
+	}
+	s.backgroundWG.Add(1)
+	s.backgroundMu.Unlock()
+	go func() {
+		defer s.backgroundWG.Done()
+		work()
+	}()
+	return true
 }
 
 func (s *Server) Request(ctx context.Context, method string, params json.RawMessage) (result any, responseErr *jsonrpc.ResponseError) {
 	start := time.Now()
+	if budget := requestBudget(method); budget > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			result = nil
@@ -171,67 +230,71 @@ func (s *Server) Request(ctx context.Context, method string, params json.RawMess
 		s.shutdown.Store(true)
 		return nil, nil
 	case "textDocument/completion":
-		return s.completion(params)
+		return s.completion(params, ctx)
 	case "completionItem/resolve":
 		return s.resolveCompletion(params)
 	case "textDocument/hover":
-		return s.hover(params)
+		return s.hover(params, ctx)
 	case "textDocument/definition":
-		return s.definition(params, false)
+		return s.definition(params, false, ctx)
 	case "textDocument/declaration":
-		return s.definition(params, false)
+		return s.definition(params, false, ctx)
 	case "textDocument/typeDefinition":
-		return s.definition(params, true)
+		return s.definition(params, true, ctx)
 	case "textDocument/implementation":
-		return s.implementation(params)
+		return s.implementation(params, ctx)
 	case "textDocument/references":
-		return s.references(params)
+		return s.references(params, ctx)
 	case "textDocument/documentHighlight":
-		return s.documentHighlight(params)
+		return s.documentHighlight(params, ctx)
 	case "textDocument/documentSymbol":
-		return s.documentSymbols(params)
+		return s.documentSymbols(params, ctx)
 	case "workspace/symbol":
-		return s.workspaceSymbols(params)
+		return s.workspaceSymbols(params, ctx)
 	case "textDocument/formatting":
 		return s.formatting(ctx, params)
 	case "textDocument/rangeFormatting":
 		return s.rangeFormatting(ctx, params)
 	case "textDocument/codeAction":
-		return s.codeActions(params)
+		return s.codeActions(params, ctx)
 	case "textDocument/diagnostic":
-		return s.diagnostic(params)
+		return s.diagnostic(params, ctx)
+	case "workspace/diagnostic":
+		return s.workspaceDiagnostics(ctx, params)
 	case "textDocument/codeLens":
-		return s.codeLens(params)
+		return s.codeLens(params, ctx)
 	case "textDocument/foldingRange":
-		return s.foldingRanges(params)
+		return s.foldingRanges(params, ctx)
 	case "textDocument/semanticTokens/full":
-		return s.semanticTokens(params, nil)
+		return s.semanticTokens(params, nil, ctx)
+	case "textDocument/semanticTokens/full/delta":
+		return s.semanticTokensDelta(params, ctx)
 	case "textDocument/semanticTokens/range":
-		return s.semanticTokensRange(params)
+		return s.semanticTokensRange(params, ctx)
 	case "textDocument/inlayHint":
-		return s.inlayHints(params)
+		return s.inlayHints(params, ctx)
 	case "inlayHint/resolve":
 		return s.resolveInlayHint(params)
 	case "textDocument/signatureHelp":
-		return s.signatureHelp(params)
+		return s.signatureHelp(params, ctx)
 	case "textDocument/prepareCallHierarchy":
-		return s.prepareHierarchy(params, false)
+		return s.prepareHierarchy(params, false, ctx)
 	case "callHierarchy/incomingCalls":
-		return s.incomingCalls(params)
+		return s.incomingCalls(params, ctx)
 	case "callHierarchy/outgoingCalls":
-		return s.outgoingCalls(params)
+		return s.outgoingCalls(params, ctx)
 	case "textDocument/prepareTypeHierarchy":
-		return s.prepareHierarchy(params, true)
+		return s.prepareHierarchy(params, true, ctx)
 	case "typeHierarchy/supertypes":
-		return s.typeHierarchy(params, true)
+		return s.typeHierarchy(params, true, ctx)
 	case "typeHierarchy/subtypes":
-		return s.typeHierarchy(params, false)
+		return s.typeHierarchy(params, false, ctx)
 	case "textDocument/rename":
-		return s.rename(params)
+		return s.rename(params, ctx)
 	case "textDocument/prepareRename":
-		return s.prepareRename(params)
+		return s.prepareRename(params, ctx)
 	case "workspace/willRenameFiles":
-		return s.willRenameFiles(params)
+		return s.willRenameFiles(params, ctx)
 	case "workspace/executeCommand":
 		return s.executeCommand(ctx, params)
 	case "kotlsp/status":
@@ -241,9 +304,39 @@ func (s *Server) Request(ctx context.Context, method string, params json.RawMess
 	}
 }
 
+func requestBudget(method string) time.Duration {
+	switch method {
+	case "initialize", "shutdown", "workspace/executeCommand", "workspace/willRenameFiles":
+		return 2 * time.Second
+	case "workspace/symbol", "textDocument/references", "textDocument/rename":
+		return 500 * time.Millisecond
+	case "workspace/diagnostic":
+		// A workspace report evaluates every document's fast rules; on a
+		// modest Spring project that is seconds, not milliseconds, and a
+		// pull client that receives an error here shows nothing at all.
+		return 15 * time.Second
+	default:
+		return latencyLimit
+	}
+}
+
+func operationContext(contexts []context.Context) context.Context {
+	if len(contexts) > 0 && contexts[0] != nil {
+		return contexts[0]
+	}
+	return context.Background()
+}
+
+func canceledResponse(ctx context.Context) *jsonrpc.ResponseError {
+	if err := ctx.Err(); err != nil {
+		return &jsonrpc.ResponseError{Code: jsonrpc.RequestCanceled, Message: err.Error()}
+	}
+	return nil
+}
+
 func (s *Server) Notify(ctx context.Context, method string, params json.RawMessage) {
 	if method == "exit" {
-		s.index.Close()
+		s.Close()
 		if s.conn != nil {
 			s.conn.Stop()
 		}
@@ -253,7 +346,9 @@ func (s *Server) Notify(ctx context.Context, method string, params json.RawMessa
 		if s.initializeReceived.Load() && !s.shutdown.Load() {
 			s.initialized.Store(true)
 			if s.clientCapabilityBool("workspace", "didChangeWatchedFiles", "dynamicRegistration") {
-				go s.registerWatchedFiles()
+				s.launchBackground(s.registerWatchedFiles)
+			} else {
+				s.startFallbackWatcher()
 			}
 			s.reportIndexingProgress()
 			s.refreshDiagnosticsWhenIndexed()
@@ -276,14 +371,15 @@ func (s *Server) Notify(ctx context.Context, method string, params json.RawMessa
 	switch method {
 	case "textDocument/didOpen":
 		var p protocol.DidOpenTextDocumentParams
-		if decode(params, &p) == nil {
+		if s.decodeNotification(method, params, &p) {
 			s.index.Open(ctx, p.TextDocument)
 			s.markWatermark()
 		}
 	case "textDocument/didChange":
 		var p protocol.DidChangeTextDocumentParams
-		if decode(params, &p) == nil {
+		if s.decodeNotification(method, params, &p) {
 			if _, err := s.index.Change(ctx, p); err != nil {
+				s.droppedNotifications.Add(1)
 				s.log.Printf("didChange: %v", err)
 			} else {
 				s.markWatermark()
@@ -291,7 +387,7 @@ func (s *Server) Notify(ctx context.Context, method string, params json.RawMessa
 		}
 	case "textDocument/didClose":
 		var p protocol.DidCloseTextDocumentParams
-		if decode(params, &p) == nil {
+		if s.decodeNotification(method, params, &p) {
 			s.completionMu.Lock()
 			for id, application := range s.completionSessions {
 				if application.URI == p.TextDocument.URI {
@@ -304,7 +400,7 @@ func (s *Server) Notify(ctx context.Context, method string, params json.RawMessa
 		}
 	case "textDocument/didSave":
 		var p protocol.DidSaveTextDocumentParams
-		if decode(params, &p) == nil {
+		if s.decodeNotification(method, params, &p) {
 			s.index.Save(ctx, p.TextDocument.URI)
 			s.markWatermark()
 		}
@@ -316,9 +412,20 @@ func (s *Server) Notify(ctx context.Context, method string, params json.RawMessa
 	}
 }
 
+func (s *Server) decodeNotification(method string, raw json.RawMessage, value any) bool {
+	if err := decode(raw, value); err != nil {
+		s.droppedNotifications.Add(1)
+		s.log.Printf("dropped %s notification: %v (paramsBytes=%d)", method, err, len(raw))
+		return false
+	}
+	return true
+}
+
 func (s *Server) registerWatchedFiles() {
 	watchers := make([]map[string]any, 0, 14)
-	for _, pattern := range []string{"**/*.kt", "**/*.kts", "**/*.java", "**/*.jar", "**/build.gradle", "**/build.gradle.kts", "**/settings.gradle", "**/settings.gradle.kts", "**/gradle.properties", "**/pom.xml", "**/MODULE.bazel", "**/WORKSPACE", "**/WORKSPACE.bazel", "**/BUILD", "**/BUILD.bazel", "**/*.bzl"} {
+	patterns := []string{"**/*.kt", "**/*.kts", "**/*.java", "**/*.jar"}
+	patterns = append(patterns, index.BuildModelWatchPatterns()...)
+	for _, pattern := range patterns {
 		watchers = append(watchers, map[string]any{"globPattern": pattern, "kind": 7})
 	}
 	err := s.callClient(s.ctx, "client/registerCapability", map[string]any{"registrations": []any{map[string]any{
@@ -327,6 +434,114 @@ func (s *Server) registerWatchedFiles() {
 	}}}, nil)
 	if err != nil && s.ctx.Err() == nil {
 		s.log.Printf("register watched files: %v", err)
+		s.startFallbackWatcher()
+	}
+}
+
+func (s *Server) startFallbackWatcher() {
+	if !s.fallbackWatcherStarted.CompareAndSwap(false, true) {
+		return
+	}
+	s.fallbackWatcherHash.Store(s.index.WorkspaceBuildFingerprint(false))
+	const maxFallbackSourceFiles = 250000
+	initialSources, initialExhausted := s.index.WorkspaceSourceSnapshot(s.ctx, maxFallbackSourceFiles)
+	if !initialExhausted {
+		s.fallbackSourceMu.Lock()
+		s.fallbackSources = initialSources
+		s.fallbackSourceMu.Unlock()
+	}
+	s.launchBackground(func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		polls := 0
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-ticker.C:
+				polls++
+				s.refreshFallbackSources(maxFallbackSourceFiles, polls%10 == 0)
+				// Full manifest rediscovery is deliberately rare. It catches a
+				// newly created build file without walking a monorepo every poll.
+				current := s.index.WorkspaceBuildFingerprint(polls%10 == 0)
+				previous := s.fallbackWatcherHash.Load()
+				if current == previous {
+					continue
+				}
+				s.log.Printf("fallback watcher detected a build/archive change; refreshing project model")
+				if <-s.index.RefreshBuildChangesResult(s.ctx, nil) {
+					s.fallbackWatcherHash.Store(current)
+					s.markWatermark()
+				} else {
+					s.log.Printf("fallback watcher retained the previous build fingerprint for retry")
+				}
+			}
+		}
+	})
+}
+
+func (s *Server) refreshFallbackSources(limit int, verifyContent ...bool) {
+	s.fallbackRefreshMu.Lock()
+	defer s.fallbackRefreshMu.Unlock()
+	current, exhausted := s.index.WorkspaceSourceSnapshot(s.ctx, limit, verifyContent...)
+	if exhausted {
+		s.log.Printf("fallback source watcher exceeded its %d-file safety limit; retaining the previous snapshot", limit)
+		return
+	}
+	s.fallbackSourceMu.Lock()
+	previous := make(map[protocol.URI]index.SourceFileStamp, len(s.fallbackSources))
+	for uri, stamp := range s.fallbackSources {
+		previous[uri] = stamp
+	}
+	s.fallbackSourceMu.Unlock()
+	var reload []protocol.URI
+	var removed []protocol.URI
+	contentVerified := len(verifyContent) > 0 && verifyContent[0]
+	for uri, stamp := range current {
+		old, exists := previous[uri]
+		metadataChanged := !exists || old.Size != stamp.Size || old.ModifiedUnixNano != stamp.ModifiedUnixNano
+		if metadataChanged || contentVerified && old.ContentHash != stamp.ContentHash {
+			reload = append(reload, uri)
+		}
+	}
+	for uri := range previous {
+		if _, exists := current[uri]; !exists {
+			removed = append(removed, uri)
+		}
+	}
+	if len(reload) == 0 && len(removed) == 0 {
+		return
+	}
+	changed, complete := false, true
+	for _, uri := range removed {
+		if actuallyRemoved, handled := s.index.RemoveClosedResult(uri); handled {
+			if actuallyRemoved {
+				s.publishDiagnostics(uri, []protocol.Diagnostic{})
+				changed = true
+			}
+			delete(previous, uri)
+		} else {
+			complete = false
+		}
+	}
+	for _, uri := range reload {
+		if <-s.index.ReloadResult(s.ctx, uri) {
+			previous[uri] = current[uri]
+			changed = true
+		} else {
+			complete = false
+		}
+	}
+	s.fallbackSourceMu.Lock()
+	s.fallbackSources = previous
+	s.fallbackSourceMu.Unlock()
+	if changed {
+		s.index.ScheduleCompilerDiagnostics(s.ctx)
+	}
+	if complete {
+		s.markWatermark()
+	} else {
+		s.log.Printf("fallback source watcher retained failed file stamps for retry")
 	}
 }
 
@@ -352,7 +567,12 @@ func (s *Server) refreshWatermarkFile() {
 	if info, err := os.Stat(path); err == nil {
 		value = info.ModTime().UnixMilli()
 	}
-	if data, err := os.ReadFile(path); err == nil {
+	if file, err := os.Open(path); err == nil {
+		data, readErr := io.ReadAll(io.LimitReader(file, 4097))
+		_ = file.Close()
+		if readErr != nil || len(data) > 4096 {
+			return
+		}
 		if parsed, parseErr := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); parseErr == nil && parsed > value {
 			value = parsed
 		}
@@ -434,9 +654,9 @@ func serverCapabilities() map[string]any {
 		"documentSymbolProvider":    true, "workspaceSymbolProvider": map[string]any{"resolveProvider": false, "workDoneProgress": true},
 		"documentFormattingProvider": true, "documentRangeFormattingProvider": true,
 		"codeActionProvider": map[string]any{"codeActionKinds": []string{"quickfix", "refactor", "source.organizeImports", "refactor.extract.variable", "refactor.extract.function", "refactor.extract.field", "refactor.extract.constant", "refactor.inline.variable"}, "resolveProvider": false, "workDoneProgress": false},
-		"diagnosticProvider": map[string]any{"interFileDependencies": true, "workspaceDiagnostics": false, "workDoneProgress": false},
+		"diagnosticProvider": map[string]any{"interFileDependencies": true, "workspaceDiagnostics": true, "workDoneProgress": false},
 		"codeLensProvider":   map[string]any{"resolveProvider": false, "workDoneProgress": false}, "foldingRangeProvider": true,
-		"semanticTokensProvider": map[string]any{"legend": map[string]any{"tokenTypes": []string{"namespace", "class", "enum", "interface", "struct", "typeParameter", "type", "parameter", "variable", "property", "enumMember", "event", "function", "method", "macro", "keyword", "modifier", "comment", "string", "number", "regexp", "operator", "decorator"}, "tokenModifiers": []string{"declaration", "definition", "readonly", "static", "deprecated", "abstract", "async", "modification", "documentation", "defaultLibrary"}}, "range": true, "full": true},
+		"semanticTokensProvider": map[string]any{"legend": map[string]any{"tokenTypes": []string{"namespace", "class", "enum", "interface", "struct", "typeParameter", "type", "parameter", "variable", "property", "enumMember", "event", "function", "method", "macro", "keyword", "modifier", "comment", "string", "number", "regexp", "operator", "decorator"}, "tokenModifiers": []string{"declaration", "definition", "readonly", "static", "deprecated", "abstract", "async", "modification", "documentation", "defaultLibrary"}}, "range": true, "full": map[string]any{"delta": true}},
 		"inlayHintProvider":      map[string]bool{"resolveProvider": true}, "signatureHelpProvider": map[string]any{"triggerCharacters": []string{"(", ","}, "retriggerCharacters": []string{","}, "workDoneProgress": false},
 		"callHierarchyProvider": true, "typeHierarchyProvider": true, "renameProvider": map[string]bool{"prepareProvider": true},
 		"workspace":              map[string]any{"workspaceFolders": map[string]bool{"supported": true, "changeNotifications": true}, "fileOperations": map[string]any{"willRename": map[string]any{"filters": []any{map[string]any{"pattern": map[string]string{"glob": "**/*"}}}}}},
@@ -448,7 +668,8 @@ func supportedCommands() []string {
 	return []string{"decompile", "applyModCommand", "chooseModCommandAction", "interpolateFileTemplate", "set-highwatermark-file", "wait-for-highwatermark", "start_debug_server", "intellij.java.resolveClassDocument", "intellij.java.resolveClasspath", "intellij.java.resolveJavaExecutable", "intellij.java.resolveWorkingDirectory", "jetbrains.java.completion.apply", "java.organize.imports", "refactor.extract.variable", "refactor.extract.function", "refactor.extract.field", "refactor.extract.constant", "kotlin.organize.imports", "jetbrains.kotlin.completion.apply", "exportWorkspace"}
 }
 
-func (s *Server) completion(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) completion(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
+	ctx := operationContext(contexts)
 	var p protocol.TextDocumentPositionParams
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
@@ -464,7 +685,7 @@ func (s *Server) completion(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	// returned as incomplete so the client re-queries as the prefix narrows --
 	// which is exactly what `isIncomplete` is for.
 	file, _ := s.index.Parsed(p.TextDocument.URI)
-	doc, hasDocument := s.index.Document(p.TextDocument.URI)
+	doc, hasDocument := s.index.DocumentContext(ctx, p.TextDocument.URI)
 	kotlin := file != nil && file.Language == analysis.LanguageKotlin
 	// A string body and comment prose complete nothing -- not a symbol, not a
 	// keyword, not a snippet. A doc comment completes its own tags, and
@@ -479,8 +700,11 @@ func (s *Server) completion(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	case index.CompletionDocTag:
 		return protocol.CompletionList{Items: docTagCompletions(doc, p.Position, position, kotlin)}, nil
 	}
-	symbols := s.index.Completion(p.TextDocument.URI, p.Position, completionCandidateLimit)
-	truncated := len(symbols) >= completionCandidateLimit
+	symbols, truncated := s.index.CompletionBoundedContext(ctx, p.TextDocument.URI, p.Position, completionCandidateLimit)
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
+	}
+	truncated = truncated || len(symbols) >= completionCandidateLimit
 	items := make([]protocol.CompletionItem, 0, len(symbols)+40)
 	annotationOwner := ""
 	if hasDocument {
@@ -501,6 +725,12 @@ func (s *Server) completion(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	labelDetails := s.clientCapabilityBool("textDocument", "completion", "completionItem", "labelDetailsSupport")
 	javaCanResolveImportEdits := s.clientCompletionResolveProperty("additionalTextEdits")
 	for n, sym := range symbols {
+		if n&31 == 0 {
+			if responseErr := canceledResponse(ctx); responseErr != nil {
+				s.completionMu.Unlock()
+				return nil, responseErr
+			}
+		}
 		insertName := sym.Name
 		if kotlin {
 			insertName = kotlinIdentifierInsertion(insertName)
@@ -586,7 +816,7 @@ func (s *Server) completion(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	}
 	s.completionMu.Unlock()
 	if !kotlin && position.Scope == index.CompletionCode {
-		if doc, ok := s.index.Document(p.TextDocument.URI); ok {
+		if doc, ok := s.index.DocumentContext(ctx, p.TextDocument.URI); ok {
 			items = append(items, javaTemplateCompletions(doc, p.Position, snippets)...)
 			items = append(items, s.javaReferenceCompletions(doc, p.Position)...)
 		}
@@ -842,12 +1072,19 @@ func (s *Server) completionImportIn(uri protocol.URI, file *analysis.ParsedFile,
 	return addImportEdit(doc.Text, uri, symbol.FQN)
 }
 
-func (s *Server) hover(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) hover(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p protocol.TextDocumentPositionParams
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	sym, reference, ok := s.index.SymbolAt(p.TextDocument.URI, p.Position)
+	ctx := operationContext(contexts)
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
+	}
+	sym, reference, ok := s.index.SymbolAtContext(ctx, p.TextDocument.URI, p.Position)
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
+	}
 	if !ok {
 		return nil, nil
 	}
@@ -863,33 +1100,42 @@ func (s *Server) hover(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	return protocol.Hover{Contents: protocol.MarkupContent{Kind: "markdown", Value: value}, Range: &hoverRange}, nil
 }
 
-func (s *Server) definition(raw json.RawMessage, typeDefinition bool) (any, *jsonrpc.ResponseError) {
+func (s *Server) definition(raw json.RawMessage, typeDefinition bool, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p protocol.TextDocumentPositionParams
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
+	ctx := operationContext(contexts)
 	var symbols []analysis.Symbol
 	if typeDefinition {
-		symbols = s.index.TypeDefinitions(p.TextDocument.URI, p.Position)
+		symbols = s.index.TypeDefinitionsContext(ctx, p.TextDocument.URI, p.Position)
 	} else {
-		symbols = s.index.Definitions(p.TextDocument.URI, p.Position)
+		symbols = s.index.DefinitionsContext(ctx, p.TextDocument.URI, p.Position)
+	}
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
 	}
 	result := locations(symbols)
 	if !typeDefinition {
-		result = append(result, s.index.PackageDefinitions(p.TextDocument.URI, p.Position)...)
+		result = append(result, s.index.PackageDefinitionsContext(ctx, p.TextDocument.URI, p.Position)...)
 	}
-	return s.externalLocations(result), nil
+	return s.externalLocationsContext(ctx, result), nil
 }
 
-func (s *Server) implementation(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) implementation(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p protocol.TextDocumentPositionParams
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	return s.externalLocations(locations(s.index.Implementations(p.TextDocument.URI, p.Position))), nil
+	ctx := operationContext(contexts)
+	symbols := s.index.ImplementationsContext(ctx, p.TextDocument.URI, p.Position)
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
+	}
+	return s.externalLocationsContext(ctx, locations(symbols)), nil
 }
 
-func (s *Server) references(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) references(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p struct {
 		protocol.TextDocumentPositionParams
 		Context struct {
@@ -899,46 +1145,71 @@ func (s *Server) references(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	return s.externalLocations(s.index.References(p.TextDocument.URI, p.Position, p.Context.IncludeDeclaration)), nil
+	ctx := operationContext(contexts)
+	locations := s.index.ReferencesContext(ctx, p.TextDocument.URI, p.Position, p.Context.IncludeDeclaration)
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
+	}
+	return s.externalLocationsContext(ctx, locations), nil
 }
 
-func (s *Server) documentHighlight(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) documentHighlight(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p protocol.TextDocumentPositionParams
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	return s.index.DocumentHighlights(p.TextDocument.URI, p.Position), nil
+	ctx := operationContext(contexts)
+	result := s.index.DocumentHighlightsContext(ctx, p.TextDocument.URI, p.Position)
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
+	}
+	return result, nil
 }
 
-func (s *Server) documentSymbols(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) documentSymbols(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p struct {
 		TextDocument protocol.TextDocumentIdentifier `json:"textDocument"`
 	}
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
+	ctx := operationContext(contexts)
 	symbols := s.index.SymbolsInFile(p.TextDocument.URI)
-	return hierarchicalSymbols(symbols), nil
+	result, completed := hierarchicalSymbolsContext(ctx, symbols)
+	if !completed {
+		return nil, canceledResponse(ctx)
+	}
+	return result, nil
 }
 
-func (s *Server) workspaceSymbols(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) workspaceSymbols(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p struct {
 		Query string `json:"query"`
 	}
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	// workspace/symbol has no incomplete flag in the negotiated protocol.
-	// Return every match rather than presenting a capped list as complete.
-	symbols := s.index.WorkspaceSymbols(p.Query, 0)
+	// workspace/symbol has no incomplete flag. Bound the response anyway: an
+	// editor query must not monopolize the connection in a generated workspace.
+	ctx := operationContext(contexts)
+	symbols, truncated := s.index.WorkspaceSymbolsBoundedContext(ctx, p.Query, 500)
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
+	}
+	if truncated {
+		return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestCanceled, Message: "workspace symbol candidate safety limit exceeded", Data: map[string]any{"resultLimit": 500, "candidateLimit": 4000, "retry": "use a more specific query"}}
+	}
 	out := make([]protocol.SymbolInformation, 0, len(symbols))
 	for _, sym := range symbols {
-		out = append(out, protocol.SymbolInformation{Name: sym.Name, Kind: sym.Kind.LSP(), Tags: deprecatedTags(sym), Location: s.externalLocation(sym.Location()), ContainerName: sym.ContainerName})
+		if responseErr := canceledResponse(ctx); responseErr != nil {
+			return nil, responseErr
+		}
+		out = append(out, protocol.SymbolInformation{Name: sym.Name, Kind: sym.Kind.LSP(), Tags: deprecatedTags(sym), Location: s.externalLocationContext(ctx, sym.Location()), ContainerName: sym.ContainerName})
 	}
 	return out, nil
 }
 
-func (s *Server) diagnostic(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) diagnostic(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p struct {
 		TextDocument     protocol.TextDocumentIdentifier `json:"textDocument"`
 		PreviousResultID string                          `json:"previousResultId"`
@@ -946,52 +1217,274 @@ func (s *Server) diagnostic(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	file, ok := s.index.Parsed(p.TextDocument.URI)
-	if !ok {
-		return protocol.FullDocumentDiagnosticReport{Kind: "full", Items: []protocol.Diagnostic{}}, nil
+	ctx := operationContext(contexts)
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
 	}
-	progress := s.index.Progress()
-	resultID := fmt.Sprintf("%x:%d:%d", file.TextHash, progress.FilesParsed+progress.LibrariesParsed, s.index.DiagnosticsVersion())
-	if p.PreviousResultID == resultID {
-		return map[string]any{"kind": "unchanged", "resultId": resultID}, nil
+	for attempt := 0; attempt < 2; attempt++ {
+		epoch := s.index.DiagnosticsEpoch()
+		file, ok := s.index.Parsed(p.TextDocument.URI)
+		textHash := uint64(0)
+		if ok {
+			textHash = file.TextHash
+		}
+		items := s.index.Diagnostics(p.TextDocument.URI)
+		if responseErr := canceledResponse(ctx); responseErr != nil {
+			return nil, responseErr
+		}
+		// One retry keeps the resultId and the items from the same epoch when
+		// the index is quiet; under sustained churn the last snapshot is
+		// returned anyway, since its resultId is only a cache key that the next
+		// request will not match.
+		if attempt == 0 && epoch != s.index.DiagnosticsEpoch() {
+			continue
+		}
+		resultID := diagnosticResultID(textHash, epoch)
+		if p.PreviousResultID == resultID {
+			return map[string]any{"kind": "unchanged", "resultId": resultID}, nil
+		}
+		if items == nil {
+			items = []protocol.Diagnostic{}
+		}
+		return protocol.FullDocumentDiagnosticReport{Kind: "full", ResultID: resultID, Items: items}, nil
 	}
-	items := s.index.Diagnostics(p.TextDocument.URI)
-	if items == nil {
-		items = []protocol.Diagnostic{}
-	}
-	return protocol.FullDocumentDiagnosticReport{Kind: "full", ResultID: resultID, Items: items}, nil
+	return nil, &jsonrpc.ResponseError{Code: jsonrpc.InternalError, Message: "diagnostic report was not assembled"}
 }
 
-func (s *Server) foldingRanges(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func diagnosticResultID(textHash uint64, epoch [4]uint64) string {
+	return fmt.Sprintf("%x:%x:%x:%x:%x", textHash, epoch[0], epoch[1], epoch[2], epoch[3])
+}
+
+func (s *Server) workspaceDiagnostics(ctx context.Context, raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+	const (
+		maxWorkspaceDiagnosticDocuments = 2048
+		maxWorkspaceDiagnosticItems     = 10_000
+		maxWorkspaceDiagnosticBytes     = 32 << 20
+	)
+	var params struct {
+		Previous []struct {
+			URI      protocol.URI `json:"uri"`
+			ResultID string       `json:"value"`
+		} `json:"previousResultIds"`
+		PartialResultToken any `json:"partialResultToken"`
+	}
+	if err := decode(raw, &params); err != nil {
+		return nil, invalidParams(err)
+	}
+	if len(params.Previous) > maxWorkspaceDiagnosticDocuments {
+		return nil, &jsonrpc.ResponseError{Code: jsonrpc.InvalidParams, Message: "previous workspace diagnostic results exceed their 2048-document safety limit"}
+	}
+	previous := make(map[protocol.URI]string, len(params.Previous))
+	for _, item := range params.Previous {
+		if len(item.URI) > 1<<20 || strings.IndexByte(string(item.URI), 0) >= 0 || len(item.ResultID) > 4096 || strings.IndexByte(item.ResultID, 0) >= 0 {
+			return nil, &jsonrpc.ResponseError{Code: jsonrpc.InvalidParams, Message: "previous workspace diagnostic identity exceeds its size or NUL-safety limit"}
+		}
+		previous[item.URI] = item.ResultID
+	}
+	epoch := s.index.DiagnosticsEpoch()
+	files, truncated := s.index.WorkspaceFilesContext(ctx, maxWorkspaceDiagnosticDocuments+1)
+	if ctx.Err() != nil {
+		return nil, canceledResponse(ctx)
+	}
+	if truncated || len(files) > maxWorkspaceDiagnosticDocuments {
+		return nil, &jsonrpc.ResponseError{
+			Code:    jsonrpc.RequestCanceled,
+			Message: "workspace diagnostic safety limit exceeded",
+			Data:    map[string]any{"documentLimit": maxWorkspaceDiagnosticDocuments, "retry": "request diagnostics for individual documents or narrow the workspace"},
+		}
+	}
+	sort.Slice(files, func(left, right int) bool { return files[left].URI < files[right].URI })
+	items := make([]protocol.WorkspaceDocumentDiagnosticReport, 0, len(files)+len(previous))
+	seen := make(map[protocol.URI]bool, len(files))
+	diagnosticItems, diagnosticBytes := 0, 0
+	for _, file := range files {
+		if ctx.Err() != nil {
+			return nil, canceledResponse(ctx)
+		}
+		seen[file.URI] = true
+		resultID := diagnosticResultID(file.TextHash, epoch)
+		if previous[file.URI] == resultID {
+			items = append(items, protocol.WorkspaceDocumentDiagnosticReport{URI: file.URI, Kind: "unchanged", ResultID: resultID})
+			continue
+		}
+		diagnostics := s.index.Diagnostics(file.URI)
+		if diagnostics == nil {
+			diagnostics = []protocol.Diagnostic{}
+		}
+		diagnosticItems += len(diagnostics)
+		encoded, encodeErr := json.Marshal(diagnostics)
+		if encodeErr != nil {
+			return nil, &jsonrpc.ResponseError{Code: jsonrpc.InternalError, Message: "encode workspace diagnostics: " + encodeErr.Error()}
+		}
+		diagnosticBytes += len(encoded)
+		if diagnosticItems > maxWorkspaceDiagnosticItems || diagnosticBytes > maxWorkspaceDiagnosticBytes {
+			return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestCanceled, Message: "workspace diagnostic payload safety limit exceeded", Data: map[string]any{"itemLimit": maxWorkspaceDiagnosticItems, "byteLimit": maxWorkspaceDiagnosticBytes}}
+		}
+		items = append(items, protocol.WorkspaceDocumentDiagnosticReport{URI: file.URI, Kind: "full", ResultID: resultID, Items: diagnostics})
+	}
+	for uri := range previous {
+		if seen[uri] {
+			continue
+		}
+		if len(items) >= maxWorkspaceDiagnosticDocuments {
+			return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestCanceled, Message: "workspace diagnostic safety limit exceeded while clearing deleted documents"}
+		}
+		items = append(items, protocol.WorkspaceDocumentDiagnosticReport{URI: uri, Kind: "full", ResultID: diagnosticResultID(0, epoch), Items: []protocol.Diagnostic{}})
+	}
+	// The epoch may move while a large workspace is walked (a background
+	// compiler pass landing, a library finishing its scan). The report is still
+	// a valid snapshot: every resultId is a cache key stamped with the epoch
+	// the walk started from, so the next request computes a different id for
+	// every document and re-sends full reports. Refusing here would leave a
+	// busy workspace without workspace diagnostics indefinitely, and clients
+	// retry only on ServerCancelled.
+	if params.PartialResultToken != nil {
+		for len(items) > 0 {
+			end := min(128, len(items))
+			chunk := append([]protocol.WorkspaceDocumentDiagnosticReport(nil), items[:end]...)
+			s.notifyProgressValue(params.PartialResultToken, protocol.WorkspaceDiagnosticReport{Items: chunk})
+			items = items[end:]
+		}
+	}
+	if params.PartialResultToken != nil {
+		items = []protocol.WorkspaceDocumentDiagnosticReport{}
+	}
+	return protocol.WorkspaceDiagnosticReport{Items: items}, nil
+}
+
+func (s *Server) foldingRanges(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p struct {
 		TextDocument protocol.TextDocumentIdentifier `json:"textDocument"`
 	}
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
+	}
+	ctx := operationContext(contexts)
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
 	}
 	file, ok := s.index.Parsed(p.TextDocument.URI)
 	if !ok {
 		return []protocol.FoldingRange{}, nil
 	}
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
+	}
 	return file.Folds, nil
 }
 
-func (s *Server) semanticTokens(raw json.RawMessage, filter *protocol.Range) (any, *jsonrpc.ResponseError) {
+func (s *Server) semanticTokens(raw json.RawMessage, filter *protocol.Range, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p struct {
 		TextDocument protocol.TextDocumentIdentifier `json:"textDocument"`
 	}
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	tokens, textHash, ok := s.index.SemanticTokens(p.TextDocument.URI)
+	ctx := operationContext(contexts)
+	tokens, resultHash, ok := s.index.SemanticTokensContext(ctx, p.TextDocument.URI)
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
+	}
 	if !ok {
 		return protocol.SemanticTokens{Data: []uint32{}}, nil
 	}
-	data := encodeSemanticTokens(tokens, filter)
-	return protocol.SemanticTokens{ResultID: fmt.Sprintf("%x", textHash), Data: data}, nil
+	data, completed := encodeSemanticTokensContext(ctx, tokens, filter)
+	if !completed {
+		return nil, canceledResponse(ctx)
+	}
+	resultID := fmt.Sprintf("%x", resultHash)
+	if filter == nil {
+		s.rememberSemanticTokens(resultID, data)
+	}
+	return protocol.SemanticTokens{ResultID: resultID, Data: data}, nil
 }
 
-func (s *Server) semanticTokensRange(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) semanticTokensDelta(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
+	var params struct {
+		TextDocument     protocol.TextDocumentIdentifier `json:"textDocument"`
+		PreviousResultID string                          `json:"previousResultId"`
+	}
+	if err := decode(raw, &params); err != nil {
+		return nil, invalidParams(err)
+	}
+	ctx := operationContext(contexts)
+	tokens, resultHash, ok := s.index.SemanticTokensContext(ctx, params.TextDocument.URI)
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
+	}
+	if !ok {
+		return protocol.SemanticTokens{Data: []uint32{}}, nil
+	}
+	data, completed := encodeSemanticTokensContext(ctx, tokens, nil)
+	if !completed {
+		return nil, canceledResponse(ctx)
+	}
+	resultID := fmt.Sprintf("%x", resultHash)
+	s.semanticTokensMu.Lock()
+	previous, found := s.semanticTokenResults[params.PreviousResultID]
+	s.semanticTokensMu.Unlock()
+	s.rememberSemanticTokens(resultID, data)
+	if !found {
+		return protocol.SemanticTokens{ResultID: resultID, Data: data}, nil
+	}
+	if len(previous) == len(data) {
+		equal := true
+		for index := range data {
+			if data[index] != previous[index] {
+				equal = false
+				break
+			}
+		}
+		if equal {
+			return protocol.SemanticTokensDelta{ResultID: resultID, Edits: []protocol.SemanticTokensEdit{}}, nil
+		}
+	}
+	prefix := 0
+	for prefix < len(previous) && prefix < len(data) && previous[prefix] == data[prefix] {
+		if prefix&1023 == 0 && ctx.Err() != nil {
+			return nil, canceledResponse(ctx)
+		}
+		prefix++
+	}
+	suffix := 0
+	for suffix < len(previous)-prefix && suffix < len(data)-prefix && previous[len(previous)-1-suffix] == data[len(data)-1-suffix] {
+		if suffix&1023 == 0 && ctx.Err() != nil {
+			return nil, canceledResponse(ctx)
+		}
+		suffix++
+	}
+	insert := append([]uint32(nil), data[prefix:len(data)-suffix]...)
+	edit := protocol.SemanticTokensEdit{Start: prefix, DeleteCount: len(previous) - prefix - suffix, Data: insert}
+	return protocol.SemanticTokensDelta{ResultID: resultID, Edits: []protocol.SemanticTokensEdit{edit}}, nil
+}
+
+func (s *Server) rememberSemanticTokens(resultID string, data []uint32) {
+	const maxRememberedSemanticTokenWords = 16 << 20 // 64 MiB
+	if len(data) > maxRememberedSemanticTokenWords {
+		return
+	}
+	s.semanticTokensMu.Lock()
+	defer s.semanticTokensMu.Unlock()
+	if s.semanticTokenResults == nil {
+		s.semanticTokenResults = make(map[string][]uint32)
+	}
+	if _, exists := s.semanticTokenResults[resultID]; !exists {
+		s.semanticTokenOrder = append(s.semanticTokenOrder, resultID)
+	}
+	s.semanticTokenResults[resultID] = append([]uint32(nil), data...)
+	totalWords := 0
+	for _, value := range s.semanticTokenResults {
+		totalWords += len(value)
+	}
+	for len(s.semanticTokenOrder) > 32 || totalWords > maxRememberedSemanticTokenWords {
+		oldest := s.semanticTokenOrder[0]
+		s.semanticTokenOrder = s.semanticTokenOrder[1:]
+		totalWords -= len(s.semanticTokenResults[oldest])
+		delete(s.semanticTokenResults, oldest)
+	}
+}
+
+func (s *Server) semanticTokensRange(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p struct {
 		TextDocument protocol.TextDocumentIdentifier `json:"textDocument"`
 		Range        protocol.Range                  `json:"range"`
@@ -1002,16 +1495,20 @@ func (s *Server) semanticTokensRange(raw json.RawMessage) (any, *jsonrpc.Respons
 	forward, _ := json.Marshal(struct {
 		TextDocument protocol.TextDocumentIdentifier `json:"textDocument"`
 	}{p.TextDocument})
-	return s.semanticTokens(forward, &p.Range)
+	return s.semanticTokens(forward, &p.Range, operationContext(contexts))
 }
 
-func (s *Server) prepareRename(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) prepareRename(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p protocol.TextDocumentPositionParams
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	sym, ref, ok := s.index.SymbolAt(p.TextDocument.URI, p.Position)
-	if !ok || sym.Library || !s.index.Renameable(p.TextDocument.URI, p.Position) {
+	ctx := operationContext(contexts)
+	sym, ref, ok := s.index.SymbolAtContext(ctx, p.TextDocument.URI, p.Position)
+	if !ok || sym.Library || !s.index.RenameableContext(ctx, p.TextDocument.URI, p.Position) {
+		if responseErr := canceledResponse(ctx); responseErr != nil {
+			return nil, responseErr
+		}
 		return nil, &jsonrpc.ResponseError{Code: jsonrpc.InvalidRequest, Message: "symbol cannot be renamed"}
 	}
 	r := sym.SelectionRange
@@ -1021,7 +1518,7 @@ func (s *Server) prepareRename(raw json.RawMessage) (any, *jsonrpc.ResponseError
 	return map[string]any{"range": r, "placeholder": sym.Name}, nil
 }
 
-func (s *Server) rename(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+func (s *Server) rename(raw json.RawMessage, contexts ...context.Context) (any, *jsonrpc.ResponseError) {
 	var p struct {
 		protocol.TextDocumentPositionParams
 		NewName string `json:"newName"`
@@ -1029,7 +1526,11 @@ func (s *Server) rename(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	if err := decode(raw, &p); err != nil {
 		return nil, invalidParams(err)
 	}
-	symbol, _, found := s.index.SymbolAt(p.TextDocument.URI, p.Position)
+	ctx := operationContext(contexts)
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
+	}
+	symbol, _, found := s.index.SymbolAtContext(ctx, p.TextDocument.URI, p.Position)
 	if !found || symbol.Library {
 		return nil, &jsonrpc.ResponseError{Code: jsonrpc.InvalidRequest, Message: "symbol cannot be renamed"}
 	}
@@ -1041,9 +1542,29 @@ func (s *Server) rename(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 	if !validIdentifierForLanguage(p.NewName, language) {
 		return nil, &jsonrpc.ResponseError{Code: jsonrpc.InvalidParams, Message: "newName is not a valid identifier"}
 	}
-	edit := s.index.Rename(p.TextDocument.URI, p.Position, p.NewName)
-	if symbol.Language == analysis.LanguageKotlin && hasModifier(symbol, "operator") && !kotlinConventionOperatorName(strings.Trim(p.NewName, "`")) {
-		if doc, ok := s.index.Document(symbol.URI); ok && symbol.StartByte >= 0 && symbol.NameStartByte <= len(doc.Text) && symbol.StartByte < symbol.NameStartByte {
+	// Renaming a Kotlin operator function to a non-convention name is the
+	// structural refactoring IntelliJ performs: the declaration is renamed,
+	// its `operator` modifier is dropped and explicit `.plus(...)` call sites
+	// follow, while `a + b` uses are left for the compiler to report. Those
+	// convention uses are spelled by an operator token rather than the name,
+	// which is exactly what the textual completeness proof rejects, so that
+	// proof applies only to name-spelled renames.
+	structuralOperatorRename := symbol.Language == analysis.LanguageKotlin && hasModifier(symbol, "operator") && !kotlinConventionOperatorName(strings.Trim(p.NewName, "`"))
+	if !structuralOperatorRename && !s.index.RenameableContext(ctx, p.TextDocument.URI, p.Position) {
+		if responseErr := canceledResponse(ctx); responseErr != nil {
+			return nil, responseErr
+		}
+		return nil, &jsonrpc.ResponseError{Code: jsonrpc.InvalidRequest, Message: "rename cannot be proven complete within the current semantic/safety boundary"}
+	}
+	edit := s.index.RenameContext(ctx, p.TextDocument.URI, p.Position, p.NewName)
+	if responseErr := canceledResponse(ctx); responseErr != nil {
+		return nil, responseErr
+	}
+	if len(edit.Changes) == 0 {
+		return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestCanceled, Message: "rename snapshot changed while edits were being assembled; retry"}
+	}
+	if structuralOperatorRename {
+		if doc, ok := s.index.DocumentContext(ctx, symbol.URI); ok && symbol.StartByte >= 0 && symbol.NameStartByte <= len(doc.Text) && symbol.StartByte < symbol.NameStartByte {
 			prefix := doc.Text[symbol.StartByte:symbol.NameStartByte]
 			if relative := strings.Index(prefix, "operator"); relative >= 0 {
 				start := symbol.StartByte + relative
@@ -1062,6 +1583,9 @@ func (s *Server) rename(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 		}
 		sort.Strings(uris)
 		for _, rawURI := range uris {
+			if responseErr := canceledResponse(ctx); responseErr != nil {
+				return nil, responseErr
+			}
 			uri := protocol.URI(rawURI)
 			edits := edit.Changes[uri]
 			sort.SliceStable(edits, func(left, right int) bool {
@@ -1071,7 +1595,7 @@ func (s *Server) rename(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
 				return edits[left].Range.Start.Character < edits[right].Range.Start.Character
 			})
 			identifier := protocol.OptionalVersionedTextDocumentIdentifier{URI: uri}
-			if doc, ok := s.index.Document(uri); ok {
+			if doc, ok := s.index.DocumentContext(ctx, uri); ok {
 				version := doc.Version
 				identifier.Version = &version
 			}
@@ -1230,7 +1754,7 @@ func (s *Server) changeWorkspaceFolders(raw json.RawMessage) {
 			} `json:"removed"`
 		} `json:"event"`
 	}
-	if decode(raw, &p) != nil {
+	if !s.decodeNotification("workspace/didChangeWorkspaceFolders", raw, &p) {
 		return
 	}
 	s.rootMu.Lock()
@@ -1259,26 +1783,23 @@ func (s *Server) changedWatchedFiles(raw json.RawMessage) {
 			Type int          `json:"type"`
 		} `json:"changes"`
 	}
-	if decode(raw, &p) != nil {
+	if !s.decodeNotification("workspace/didChangeWatchedFiles", raw, &p) {
 		return
 	}
-	reindex := false
+	var buildChanges []protocol.URI
 	for _, change := range p.Changes {
 		if watchedBuildModelOrLibrary(change.URI) {
-			reindex = true
-			break
+			buildChanges = append(buildChanges, change.URI)
 		}
 	}
-	if reindex {
-		s.rootMu.RLock()
-		roots := append([]protocol.URI(nil), s.roots...)
-		s.rootMu.RUnlock()
-		s.index.Start(s.ctx, roots)
-		s.markWatermark()
-		return
-	}
 	var pending []<-chan struct{}
+	if len(buildChanges) > 0 {
+		pending = append(pending, s.index.RefreshBuildChanges(s.ctx, buildChanges))
+	}
 	for _, c := range p.Changes {
+		if watchedBuildModelOrLibrary(c.URI) {
+			continue
+		}
 		if c.Type == 3 {
 			if s.index.RemoveClosed(c.URI) {
 				s.publishDiagnostics(c.URI, []protocol.Diagnostic{})
@@ -1292,26 +1813,28 @@ func (s *Server) changedWatchedFiles(raw json.RawMessage) {
 		s.markWatermark()
 		return
 	}
-	go func() {
+	s.launchBackground(func() {
 		for _, done := range pending {
-			<-done
+			select {
+			case <-done:
+			case <-s.ctx.Done():
+				return
+			}
+		}
+		if s.ctx.Err() != nil {
+			return
 		}
 		s.index.ScheduleCompilerDiagnostics(s.ctx)
 		s.markWatermark()
-	}()
+	})
 }
 
 func watchedBuildModelOrLibrary(uri protocol.URI) bool {
 	lower := strings.ToLower(filepath.Base(string(uri)))
-	if strings.HasSuffix(lower, ".jar") || strings.HasSuffix(lower, ".bzl") {
+	if strings.HasSuffix(lower, ".jar") {
 		return true
 	}
-	switch lower {
-	case "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "gradle.properties", "pom.xml", "module.bazel", "workspace", "workspace.bazel", "build", "build.bazel":
-		return true
-	default:
-		return false
-	}
+	return index.IsBuildModelInputPath(lower)
 }
 
 func decode(raw json.RawMessage, v any) error {
@@ -1370,30 +1893,65 @@ func keywordCompletions(uri protocol.URI) []protocol.CompletionItem {
 	return out
 }
 func hierarchicalSymbols(symbols []analysis.Symbol) []protocol.DocumentSymbol {
+	result, _ := hierarchicalSymbolsContext(context.Background(), symbols)
+	return result
+}
+
+func hierarchicalSymbolsContext(ctx context.Context, symbols []analysis.Symbol) ([]protocol.DocumentSymbol, bool) {
+	const maxDocumentSymbols = 50000
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(symbols) > maxDocumentSymbols {
+		return nil, false
+	}
 	children := map[string][]analysis.Symbol{}
-	for _, s := range symbols {
+	for index, s := range symbols {
+		if index&1023 == 0 && ctx.Err() != nil {
+			return nil, false
+		}
 		if s.Kind == analysis.KindParameter || s.Kind == analysis.KindVariable || s.Kind == analysis.KindTypeParameter {
 			continue
 		}
 		children[s.ContainerID] = append(children[s.ContainerID], s)
 	}
-	var build func(string) []protocol.DocumentSymbol
-	build = func(parent string) []protocol.DocumentSymbol {
+	completed := true
+	visited := 0
+	var build func(string, int) []protocol.DocumentSymbol
+	build = func(parent string, depth int) []protocol.DocumentSymbol {
+		if !completed || depth > 512 {
+			completed = false
+			return nil
+		}
 		xs := children[parent]
 		sort.SliceStable(xs, func(a, b int) bool { return xs[a].StartByte < xs[b].StartByte })
 		out := make([]protocol.DocumentSymbol, 0, len(xs))
 		for _, s := range xs {
-			out = append(out, protocol.DocumentSymbol{Name: s.Name, Detail: s.Type, Kind: s.Kind.LSP(), Tags: deprecatedTags(s), Range: s.Range, SelectionRange: s.SelectionRange, Children: build(s.ID)})
+			visited++
+			if visited&255 == 0 && ctx.Err() != nil || visited > maxDocumentSymbols {
+				completed = false
+				return nil
+			}
+			out = append(out, protocol.DocumentSymbol{Name: s.Name, Detail: s.Type, Kind: s.Kind.LSP(), Tags: deprecatedTags(s), Range: s.Range, SelectionRange: s.SelectionRange, Children: build(s.ID, depth+1)})
 		}
 		return out
 	}
-	return build("")
+	result := build("", 0)
+	return result, completed
 }
 func encodeSemanticTokens(tokens []analysis.Token, filter *protocol.Range) []uint32 {
+	encoded, _ := encodeSemanticTokensContext(context.Background(), tokens, filter)
+	return encoded
+}
+
+func encodeSemanticTokensContext(ctx context.Context, tokens []analysis.Token, filter *protocol.Range) ([]uint32, bool) {
 	out := make([]uint32, 0, len(tokens)*5)
 	prevLine, prevChar := 0, 0
 	first := true
-	for _, t := range tokens {
+	for index, t := range tokens {
+		if index&1023 == 0 && ctx.Err() != nil {
+			return nil, false
+		}
 		if t.Range.Start.Line != t.Range.End.Line {
 			continue
 		}
@@ -1413,7 +1971,7 @@ func encodeSemanticTokens(tokens []analysis.Token, filter *protocol.Range) []uin
 		prevLine, prevChar = line, char
 		first = false
 	}
-	return out
+	return out, ctx.Err() == nil
 }
 func before(a, b protocol.Position) bool {
 	return a.Line < b.Line || (a.Line == b.Line && a.Character < b.Character)

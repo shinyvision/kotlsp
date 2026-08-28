@@ -204,11 +204,20 @@ type Symbol struct {
 	// JVMName is the bytecode-level callable/accessor name supplied by a
 	// Kotlin @JvmName annotation. The source declaration keeps Name so Kotlin
 	// navigation and rename continue to use the spelling in the document.
-	JVMName       string
+	JVMName string
+	// JVMDescriptor is the exact erased field/method descriptor when the
+	// declaration originates in bytecode. Source declarations leave it empty;
+	// consumers may derive one only when every source type resolves uniquely.
+	JVMDescriptor string
 	Documentation string
 	Deprecated    bool
 	Library       bool
 	Synthetic     bool
+	// Provisional marks a declaration retained from the last syntax snapshot
+	// after error recovery could no longer rediscover it. The declaration name
+	// and byte span have still been validated against the edited source; fields
+	// touched by an edit are cleared before the symbol is published.
+	Provisional bool
 	// InteropLanguage restricts a synthetic JVM view to the language which can
 	// spell it. LanguageUnknown means visible to both languages.
 	InteropLanguage Language
@@ -259,6 +268,11 @@ type Reference struct {
 	Arguments     []protocol.Range
 	Arity         int
 	ArgumentLabel bool
+	// ContextualBranch is set only when the syntax tree places this occurrence
+	// in the label/condition side of a Kotlin when entry or Java switch label.
+	// It lets conservative fast diagnostics delegate contextual enum/sealed
+	// binding without scanning unrelated source text.
+	ContextualBranch bool
 }
 
 type Import struct {
@@ -315,6 +329,9 @@ type ParsedFile struct {
 	Folds         []protocol.FoldingRange
 	Version       int
 	TextHash      uint64
+	// ParseMode is an instrumentation contract used by performance tests and
+	// status/debug tooling: "full", "incremental", "snapshot", or "large".
+	ParseMode string
 	// InteropPrepared records that the JVM-view symbols have already been
 	// merged into Symbols, so the index does not derive them again under its
 	// lock. Library loading does this on a worker before insertion.
