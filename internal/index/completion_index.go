@@ -185,7 +185,9 @@ func (i *Index) completionContext(ctx context.Context, uri protocol.URI, pos pro
 						break
 					}
 					s := i.symbols[candidateID]
-					if !i.memberInheritedForReceiverLocked(file, *s, typ) {
+					// A constructor is never reached through a dot: neither a value
+					// nor a type qualifier can name it.
+					if s.Kind == analysis.KindConstructor || !i.memberInheritedForReceiverLocked(file, *s, typ) {
 						continue
 					}
 					if typeQualifier && !i.memberAvailableThroughTypeQualifierLocked(file, *s, typeQualifierSymbols) {

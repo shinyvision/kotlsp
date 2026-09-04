@@ -1069,7 +1069,7 @@ func (i *Index) uniqueDirectMemberResultTypeLocked(file *analysis.ParsedFile, re
 			}
 			matches++
 			if matches == 1 {
-				result = substituteTypeParameters(member.Type, owner.TypeParameters, arguments)
+				result = substituteTypeParameters(i.respellDeclaredTypeLocked(file, *member, member.Type), owner.TypeParameters, arguments)
 			} else {
 				result = ""
 			}
@@ -1128,7 +1128,7 @@ func (i *Index) uniqueExtensionResultTypeLocked(file *analysis.ParsedFile, recei
 			}
 			matches++
 			if matches == 1 {
-				result = substituteTypeBindings(extension.Type, bindings)
+				result = substituteTypeBindings(i.respellDeclaredTypeLocked(file, *extension, extension.Type), bindings)
 			} else {
 				return "", true
 			}

@@ -980,7 +980,9 @@ func (i *Index) instantiatedTypeHierarchyBoundedWithMemoLocked(ctx context.Conte
 					current = append(current, pendingOwner{name: substituteTypeParameters(symbol.Type, symbol.TypeParameters, arguments), distance: pending.distance, resolutionFile: declarationFile, lexicalOwner: symbol})
 				}
 				for _, supertype := range symbol.Supertypes {
-					next = append(next, pendingOwner{name: substituteTypeParameters(supertype, symbol.TypeParameters, arguments), distance: pending.distance + 1, resolutionFile: declarationFile, lexicalOwner: symbol})
+					// Type arguments the supertype spells (`JpaRepository<User, Long>`)
+					// are read later from the call site; spell them for it.
+					next = append(next, pendingOwner{name: substituteTypeParameters(i.respellDeclaredTypeLocked(file, symbol, supertype), symbol.TypeParameters, arguments), distance: pending.distance + 1, resolutionFile: declarationFile, lexicalOwner: symbol})
 				}
 			}
 		}

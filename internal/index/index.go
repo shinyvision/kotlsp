@@ -137,6 +137,10 @@ type Index struct {
 	generatedSources            generatedSourceState
 	librariesScanned            atomic.Bool
 	onDiagnosticsChanged        func()
+
+	// respell memoizes respellDeclaredTypeLocked per index epoch. It has its
+	// own lock because resolution runs under the read lock.
+	respell respellMemo
 }
 
 func (i *Index) DiagnosticsVersion() uint64 { return i.diagnosticsVersion.Load() }
