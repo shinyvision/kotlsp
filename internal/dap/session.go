@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -97,6 +98,7 @@ type session struct {
 	lastStop            string
 	terminated          atomic.Bool
 	sourceResolver      SourceResolver
+	stepTargets         map[int]stepTarget
 	breakpointMu        sync.Mutex
 	breakpointCache     map[string]breakpointClassCacheEntry
 }
@@ -436,8 +438,8 @@ var dapRequestRegistry = map[string]dapRequestHandler{
 	"completions": func(s *session, ctx context.Context, raw json.RawMessage) (any, bool, string) {
 		return s.completions(raw, ctx)
 	},
-	"exceptionInfo": func(s *session, _ context.Context, _ json.RawMessage) (any, bool, string) {
-		return s.exceptionInfo(), true, ""
+	"exceptionInfo": func(s *session, ctx context.Context, _ json.RawMessage) (any, bool, string) {
+		return s.exceptionInfo(ctx), true, ""
 	},
 	// Cancel is consumed before ordinary dispatch because it targets another
 	// in-flight request. Keeping that transport handler in this table makes the
@@ -445,8 +447,8 @@ var dapRequestRegistry = map[string]dapRequestHandler{
 	"cancel": func(_ *session, _ context.Context, _ json.RawMessage) (any, bool, string) {
 		return nil, false, "request cancellation is handled by the DAP transport"
 	},
-	"stepInTargets": func(s *session, _ context.Context, raw json.RawMessage) (any, bool, string) {
-		return s.stepInTargets(raw)
+	"stepInTargets": func(s *session, ctx context.Context, raw json.RawMessage) (any, bool, string) {
+		return s.stepInTargets(raw, ctx)
 	},
 	"restartFrame": func(s *session, ctx context.Context, raw json.RawMessage) (any, bool, string) {
 		return s.restartFrame(raw, ctx)
@@ -523,12 +525,20 @@ func (s *session) attach(ctx context.Context, raw json.RawMessage) (any, bool, s
 		return nil, false, "a debug target is already active on this DAP connection"
 	}
 	var args struct {
-		Port     int    `json:"port"`
-		Host     string `json:"host"`
-		JavaExec string `json:"javaExec"`
+		Port int    `json:"port"`
+		Host string `json:"host"`
+		// hostName is the VS Code Java debugger's name for host.
+		HostName    string   `json:"hostName"`
+		JavaExec    string   `json:"javaExec"`
+		SourcePaths []string `json:"sourcePaths"`
+		ClassPaths  []string `json:"classPaths"`
+		CWD         string   `json:"cwd"`
 	}
 	if decodeDAPArguments(raw, &args) != nil || args.Port <= 0 || args.Port > 65535 {
 		return nil, false, "attach requires a valid JDWP port"
+	}
+	if args.Host == "" {
+		args.Host = args.HostName
 	}
 	if len(args.Host) > 4096 || len(args.JavaExec) > 4096 || strings.IndexByte(args.Host, 0) >= 0 || strings.IndexByte(args.JavaExec, 0) >= 0 {
 		return nil, false, "attach host or Java executable exceeds its size/NUL safety limit"
@@ -547,6 +557,23 @@ func (s *session) attach(ctx context.Context, raw json.RawMessage) (any, bool, s
 	s.debug = debugger
 	s.launched = false
 	s.debugMu.Unlock()
+	// The same source and class lookup as a launch: stack frames map to
+	// these sources, and breakpoints narrow to the classes with code there.
+	classPaths := append([]string(nil), args.ClassPaths...)
+	for index, path := range classPaths {
+		if !filepath.IsAbs(path) && args.CWD != "" {
+			classPaths[index] = filepath.Join(args.CWD, path)
+		}
+	}
+	s.stateMu.Lock()
+	s.classPaths = classPaths
+	s.sourceRoots = debugSourceRoots(args.CWD, args.SourcePaths)
+	s.sourceCache = make(map[string]string)
+	s.stateMu.Unlock()
+	s.sources.reset()
+	s.breakpointMu.Lock()
+	s.breakpointCache = make(map[string]breakpointClassCacheEntry)
+	s.breakpointMu.Unlock()
 	return map[string]any{}, true, ""
 }
 
@@ -788,7 +815,8 @@ func (s *session) streamDebuggee(reader io.Reader, category string) {
 			_ = s.event("output", map[string]any{"category": category, "output": line})
 		}
 		if err != nil {
-			if err != io.EOF {
+			// A pipe this adapter closed at shutdown is not an output error.
+			if err != io.EOF && !errors.Is(err, os.ErrClosed) {
 				_ = s.event("output", map[string]any{"category": "stderr", "output": "debuggee output error: " + err.Error() + "\n"})
 			}
 			return
@@ -829,14 +857,22 @@ func (s *session) streamDebuggeeJDWP(reader io.Reader, category string, port cha
 				case port <- value:
 				default:
 				}
+				// The JVM's own notice of the debug port is not the
+				// program's output.
+				if strings.TrimSpace(line) == strings.TrimSpace(match[0]) {
+					line, truncated = "", false
+				}
 			}
 			if truncated {
 				line += "\n[kotlsp: debuggee output line truncated]\n"
 			}
-			_ = s.event("output", map[string]any{"category": category, "output": line})
+			if line != "" {
+				_ = s.event("output", map[string]any{"category": category, "output": line})
+			}
 		}
 		if err != nil {
-			if err != io.EOF {
+			// A pipe this adapter closed at shutdown is not an output error.
+			if err != io.EOF && !errors.Is(err, os.ErrClosed) {
 				_ = s.event("output", map[string]any{"category": "stderr", "output": "debuggee output error: " + err.Error() + "\n"})
 			}
 			return
@@ -996,6 +1032,9 @@ func (s *session) handleJDIEvent(event debugEvent) {
 			_ = s.event("output", map[string]any{"category": "stderr", "output": "JDI bridge: " + event.protocolError + "\n"})
 		}
 		return
+	case "SKIPPED":
+		_ = s.event("output", map[string]any{"category": "console", "output": "Skipped a stop at " + event.protocolError + " reached while evaluating an expression\n"})
+		return
 	case "STOP":
 	default:
 		return
@@ -1017,14 +1056,21 @@ func (s *session) handleJDIEvent(event debugEvent) {
 	s.invalidateStopHandlesLocked()
 	s.stateMu.Unlock()
 	threadID := s.threadIdentity(event.threadToken, event.threadName)
-	if event.reason == "breakpoint" {
+	if event.reason == "breakpoint" || event.reason == "breakpoint+step" {
 		s.handleBreakpointStop(event, threadID, description)
 		return
 	}
 	_ = s.event("stopped", map[string]any{"reason": event.reason, "threadId": threadID, "allThreadsStopped": true, "description": description})
 }
 
+// handleBreakpointStop applies a breakpoint's hit condition, condition and
+// log message. A breakpoint reached by a step ("breakpoint+step") only decides
+// how the stop is reported: the step has stopped the thread either way.
 func (s *session) handleBreakpointStop(event debugEvent, threadID int, description string) {
+	stepped := event.reason == "breakpoint+step"
+	stepStop := func() {
+		_ = s.event("stopped", map[string]any{"reason": "step", "threadId": threadID, "allThreadsStopped": true, "description": fmt.Sprintf("Step completed at %s.%s:%d", event.className, event.methodName, event.line)})
+	}
 	var breakpoint sourceBreakpoint
 	found := false
 	s.stateMu.Lock()
@@ -1046,18 +1092,40 @@ func (s *session) handleBreakpointStop(event debugEvent, threadID int, descripti
 	s.stateMu.Unlock()
 	debugger := s.currentDebugger()
 	if !found || debugger == nil {
-		_ = s.event("stopped", map[string]any{"reason": "breakpoint", "threadId": threadID, "allThreadsStopped": true, "description": description})
+		if stepped {
+			stepStop()
+			return
+		}
+		reason := "breakpoint"
+		s.stateMu.Lock()
+		for _, name := range s.functionBreakpoints {
+			if name == event.className+"."+event.methodName || strings.HasSuffix(event.className+"."+event.methodName, "."+name) {
+				reason = "function breakpoint"
+				break
+			}
+		}
+		s.stateMu.Unlock()
+		_ = s.event("stopped", map[string]any{"reason": reason, "threadId": threadID, "allThreadsStopped": true, "description": description})
 		return
 	}
 	if !breakpoint.HitCondition.matches(breakpoint.Hits) {
+		if stepped {
+			stepStop()
+			return
+		}
 		_ = debugger.resume("continue", "")
 		return
 	}
-	decision, logMessage := "stop", ""
+	decision, logMessage, conditionError := "stop", "", ""
 	debugger.transaction(func(transaction *jdiTransaction) {
 		if breakpoint.Condition != "" {
+			// A condition that cannot be evaluated stops, with the reason: read
+			// as false, a typo in it silently disabled the breakpoint.
 			value, err := transaction.evaluate(breakpoint.Condition)
-			if err != nil || !strings.EqualFold(strings.TrimSpace(value.value), "true") {
+			switch {
+			case err != nil:
+				conditionError = err.Error()
+			case !strings.EqualFold(strings.TrimSpace(value.value), "true"):
 				decision = "continue"
 			}
 		}
@@ -1065,16 +1133,20 @@ func (s *session) handleBreakpointStop(event debugEvent, threadID int, descripti
 			logMessage = s.renderLogPointTransaction(transaction, breakpoint.LogMessage)
 			decision = "log"
 		}
-		if decision != "stop" {
+		if decision != "stop" && !stepped {
 			_ = transaction.resume()
 		}
 	})
-	if decision == "continue" {
-		return
+	if conditionError != "" {
+		_ = s.event("output", map[string]any{"category": "console", "output": fmt.Sprintf("Breakpoint condition %q at %s:%d could not be evaluated: %s\n", breakpoint.Condition, event.className, event.line, conditionError)})
 	}
 	if decision == "log" {
-		message := logMessage
-		_ = s.event("output", map[string]any{"category": "console", "output": message + "\n"})
+		_ = s.event("output", map[string]any{"category": "console", "output": logMessage + "\n"})
+	}
+	if decision != "stop" {
+		if stepped {
+			stepStop()
+		}
 		return
 	}
 	_ = s.event("stopped", map[string]any{"reason": "breakpoint", "threadId": threadID, "allThreadsStopped": true, "description": description})
@@ -1329,7 +1401,7 @@ func (s *session) variableValues(raw json.RawMessage, contexts ...context.Contex
 		return nil, false, "debugger is not attached"
 	}
 	if contextValue.handle != "" {
-		variables := s.inspectVariables(debugger, contextValue.frameID, contextValue.handle, contextValue.hint, args.Start, args.Count, args.Filter, contexts...)
+		variables := s.inspectVariables(debugger, contextValue.frameID, contextValue.handle, contextValue.expression, args.Start, args.Count, args.Filter, contexts...)
 		return map[string]any{"variables": variables}, true, ""
 	}
 	values, err := debugger.locals(contexts...)
@@ -1374,21 +1446,37 @@ func (s *session) restartFrame(raw json.RawMessage, contexts ...context.Context)
 	if decodeDAPArguments(raw, &args) != nil || args.FrameID <= 0 {
 		return nil, false, "restartFrame requires a frameId"
 	}
-	_, ok := s.selectFrame(args.FrameID, contexts...)
+	frame, ok := s.selectFrame(args.FrameID, contexts...)
 	if !ok {
 		return nil, false, "unknown stack frame"
 	}
 	debugger := s.currentDebugger()
+	if debugger == nil {
+		return nil, false, "debugger is not attached"
+	}
 	if err := debugger.restartFrame(contexts...); err != nil {
 		return nil, false, err.Error()
 	}
 	s.stateMu.Lock()
 	s.invalidateStopHandlesLocked()
 	s.stateMu.Unlock()
+	// The frame's thread is stopped at the start of the restarted call; the
+	// client learns that, and drops what it showed, from a stopped event
+	// after this response.
+	threadID := frame.threadID
+	s.queuePostResponse(requestContext(contexts), func() {
+		_ = s.event("stopped", map[string]any{"reason": "restart", "threadId": threadID, "allThreadsStopped": true, "description": "Frame restarted"})
+	})
 	return map[string]any{}, true, ""
 }
 
-func (s *session) stepInTargets(raw json.RawMessage) (any, bool, string) {
+// stepTarget is one call stepInTargets offered: stepIn with its id stops on
+// entering that method.
+type stepTarget struct {
+	className, method, signature string
+}
+
+func (s *session) stepInTargets(raw json.RawMessage, contexts ...context.Context) (any, bool, string) {
 	s.debugOperationMu.Lock()
 	defer s.debugOperationMu.Unlock()
 	var args struct {
@@ -1397,13 +1485,30 @@ func (s *session) stepInTargets(raw json.RawMessage) (any, bool, string) {
 	if decodeDAPArguments(raw, &args) != nil {
 		return nil, false, "invalid stepInTargets arguments"
 	}
-	s.stateMu.Lock()
-	frame, ok := s.frames[args.FrameID]
-	s.stateMu.Unlock()
-	if !ok {
-		return map[string]any{"targets": []any{}}, true, ""
+	if _, ok := s.selectFrame(args.FrameID, contexts...); !ok {
+		return nil, false, "unknown stack frame"
 	}
-	return map[string]any{"targets": []any{map[string]any{"id": args.FrameID, "label": frame.name}}}, true, ""
+	debugger := s.currentDebugger()
+	if debugger == nil {
+		return nil, false, "debugger is not attached"
+	}
+	rows, err := debugger.requestFor(contexts, "STEP_TARGETS")
+	if err != nil {
+		return nil, false, err.Error()
+	}
+	targets := make([]any, 0, len(rows))
+	s.stateMu.Lock()
+	s.stepTargets = make(map[int]stepTarget, len(rows))
+	for index, row := range rows {
+		if len(row) < 4 {
+			continue
+		}
+		id := index + 1
+		s.stepTargets[id] = stepTarget{className: row[1], method: row[2], signature: row[3]}
+		targets = append(targets, map[string]any{"id": id, "label": row[0]})
+	}
+	s.stateMu.Unlock()
+	return map[string]any{"targets": targets}, true, ""
 }
 
 func (s *session) completions(raw json.RawMessage, contexts ...context.Context) (any, bool, string) {
@@ -1429,37 +1534,81 @@ func (s *session) completions(raw json.RawMessage, contexts ...context.Context) 
 	if debugger == nil {
 		return map[string]any{"targets": []any{}}, true, ""
 	}
-	values, err := debugger.locals(contexts...)
-	if err != nil {
-		return nil, false, err.Error()
+	text := args.Text
+	if args.Column > 0 && args.Column-1 < len(text) {
+		text = text[:args.Column-1]
 	}
-	prefix := args.Text
-	if args.Column > 0 && args.Column-1 < len(prefix) {
-		prefix = prefix[:args.Column-1]
-	}
-	for len(prefix) > 0 {
-		last := prefix[len(prefix)-1]
-		if last == '_' || last == '$' || last >= 'a' && last <= 'z' || last >= 'A' && last <= 'Z' || last >= '0' && last <= '9' {
-			break
-		}
-		prefix = prefix[:len(prefix)-1]
-	}
-	if at := strings.LastIndexAny(prefix, " .()[]{};,+-*/=!<>"); at >= 0 {
-		prefix = prefix[at+1:]
-	}
+	receiver, prefix := completionReceiver(text)
 	targets := make([]map[string]any, 0)
 	seen := make(map[string]bool)
-	for _, value := range values {
-		if len(targets) >= 4096 {
-			break
+	add := func(label, kind, detail string) {
+		if len(targets) >= 4096 || label == "" || seen[label] || !strings.HasPrefix(label, prefix) {
+			return
 		}
-		if value.name == "" || seen[value.name] || !strings.HasPrefix(value.name, prefix) {
-			continue
+		seen[label] = true
+		target := map[string]any{"label": label, "text": label, "type": kind}
+		if detail != "" {
+			target["detail"] = detail
 		}
-		seen[value.name] = true
-		targets = append(targets, map[string]any{"label": value.name, "text": value.name, "type": "variable"})
+		targets = append(targets, target)
+	}
+	if receiver == "" {
+		values, err := debugger.locals(contexts...)
+		if err != nil {
+			return nil, false, err.Error()
+		}
+		for _, value := range values {
+			add(value.name, "variable", value.typeName)
+		}
+	}
+	// Members of the receiver after `expr.`, or of the frame's own class.
+	members, err := debugger.members(receiver, contexts...)
+	if err != nil && receiver == "" {
+		return nil, false, err.Error()
+	}
+	for _, member := range members {
+		add(member.name, member.kind, member.detail)
 	}
 	return map[string]any{"targets": targets}, true, ""
+}
+
+// completionReceiver splits the text before the cursor into the expression
+// a member is being completed on and the partial name typed so far:
+// `user.na` is ("user", "na"), `names.get(0).len` is ("names.get(0)", "len"),
+// and `coun` is ("", "coun").
+func completionReceiver(text string) (string, string) {
+	end := len(text)
+	start := end
+	for start > 0 {
+		c := text[start-1]
+		if c == '_' || c == '$' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+			start--
+			continue
+		}
+		break
+	}
+	prefix := text[start:end]
+	if start == 0 || text[start-1] != '.' {
+		return "", prefix
+	}
+	dot := start - 1
+	depth := 0
+	begin := dot
+	for begin > 0 {
+		c := text[begin-1]
+		if c == ')' || c == ']' {
+			depth++
+		} else if c == '(' || c == '[' {
+			if depth == 0 {
+				break
+			}
+			depth--
+		} else if depth == 0 && !(c == '_' || c == '$' || c == '.' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
+			break
+		}
+		begin--
+	}
+	return strings.TrimSpace(text[begin:dot]), prefix
 }
 
 func (s *session) evaluate(raw json.RawMessage, contexts ...context.Context) (any, bool, string) {
@@ -1529,7 +1678,101 @@ func (s *session) setVariable(raw json.RawMessage, contexts ...context.Context) 
 	if variable.expression != "" {
 		expression = childExpression(variable.expression, args.Name)
 	}
-	return s.assignExpression(expression, args.Value, contexts...)
+	// The row the Variables view shows knows the real expression: a Kotlin
+	// local shown as "total" is $total, a list element is list.get(0).
+	real, typeName := s.childEvaluateName(variable, args.Name, contexts...)
+	if real != "" {
+		expression = real
+	}
+	value := boxedLiteral(typeName, args.Value)
+	// A collection element is changed through the collection, the one
+	// target method call setVariable makes -- and only because the user
+	// asked for the change.
+	if match := collectionElement.FindStringSubmatch(expression); match != nil {
+		debugger := s.currentDebugger()
+		if debugger == nil {
+			return nil, false, "debugger is not attached"
+		}
+		method := "put"
+		if _, err := strconv.Atoi(match[2]); err == nil && strings.HasPrefix(args.Name, "[") {
+			method = "set"
+		}
+		if _, err := debugger.evaluate(fmt.Sprintf("%s.%s(%s, %s)", match[1], method, match[2], value), contexts...); err != nil {
+			return nil, false, err.Error()
+		}
+		value, err := debugger.evaluate(expression, contexts...)
+		if err != nil {
+			return nil, false, err.Error()
+		}
+		body := map[string]any{"value": value.value, "variablesReference": 0}
+		if value.typeName != "" {
+			body["type"] = value.typeName
+		}
+		return body, true, ""
+	}
+	return s.assignExpression(expression, value, contexts...)
+}
+
+// boxedLiteral boxes a primitive literal assigned to a boxed variable: the
+// JDK evaluator does not, and an Integer field or map value refused "5".
+func boxedLiteral(typeName, value string) string {
+	switch typeName {
+	case "java.lang.Integer", "java.lang.Long", "java.lang.Short", "java.lang.Byte", "java.lang.Double", "java.lang.Float", "java.lang.Boolean", "java.lang.Character":
+	default:
+		return value
+	}
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed == "null" || !(trimmed[0] == '-' || trimmed[0] == '\'' || trimmed[0] >= '0' && trimmed[0] <= '9' || trimmed == "true" || trimmed == "false") {
+		return value
+	}
+	return typeName + ".valueOf(" + trimmed + ")"
+}
+
+var collectionElement = regexp.MustCompile(`^(.+)\.get\((.+)\)$`)
+
+// childEvaluateName is the evaluateName of the child called name under a
+// variables reference, as the Variables view showed it, or "".
+func (s *session) childEvaluateName(parent variableContext, name string, contexts ...context.Context) (string, string) {
+	debugger := s.currentDebugger()
+	if debugger == nil {
+		return "", ""
+	}
+	if parent.handle == "" {
+		values, err := debugger.locals(contexts...)
+		if err != nil {
+			return "", ""
+		}
+		for _, value := range values {
+			if value.name == name {
+				return value.evaluateName, value.typeName
+			}
+		}
+		return "", ""
+	}
+	start, count := 0, maxInspectedChildren
+	if strings.HasPrefix(name, "[") && strings.HasSuffix(name, "]") {
+		if index, err := strconv.Atoi(name[1 : len(name)-1]); err == nil {
+			start, count = index, 1
+		}
+	}
+	values, err := debugger.children(parent.handle, start, count, "", contexts...)
+	if err != nil {
+		return "", ""
+	}
+	for _, value := range values {
+		if value.name != name {
+			continue
+		}
+		suffix := value.evaluateName
+		if strings.HasPrefix(suffix, ".") || strings.HasPrefix(suffix, "[") {
+			if parent.expression == "" {
+				return "", value.typeName
+			}
+			return parent.expression + suffix, value.typeName
+		}
+		return suffix, value.typeName
+	}
+	return "", ""
 }
 
 func (s *session) setExpression(raw json.RawMessage, contexts ...context.Context) (any, bool, string) {
@@ -1579,11 +1822,22 @@ func (s *session) resume(command string, raw json.RawMessage, includeBody bool, 
 	mode := map[string]string{"cont": "continue", "next": "next", "step": "stepIn", "step up": "stepOut"}[command]
 	var args struct {
 		ThreadID int `json:"threadId"`
+		TargetID int `json:"targetId"`
 	}
 	if decodeDAPArguments(raw, &args) != nil || args.ThreadID <= 0 {
 		return nil, false, "resume requires a valid threadId"
 	}
-	if err := debugger.resume(mode, s.tokenForThread(args.ThreadID), contexts...); err != nil {
+	var resumeArguments []string
+	if command == "step" && args.TargetID > 0 {
+		s.stateMu.Lock()
+		target, ok := s.stepTargets[args.TargetID]
+		s.stateMu.Unlock()
+		if !ok {
+			return nil, false, "unknown step-in target"
+		}
+		mode, resumeArguments = "target", []string{target.className, target.method, target.signature}
+	}
+	if err := debugger.resumeWith(mode, s.tokenForThread(args.ThreadID), resumeArguments, contexts...); err != nil {
 		return nil, false, err.Error()
 	}
 	s.stateMu.Lock()
@@ -1807,12 +2061,40 @@ func (s *session) loadedSources() any {
 	return map[string]any{"sources": sources}
 }
 
-func (s *session) exceptionInfo() any {
+func (s *session) exceptionInfo(contexts ...context.Context) any {
 	s.stateMu.Lock()
 	description := s.lastException
 	s.stateMu.Unlock()
 	if description == "" {
 		description = "No exception information is available"
 	}
-	return map[string]any{"exceptionId": "java.lang.Throwable", "description": description, "breakMode": "always"}
+	info := map[string]any{"exceptionId": "java.lang.Throwable", "description": description, "breakMode": "always"}
+	debugger := s.currentDebugger()
+	if debugger == nil {
+		return info
+	}
+	rows, err := debugger.requestFor(contexts, "EXCEPTION")
+	if err != nil || len(rows) == 0 || len(rows[0]) < 4 {
+		return info
+	}
+	typeName, message, uncaught, stack := rows[0][0], rows[0][1], rows[0][2] == "true", rows[0][3]
+	info["exceptionId"] = typeName
+	if message != "" {
+		info["description"] = message
+	} else {
+		info["description"] = typeName
+	}
+	if uncaught {
+		info["breakMode"] = "unhandled"
+	}
+	simple := typeName
+	if dot := strings.LastIndexByte(simple, '.'); dot >= 0 {
+		simple = simple[dot+1:]
+	}
+	details := map[string]any{"typeName": simple, "fullTypeName": typeName, "stackTrace": stack}
+	if message != "" {
+		details["message"] = message
+	}
+	info["details"] = details
+	return info
 }

@@ -490,7 +490,17 @@ func TestVariableInspectionExpandsObjectsCollectionsArraysAndMaps(t *testing.T) 
 	if parts["type"] != "java.util.ArrayList" || parts["variablesReference"] == 0 {
 		t.Fatalf("parts field = %#v", parts)
 	}
-	partFields := fetchVariables(t, s, parts["variablesReference"].(int))
+	// A list shows its elements, read from its fields, and its fields under
+	// [raw].
+	if parts["indexedVariables"] != 2 || !strings.HasSuffix(parts["value"].(string), "size=2") {
+		t.Fatalf("parts summary = %#v", parts)
+	}
+	partElements := fetchVariables(t, s, parts["variablesReference"].(int))
+	if len(partElements) != 3 || partElements[0]["value"] != `"arm"` || partElements[1]["value"] != `"leg"` || partElements[0]["evaluateName"] != "body.parts.get(0)" {
+		t.Fatalf("ArrayList elements = %#v", partElements)
+	}
+	raw := findVariable(t, partElements, "[raw]")
+	partFields := fetchVariables(t, s, raw["variablesReference"].(int))
 	if size := findVariable(t, partFields, "size"); size["value"] != "2" {
 		t.Fatalf("ArrayList size field = %#v", size)
 	}
@@ -498,16 +508,21 @@ func TestVariableInspectionExpandsObjectsCollectionsArraysAndMaps(t *testing.T) 
 	if elementData["variablesReference"] == 0 {
 		t.Fatalf("ArrayList backing array is not expandable: %#v", elementData)
 	}
-	elements := fetchVariables(t, s, elementData["variablesReference"].(int))
-	if len(elements) < 2 || elements[0]["value"] != `"arm"` || elements[1]["value"] != `"leg"` {
-		t.Fatalf("ArrayList backing elements = %#v", elements)
+	for _, field := range partFields {
+		if field["name"] == "serialVersionUID" {
+			t.Fatalf("a static field is shown as part of the value: %#v", field)
+		}
 	}
 
 	sizes := findVariable(t, fields, "sizes")
 	if sizes["type"] != "java.util.HashMap" || sizes["variablesReference"] == 0 {
 		t.Fatalf("sizes field = %#v", sizes)
 	}
-	mapFields := fetchVariables(t, s, sizes["variablesReference"].(int))
+	entries := fetchVariables(t, s, sizes["variablesReference"].(int))
+	if len(entries) != 3 {
+		t.Fatalf("HashMap entries = %#v", entries)
+	}
+	mapFields := fetchVariables(t, s, findVariable(t, entries, "[raw]")["variablesReference"].(int))
 	if size := findVariable(t, mapFields, "size"); size["value"] != "2" {
 		t.Fatalf("HashMap size field = %#v", size)
 	}
@@ -539,9 +554,9 @@ func TestVariableInspectionExpandsObjectsCollectionsArraysAndMaps(t *testing.T) 
 	if evalReference == 0 {
 		t.Fatalf("evaluate result is not expandable: %#v", evalBody)
 	}
-	evalFields := fetchVariables(t, s, evalReference)
-	if size := findVariable(t, evalFields, "size"); size["value"] != "2" {
-		t.Fatalf("evaluate expansion = %#v", evalFields)
+	evalElements := fetchVariables(t, s, evalReference)
+	if len(evalElements) != 3 || evalElements[0]["evaluateName"] != "body.parts.get(0)" {
+		t.Fatalf("evaluate expansion = %#v", evalElements)
 	}
 	s.disconnect(json.RawMessage(`{"terminateDebuggee":true}`), true)
 }

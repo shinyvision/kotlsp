@@ -25,14 +25,17 @@ func childExpression(parent, name string) string {
 type inspector struct {
 	debugger *jdiProcess
 	session  *session
-	frameID  int
-	start    int
-	count    int
-	filter   string
+	// parent is the expression of the value being expanded; children name
+	// themselves relative to it.
+	parent  string
+	frameID int
+	start   int
+	count   int
+	filter  string
 }
 
-func (s *session) inspectVariables(debugger *jdiProcess, frameID int, handle, _ string, start, count int, filter string, contexts ...context.Context) []map[string]any {
-	insp := &inspector{debugger: debugger, session: s, frameID: frameID, start: start, count: count, filter: filter}
+func (s *session) inspectVariables(debugger *jdiProcess, frameID int, handle, parent string, start, count int, filter string, contexts ...context.Context) []map[string]any {
+	insp := &inspector{debugger: debugger, session: s, parent: parent, frameID: frameID, start: start, count: count, filter: filter}
 	values, err := debugger.children(handle, normalizedChildStart(start), normalizedChildCount(count), filter, contexts...)
 	if err != nil {
 		return []map[string]any{plainVariable("error", err.Error())}
@@ -64,6 +67,18 @@ func plainVariable(name, value string) map[string]any {
 
 func (insp *inspector) child(value debugValue) map[string]any {
 	variable := plainVariable(value.name, value.value)
+	// The bridge names a child by what follows its parent's expression:
+	// ".field", "[2]", ".get(0)". Without a parent expression -- or for a
+	// child no expression reaches, such as [raw] -- there is none.
+	if suffix := value.evaluateName; suffix != "" {
+		if strings.HasPrefix(suffix, ".") || strings.HasPrefix(suffix, "[") {
+			if insp.parent != "" {
+				value.evaluateName = insp.parent + suffix
+			} else {
+				value.evaluateName = ""
+			}
+		}
+	}
 	if value.evaluateName != "" {
 		variable["evaluateName"] = value.evaluateName
 	}

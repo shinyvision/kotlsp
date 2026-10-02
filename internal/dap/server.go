@@ -171,8 +171,12 @@ func serveConnection(ctx context.Context, connection net.Conn, sources SourceRes
 		for request := range controls {
 			session.handleRequest(request)
 			release(dapMessageBytes(request))
-			cancel()
-			_ = connection.Close()
+			// terminate ends the debuggee, not the conversation: the client
+			// follows it with disconnect, which must still be answered.
+			if request.Command == "disconnect" {
+				cancel()
+				_ = connection.Close()
+			}
 		}
 	}()
 	// Parent/server cancellation must interrupt a connection blocked in a

@@ -99,15 +99,33 @@ answers with a localhost TCP port. Connect any DAP client (e.g. nvim-dap) and
 classpath of the module owning a given document URI, so clients do not need
 to maintain launch configurations by hand.
 
-Debugging runs through the JDK's `jdb`, so a JDK (not a JRE) must be on PATH.
-Breakpoints (line, function, exception, conditional, hit conditions and log
-points), stepping, scopes, watches, evaluation and call/variable inspection
-are supported. Expanding a value inspects it recursively: object fields
-(including inherited and private ones), array elements, and the logical
-contents of lists, sets and maps rather than their internal fields. Stack
-frames from library code resolve to real sources whenever the dependency's
-`-sources.jar` sits in the Gradle or Maven cache, which is what the Gradle
-`downloadDependencySources` task in your build is for.
+Debugging runs through the JDK's debugger interface (JDI), so a JDK (not a
+JRE) must be on PATH. `attach` connects to a JVM started with
+`-agentlib:jdwp=transport=dt_socket,server=y,address=<port>`; it takes `port`,
+`host` (or `hostName`) and the same `sourcePaths`, `classPaths` and `cwd` as
+`launch`.
+
+Supported: line, function and exception breakpoints, with conditions, hit
+conditions and log points; stepping (with step filters that skip JDK and
+Kotlin-runtime internals), step-into targets, pause and restart frame;
+threads, stack frames and scopes; evaluation, completions, watches and
+changing values (locals, fields, array, list and map elements). A condition
+that cannot be evaluated stops and says why. Breakpoints reached while an
+expression is being evaluated are skipped, with a console note.
+
+Expanding a value reads it from its fields, never by calling a method in the
+program: object fields (including inherited and private ones, not static
+constants), array elements, and the elements of the JDK's lists, sets, maps
+and deques, with their internals under `[raw]`. Boxed numbers show as their
+value and enum constants by name. Kotlin's compiler-made locals are hidden,
+and an extension receiver shows as `this`. Stack frames from library code
+resolve to real sources whenever the dependency's `-sources.jar` sits in the
+Gradle or Maven cache, which is what the Gradle `downloadDependencySources`
+task in your build is for.
+
+Limits: expressions are evaluated with Java syntax by the JDK's evaluator,
+which has no `%`, `&`, `|` or `^` (kotlsp adds `&&` and `||`); data
+breakpoints and hot code replace are not supported.
 
 Data and instruction breakpoints are not supported; that is a limitation of
 bridging through `jdb` rather than speaking JDWP directly.

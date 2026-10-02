@@ -212,8 +212,26 @@ func (s *session) setBreakpoints(raw json.RawMessage, contexts ...context.Contex
 		for _, breakpoint := range installed {
 			newSpecs = append(newSpecs, lineBreakpointSpec{Class: breakpoint.Class, Line: breakpoint.Line})
 		}
-		if err := debugger.replaceLineBreakpoints(oldSpecs, newSpecs, contexts...); err != nil {
+		statuses, err := debugger.replaceLineBreakpoints(oldSpecs, newSpecs, contexts...)
+		if err != nil {
 			return nil, false, "staged breakpoint replacement failed; Go metadata was not published: " + err.Error()
+		}
+		// A line is verified when some class of its file takes it. Without a
+		// classpath to narrow by (attach), every class is asked, and the
+		// loaded ones that have no code there say so.
+		taken := make(map[int]bool, len(statuses))
+		for spec, status := range statuses {
+			if status != "none" {
+				taken[spec.Line] = true
+			}
+		}
+		if len(statuses) > 0 {
+			for _, entry := range response {
+				if line, _ := entry["line"].(int); entry["verified"] == true && !taken[line] {
+					entry["verified"] = false
+					entry["message"] = "no executable code at this line in the loaded classes"
+				}
+			}
 		}
 	}
 	s.stateMu.Lock()
