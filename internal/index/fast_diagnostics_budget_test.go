@@ -13,6 +13,7 @@ import (
 // the interaction budget or it is not fast at all. This bounds it well below
 // the 100ms the request as a whole is held to.
 func TestFastDiagnosticsStayWithinTheInteractionBudget(t *testing.T) {
+	ctx := context.Background()
 	if raceDetector {
 		t.Skip("wall-clock budget cannot hold under -race instrumentation")
 	}
@@ -47,7 +48,7 @@ func TestFastDiagnosticsStayWithinTheInteractionBudget(t *testing.T) {
 	for run := 0; run < 5; run++ {
 		start := time.Now()
 		idx.mu.RLock()
-		_ = idx.fastDiagnosticsLocked(file)
+		_ = idx.fastDiagnosticsLocked(ctx, file)
 		idx.mu.RUnlock()
 		if elapsed := time.Since(start); elapsed < best {
 			best = elapsed

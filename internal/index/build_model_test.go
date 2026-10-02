@@ -242,7 +242,7 @@ func TestLibraryScanConsumesSourceSetOnlyClasspath(t *testing.T) {
 func TestBuildModelCacheAllowsUnbuiltOutputsButRejectsMissingArchives(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	root := t.TempDir()
-	fingerprint, err := buildModelFingerprint(root, false)
+	fingerprint, err := buildModelFingerprint(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,5 +261,55 @@ func TestBuildModelCacheAllowsUnbuiltOutputsButRejectsMissingArchives(t *testing
 	}
 	if _, ok := loadBuildModelCache(root, fingerprint); ok {
 		t.Fatal("a missing archive dependency was accepted from the model cache")
+	}
+}
+
+func TestClasspathValidationAcceptsDependencyExclusionKeys(t *testing.T) {
+	resolution := newClasspathResolution()
+	key := dependencyExclusionKey("test", "gradle:org.springframework.boot:spring-boot-starter-test:")
+	resolution.ExternalDependencyExclusions[":app"] = map[string][]string{key: {"org.junit.vintage:junit-vintage-engine"}}
+	resolution.DependencyExclusions[":app"] = map[string][]string{dependencyExclusionKey("main", ":lib"): {":legacy"}}
+	if err := validateClasspathResolution(resolution); err != nil {
+		t.Fatalf("a dependency exclude discarded the whole build model: %v", err)
+	}
+	resolution.ExternalDependencyExclusions[":app"] = map[string][]string{"test\x00a\x00b": {"x:y"}}
+	if err := validateClasspathResolution(resolution); err == nil {
+		t.Fatal("an exclusion key with a stray NUL in its dependency was accepted")
+	}
+	resolution.ExternalDependencyExclusions[":app"] = map[string][]string{"no-separator": {"x:y"}}
+	if err := validateClasspathResolution(resolution); err == nil {
+		t.Fatal("an exclusion key without its source-set separator was accepted")
+	}
+}
+
+func TestSourceJarsForMatchesOnlyTheBinarysOwnAttachment(t *testing.T) {
+	root := t.TempDir()
+	touch := func(path string) string {
+		full := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return full
+	}
+	// Gradle: the attachment sits under a sibling hash directory.
+	gradle := touch("gradle/kotlin-stdlib/2.4.10/aaa/kotlin-stdlib-2.4.10.jar")
+	gradleSources := touch("gradle/kotlin-stdlib/2.4.10/bbb/kotlin-stdlib-2.4.10-sources.jar")
+	// Maven: every version of the artifact under one directory.
+	maven := touch("m2/guava/33.0/guava-33.0.jar")
+	mavenSources := touch("m2/guava/33.0/guava-33.0-sources.jar")
+	touch("m2/guava/32.0/guava-32.0-sources.jar")
+	// Arch's kotlin package: the JS and JDK variants' sources beside the stdlib.
+	arch := touch("share/kotlin/lib/kotlin-stdlib.jar")
+	archSources := touch("share/kotlin/lib/kotlin-stdlib-sources.jar")
+	touch("share/kotlin/lib/kotlin-stdlib-js-sources.jar")
+	touch("share/kotlin/lib/kotlin-stdlib-jdk8-sources.jar")
+	for binary, want := range map[string]string{gradle: gradleSources, maven: mavenSources, arch: archSources} {
+		got, _ := sourceJarsFor(binary)
+		if len(got) != 1 || got[0] != want {
+			t.Errorf("%s: sources = %v, want [%s]", binary, got, want)
+		}
 	}
 }

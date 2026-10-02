@@ -29,9 +29,7 @@ func (i *Index) CompletionBoundedContext(ctx context.Context, uri protocol.URI, 
 }
 
 func (i *Index) completionContext(ctx context.Context, uri protocol.URI, pos protocol.Position, limit int, truncated *bool) []analysis.Symbol {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx = withReceiverSpellingsMemo(ctx)
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -116,6 +114,12 @@ func (i *Index) completionContext(ctx context.Context, uri protocol.URI, pos pro
 	initialCapacity = candidateLimit
 	ids := make([]string, 0, initialCapacity)
 	synthetic := make([]analysis.Symbol, 0, 8)
+	// Attribute names are what an annotation's argument starts with. After a
+	// qualifier -- `${Authorities.Colors.}` inside `@PreAuthorize("...")` --
+	// or anywhere else in an argument, the ordinary completion applies.
+	if annotationOwner != "" && (qualifier != "" || !argumentStartBefore(doc.Text, offset-len(prefix))) {
+		annotationOwner = ""
+	}
 	if annotationOwner != "" {
 		usedAttributes := AnnotationAttributeNames(doc.Text, offset)
 		for _, owner := range i.resolveTypeSymbolsForOwnerMemoLocked(file, annotationOwner, analysis.Symbol{}, access) {
@@ -159,11 +163,21 @@ func (i *Index) completionContext(ctx context.Context, uri protocol.URI, pos pro
 				break
 			}
 		}
-		typ := i.inferExpressionResultLocked(file, qualifier, offset).Type
+		typ := i.inferExpressionResultLocked(ctx, file, qualifier, offset).Type
 		if explicit := explicitReceiverType(qualifier); explicit != "" {
 			typ = explicit
 		}
+		// `org.jooq.impl.DSL.` -- in an import or an expression -- names a type
+		// that no inference turns into a value; its members are still what
+		// follows the dot.
+		if typ == "" && len(typeQualifierSymbols) == 1 && analysis.IsTypeKind(typeQualifierSymbols[0].Kind) {
+			typ = typeQualifierSymbols[0].FQN
+		}
 		if typ != "" {
+			dot := qualifiedAccess{
+				receiverType: typ, typeQualifier: typeQualifier, typeQualifierValue: typeQualifierValue, typeQualifierSymbols: typeQualifierSymbols,
+				memberAccessAllowed: true, at: offset,
+			}
 			containers, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, typ, maxResolutionCandidates, access)
 			if !complete {
 				*truncated = true
@@ -180,20 +194,18 @@ func (i *Index) completionContext(ctx context.Context, uri protocol.URI, pos pro
 				if ctx.Err() != nil {
 					return nil
 				}
-				for _, candidateID := range i.byContainerName[owner.ID] {
+				members := i.byContainerName[owner.ID]
+				if typeQualifier {
+					if nested := i.binaryNestedTypeIDsLocked(owner, ""); len(nested) > 0 {
+						members = append(append([]string(nil), members...), nested...)
+					}
+				}
+				for _, candidateID := range members {
 					if !visitCandidate() {
 						break
 					}
 					s := i.symbols[candidateID]
-					// A constructor is never reached through a dot: neither a value
-					// nor a type qualifier can name it.
-					if s.Kind == analysis.KindConstructor || !i.memberInheritedForReceiverLocked(file, *s, typ) {
-						continue
-					}
-					if typeQualifier && !i.memberAvailableThroughTypeQualifierLocked(file, *s, typeQualifierSymbols) {
-						continue
-					}
-					if i.accessibleWithMemoLocked(file, *s, access, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(s.Name), strings.ToLower(prefix))) {
+					if i.qualifiedMemberViableLocked(file, access, dot, *s) && (prefix == "" || strings.HasPrefix(strings.ToLower(s.Name), strings.ToLower(prefix))) {
 						ids = append(ids, candidateID)
 						if len(ids) >= candidateLimit {
 							break
@@ -205,14 +217,14 @@ func (i *Index) completionContext(ctx context.Context, uri protocol.URI, pos pro
 						break
 					}
 					s := i.symbols[candidateID]
-					if (!typeQualifier || typeQualifierValue) && i.extensionReceiverApplicableLocked(file, *s, typ) && i.accessibleWithMemoLocked(file, *s, access, offset) && i.extensionVisibleLocked(file, *s, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(s.Name), strings.ToLower(prefix))) {
+					if (prefix == "" || strings.HasPrefix(strings.ToLower(s.Name), strings.ToLower(prefix))) && i.qualifiedExtensionViableLocked(ctx, file, access, dot, *s) {
 						ids = append(ids, candidateID)
 						if len(ids) >= candidateLimit {
 							break
 						}
 					}
 				}
-				if file.Language == analysis.LanguageKotlin && typeQualifier {
+				if qualifiedCompanionMembersViable(file, dot) {
 					companions, complete := i.companionMembersForOwnerBoundedLocked(ctx, owner, nil, maxResolutionCandidates)
 					if !complete {
 						*truncated = true
@@ -231,6 +243,26 @@ func (i *Index) completionContext(ctx context.Context, uri protocol.URI, pos pro
 					}
 				}
 			}
+			// A scope function's receiver is a type parameter, so it is filed by
+			// name rather than under this receiver and the loops above never see
+			// it: completion on a String offered 326 members and not `let`.
+			if file.Language == analysis.LanguageKotlin && len(ids) < candidateLimit {
+				for _, candidateID := range i.genericExtensionCandidatesLocked(prefix, candidateLimit-len(ids)) {
+					if !visitCandidate() {
+						break
+					}
+					s := i.symbols[candidateID]
+					if s == nil {
+						continue
+					}
+					if i.qualifiedExtensionViableLocked(ctx, file, access, dot, *s) {
+						ids = append(ids, candidateID)
+						if len(ids) >= candidateLimit {
+							break
+						}
+					}
+				}
+			}
 			if len(containers) == 0 && file.Language == analysis.LanguageKotlin {
 				for _, owner := range spellingReceiverOwners(typ) {
 					for _, candidateID := range i.extensionCandidatesLocked(owner) {
@@ -238,12 +270,32 @@ func (i *Index) completionContext(ctx context.Context, uri protocol.URI, pos pro
 							break
 						}
 						s := i.symbols[candidateID]
-						if (!typeQualifier || typeQualifierValue) && i.extensionReceiverApplicableLocked(file, *s, typ) && i.accessibleWithMemoLocked(file, *s, access, offset) && i.extensionVisibleLocked(file, *s, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(s.Name), strings.ToLower(prefix))) {
+						if (prefix == "" || strings.HasPrefix(strings.ToLower(s.Name), strings.ToLower(prefix))) && i.qualifiedExtensionViableLocked(ctx, file, access, dot, *s) {
 							ids = append(ids, candidateID)
 							if len(ids) >= candidateLimit {
 								break
 							}
 						}
+					}
+				}
+			}
+			// `import kotlinx.coroutines.flow.asFlow as listAsFlow`: an aliased
+			// extension is called by its alias, which no index bucket knows.
+			if file.Language == analysis.LanguageKotlin && (!typeQualifier || typeQualifierValue) {
+				for _, imported := range file.Imports {
+					if imported.Alias == "" || imported.Wildcard || prefix != "" && !strings.HasPrefix(strings.ToLower(imported.Alias), strings.ToLower(prefix)) {
+						continue
+					}
+					for _, id := range i.byFQN[imported.Path] {
+						s := i.symbols[id]
+						if s == nil || s.ReceiverType == "" || !i.extensionReceiverApplicableLocked(ctx, file, *s, typ) {
+							continue
+						}
+						aliased := *s
+						aliased.ID = s.ID + "#alias:" + imported.Alias
+						aliased.Name = imported.Alias
+						synthetic = append(synthetic, aliased)
+						break
 					}
 				}
 			}
@@ -290,7 +342,7 @@ func (i *Index) completionContext(ctx context.Context, uri protocol.URI, pos pro
 			}
 		}
 		currentType := i.enclosingTypeLocked(file, offset)
-		if enumType := i.javaSwitchLabelReceiverTypeLocked(file, offset); enumType != "" {
+		if enumType := i.javaSwitchLabelReceiverTypeLocked(ctx, file, offset); enumType != "" {
 			hierarchy, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, enumType, maxResolutionCandidates, access)
 			if !complete {
 				*truncated = true
@@ -362,7 +414,8 @@ func (i *Index) completionContext(ctx context.Context, uri protocol.URI, pos pro
 				}
 			}
 		}
-		implicitReceiverTypes := []string{i.contextualLambdaReceiverTypeLocked(file, offset), i.enclosingExtensionReceiverTypeLocked(file, offset)}
+		implicitReceiverTypes := append([]string{i.contextualLambdaReceiverTypeLocked(ctx, file, offset), i.enclosingExtensionReceiverTypeLocked(file, offset)}, i.thisSmartCastTypesLocked(file, offset)...)
+		implicitReceiverTypes = append(implicitReceiverTypes, gradleScriptReceiverTypes(file)...)
 		implicitReceiverTypes = append(implicitReceiverTypes, i.enclosingContextReceiverTypesLocked(file, offset)...)
 		if enclosing := i.enclosingTypeLocked(file, offset); enclosing.ID != "" {
 			implicitReceiverTypes = append(implicitReceiverTypes, enclosing.Name)
@@ -407,7 +460,7 @@ func (i *Index) completionContext(ctx context.Context, uri protocol.URI, pos pro
 						break
 					}
 					symbol := i.symbols[id]
-					if i.extensionReceiverApplicableLocked(file, *symbol, receiverType) && i.accessibleWithMemoLocked(file, *symbol, access, offset) && i.extensionVisibleLocked(file, *symbol, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
+					if i.extensionReceiverApplicableLocked(ctx, file, *symbol, receiverType) && i.accessibleWithMemoLocked(file, *symbol, access, offset) && i.extensionVisibleLocked(file, *symbol, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
 						ids = append(ids, id)
 						if len(ids) >= candidateLimit {
 							break
@@ -422,7 +475,7 @@ func (i *Index) completionContext(ctx context.Context, uri protocol.URI, pos pro
 							break
 						}
 						symbol := i.symbols[id]
-						if i.extensionReceiverApplicableLocked(file, *symbol, receiverType) && i.accessibleWithMemoLocked(file, *symbol, access, offset) && i.extensionVisibleLocked(file, *symbol, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
+						if i.extensionReceiverApplicableLocked(ctx, file, *symbol, receiverType) && i.accessibleWithMemoLocked(file, *symbol, access, offset) && i.extensionVisibleLocked(file, *symbol, offset) && (prefix == "" || strings.HasPrefix(strings.ToLower(symbol.Name), strings.ToLower(prefix))) {
 							ids = append(ids, id)
 							if len(ids) >= candidateLimit {
 								break
@@ -481,8 +534,8 @@ func (i *Index) completionContext(ctx context.Context, uri protocol.URI, pos pro
 		}
 	}
 	fileLanguage := file.Language
-	i.mu.RUnlock()
 	locked = false
+	i.mu.RUnlock()
 	seen := map[string]bool{}
 	outCapacity := len(ids) + len(synthetic)
 	if outCapacity > limit {
@@ -828,4 +881,21 @@ func asciiPrefix(value string, maximum int) (string, bool) {
 		}
 	}
 	return value[:length], true
+}
+
+// argumentStartBefore reports whether an argument begins at offset: only
+// whitespace separates it from the `(` or `,` before it.
+func argumentStartBefore(text string, offset int) bool {
+	for offset > 0 && offset <= len(text) {
+		value := text[offset-1]
+		switch value {
+		case ' ', '\t', '\r', '\n':
+			offset--
+		case '(', ',':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
 }

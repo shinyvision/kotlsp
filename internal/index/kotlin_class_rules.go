@@ -1,6 +1,8 @@
 package index
 
 import (
+	"context"
+
 	"strings"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
@@ -26,7 +28,7 @@ func init() {
 	})
 }
 
-func kotlinClassShapes(i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
+func kotlinClassShapes(_ context.Context, i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
 	document := i.documentLocked(file.URI)
 	if document == nil || document.Text == "" {
 		return nil

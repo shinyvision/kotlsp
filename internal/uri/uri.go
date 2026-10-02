@@ -5,11 +5,43 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/shinyvision/kotlsp/internal/protocol"
 )
 
+// Path converts a file URI to a filesystem path. Resolution does this for the
+// same few thousand URIs millions of times, and parsing and unescaping each
+// time was a visible share of a project-wide query, so results are kept
+// (bounded).
 func Path(value protocol.URI) (string, bool) {
+	pathCache.RLock()
+	cached, ok := pathCache.values[value]
+	pathCache.RUnlock()
+	if ok {
+		return cached.path, cached.ok
+	}
+	path, valid := parsePath(value)
+	pathCache.Lock()
+	if pathCache.values == nil || len(pathCache.values) >= 100_000 {
+		pathCache.values = make(map[protocol.URI]cachedPath)
+	}
+	pathCache.values[value] = cachedPath{path, valid}
+	pathCache.Unlock()
+	return path, valid
+}
+
+type cachedPath struct {
+	path string
+	ok   bool
+}
+
+var pathCache struct {
+	sync.RWMutex
+	values map[protocol.URI]cachedPath
+}
+
+func parsePath(value protocol.URI) (string, bool) {
 	u, err := url.Parse(string(value))
 	if err != nil || u.Scheme != "file" {
 		return "", false

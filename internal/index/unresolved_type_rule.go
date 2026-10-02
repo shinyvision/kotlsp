@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"github.com/shinyvision/kotlsp/internal/analysis"
 	"github.com/shinyvision/kotlsp/internal/protocol"
 )
@@ -32,7 +33,7 @@ func init() {
 	})
 }
 
-func unresolvedTypeReferences(i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
+func unresolvedTypeReferences(ctx context.Context, i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
 	// One file names few distinct types but may reference each of them many
 	// times, and resolution is the expensive part. Every answer is a function
 	// of the name alone within this pass, so each is computed once.
@@ -70,7 +71,14 @@ func unresolvedTypeReferences(i *Index, file *analysis.ParsedFile) []protocol.Di
 		if resolvesInScope(reference.Name, reference.StartByte) {
 			continue
 		}
-		if len(i.resolveLocked(file, *reference)) > 0 {
+		if len(i.resolveLocked(ctx, file, *reference)) > 0 {
+			continue
+		}
+		// A wildcard import of a library package or type can declare this name
+		// through a Kotlin typealias, which has no class file and so cannot be
+		// indexed: `import kotlin.test.*` declares `Test` as an alias of the
+		// JUnit annotation.
+		if i.nameMayBindThroughUnmodelledScopeLocked(file, reference.Name) {
 			continue
 		}
 		out = append(out, protocol.Diagnostic{

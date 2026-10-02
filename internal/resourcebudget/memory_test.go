@@ -21,8 +21,19 @@ func TestReservationsShareOneProcessTreeBudget(t *testing.T) {
 	if snapshot.ToolCurrent != wantCurrent {
 		t.Fatalf("tool reservation = %d, want %d", snapshot.ToolCurrent, wantCurrent)
 	}
-	if snapshot.EffectiveGoSoftLimit != ProcessTreeSoftLimitBytes-wantCurrent {
-		t.Fatalf("effective Go limit = %d", snapshot.EffectiveGoSoftLimit)
+	// The effective limit is whichever of the two ceilings binds: the envelope
+	// less what child JVMs hold, or Go's own limit. Asserting only the former
+	// described one set of constants rather than the rule, and stopped holding
+	// the moment the envelope grew past the Go limit.
+	wantEffective := ProcessTreeSoftLimitBytes - wantCurrent
+	if wantEffective > GoSoftLimitBytes {
+		wantEffective = GoSoftLimitBytes
+	}
+	if wantEffective < GoMinimumLimitBytes {
+		wantEffective = GoMinimumLimitBytes
+	}
+	if snapshot.EffectiveGoSoftLimit != wantEffective {
+		t.Fatalf("effective Go limit = %d, want %d", snapshot.EffectiveGoSoftLimit, wantEffective)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)

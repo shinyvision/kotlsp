@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,10 +25,6 @@ import (
 	"github.com/shinyvision/kotlsp/internal/archiveio"
 	"github.com/shinyvision/kotlsp/internal/resourcebudget"
 )
-
-func resolveClasspath(ctx context.Context, root string) []string {
-	return resolveClasspathModel(ctx, root).Classpath
-}
 
 type classpathResolution struct {
 	Importer      string
@@ -53,9 +50,32 @@ type classpathResolution struct {
 	SourceSetDependsOn           map[string]map[string][]string
 	SourceSetRoots               map[string]map[string][]string
 	CompilerSettings             map[string]map[string]CompilerSettings
+	// Formatters is the build's own formatter configuration per module.
+	Formatters map[string][]FormatterSpec
+	// GradleHome, GradleVersion and GradleUserHome locate the Gradle that
+	// runs the build: its build scripts compile against that distribution.
+	GradleHome, GradleVersion, GradleUserHome string
 }
 
-const buildModelCacheVersion = 13
+// FormatterSpec is one formatter step the build applies to a module's files:
+// Spotless running ktlint, with the exact version, classpath and settings the
+// build uses, so formatting through it matches what spotlessCheck accepts.
+type FormatterSpec struct {
+	// Format is the build's name for the file set: "kotlin" covers .kt
+	// sources, "kotlinGradle" build scripts.
+	Format       string
+	Tool         string
+	Version      string
+	EditorConfig string
+	Overrides    map[string]string
+	Classpath    []string
+}
+
+// Bumped to 14: the Kotlin compile-task source set used to be read with
+// toString() on a Gradle property, which yields "task ':compileKotlin'
+// property 'sourceSetName'" rather than "main", so every cached model filed
+// its Kotlin settings under a source set that does not exist.
+const buildModelCacheVersion = 19
 
 const maxBuildModelCacheBytes = 64 << 20
 
@@ -127,6 +147,19 @@ func isModularPath(path string) bool {
 		}
 	}
 	return modular
+}
+
+// withResolutionMaps gives every map field of r that is nil an empty map, so
+// a resolution taken whole from an importer can be written into like a new
+// one.
+func withResolutionMaps(r classpathResolution) classpathResolution {
+	value := reflect.ValueOf(&r).Elem()
+	for index := 0; index < value.NumField(); index++ {
+		if field := value.Field(index); field.Kind() == reflect.Map && field.IsNil() && field.CanSet() {
+			field.Set(reflect.MakeMap(field.Type()))
+		}
+	}
+	return r
 }
 
 func newClasspathResolution() classpathResolution {
@@ -217,7 +250,7 @@ func compileClasspathEntries(resolution classpathResolution) ([]string, bool) {
 }
 
 func resolveClasspathModel(ctx context.Context, root string) classpathResolution {
-	fingerprint, fingerprintErr := buildModelFingerprint(root, false)
+	fingerprint, fingerprintErr := buildModelFingerprint(root)
 	if fingerprintErr == nil {
 		if cached, ok := loadBuildModelCache(root, fingerprint); ok {
 			cached.Classpath = append(cached.Classpath, conventionalOutputDirectories(root)...)
@@ -233,24 +266,14 @@ func resolveClasspathModel(ctx context.Context, root string) classpathResolution
 	resolvedByBuildTool := false
 	if gradle := gradleLauncher(root); gradle != "" {
 		gradleResolution := gradleClasspathModel(ctx, root, gradle)
-		resolution.Importer = gradleResolution.Importer
-		resolution.Failure = gradleResolution.Failure
-		resolution.Authoritative = gradleResolution.Authoritative
-		resolution.UsedConfigurationFallback = gradleResolution.UsedConfigurationFallback
 		paths = append(paths, gradleResolution.Classpath...)
 		resolvedByBuildTool = len(gradleResolution.Classpath) > 0
-		resolution.ModuleClasspath = gradleResolution.ModuleClasspath
-		resolution.Dependencies = gradleResolution.Dependencies
-		resolution.SourceSetClasspath = gradleResolution.SourceSetClasspath
-		resolution.RuntimeSourceSetClasspath = gradleResolution.RuntimeSourceSetClasspath
-		resolution.SourceSetDependencies = gradleResolution.SourceSetDependencies
-		resolution.RuntimeSourceSetDependencies = gradleResolution.RuntimeSourceSetDependencies
-		resolution.SourceSetExported = gradleResolution.SourceSetExported
-		resolution.DependencyExclusions = gradleResolution.DependencyExclusions
-		resolution.ExternalDependencyExclusions = gradleResolution.ExternalDependencyExclusions
-		resolution.SourceSetDependsOn = gradleResolution.SourceSetDependsOn
-		resolution.SourceSetRoots = gradleResolution.SourceSetRoots
-		resolution.CompilerSettings = gradleResolution.CompilerSettings
+		// The Gradle model is the resolution. Copying it field by field lost
+		// every field added later and forgotten here -- the formatter
+		// configuration once -- without a word. The flat classpath is
+		// rebuilt from paths below, as before.
+		resolution = withResolutionMaps(gradleResolution)
+		resolution.Classpath = nil
 		gradleCompileClasspath, complete := compileClasspathEntries(gradleResolution)
 		paths = append(paths, gradleCompileClasspath...)
 		if !complete {
@@ -562,7 +585,13 @@ func replaceWithEffectiveMavenGraph(resolution *classpathResolution, models map[
 	return nil
 }
 
-func buildModelFingerprint(root string, verifyArchives bool) ([sha256.Size]byte, error) {
+// buildModelFingerprint identifies the build inputs of one root. Archive
+// identity is always part of the value: hashing it only on the deep pass made
+// an ordinary poll and a rediscovery poll disagree for inputs nobody had
+// touched, so the fallback watcher saw a "change" on every tick and rebuilt the
+// whole project model every 30 seconds forever. Depth now controls only how the
+// identity is obtained -- cache or reread -- never what it contributes.
+func buildModelFingerprint(root string) ([sha256.Size]byte, error) {
 	hash := sha256.New()
 	root, _ = filepath.Abs(root)
 	manifest := cachedBuildInputManifest(root)
@@ -586,17 +615,15 @@ func buildModelFingerprint(root string, verifyArchives bool) ([sha256.Size]byte,
 		} else if info, statErr := os.Stat(path); statErr == nil {
 			_, _ = io.WriteString(hash, itoa64(info.Size()))
 			_, _ = io.WriteString(hash, info.ModTime().UTC().Format(time.RFC3339Nano))
-			if verifyArchives {
-				digest, entries, digestErr := archiveCentralDirectoryDigest(path)
-				if digestErr != nil {
-					return [sha256.Size]byte{}, digestErr
-				}
-				if entries > 2_000_000-verifiedArchiveEntries {
-					return [sha256.Size]byte{}, fmt.Errorf("archive identity inventory exceeds 2000000 entries")
-				}
-				verifiedArchiveEntries += entries
-				_, _ = hash.Write(digest[:])
+			digest, entries, digestErr := cachedArchiveIdentity(path, info)
+			if digestErr != nil {
+				return [sha256.Size]byte{}, digestErr
 			}
+			if entries > 2_000_000-verifiedArchiveEntries {
+				return [sha256.Size]byte{}, fmt.Errorf("archive identity inventory exceeds 2000000 entries")
+			}
+			verifiedArchiveEntries += entries
+			_, _ = hash.Write(digest[:])
 		} else {
 			_, _ = io.WriteString(hash, "missing")
 		}
@@ -650,9 +677,11 @@ func archiveCentralDirectoryDigest(path string) ([sha256.Size]byte, int, error) 
 // created build files are still found, while ordinary polls only stat/read the
 // inputs already discovered during import.
 func (i *Index) WorkspaceBuildFingerprint(rediscover bool) uint64 {
-	i.mu.RLock()
+	guard := i.lockGuard()
+	defer guard.release()
+	guard.RLock()
 	roots := append([]string(nil), i.roots...)
-	i.mu.RUnlock()
+	guard.RUnlock()
 	for index := range roots {
 		roots[index], _ = filepath.Abs(roots[index])
 		roots[index] = filepath.Clean(roots[index])
@@ -670,11 +699,14 @@ func (i *Index) WorkspaceBuildFingerprint(rediscover bool) uint64 {
 		buildInputDigestCache.Lock()
 		buildInputDigestCache.values = make(map[string]buildInputDigestEntry)
 		buildInputDigestCache.Unlock()
+		archiveIdentityCache.Lock()
+		archiveIdentityCache.values = make(map[string]archiveIdentityEntry)
+		archiveIdentityCache.Unlock()
 	}
 	hash := sha256.New()
 	var size [8]byte
 	for _, root := range roots {
-		fingerprint, fingerprintErr := buildModelFingerprint(root, rediscover)
+		fingerprint, fingerprintErr := buildModelFingerprint(root)
 		binary.LittleEndian.PutUint64(size[:], uint64(len(root)))
 		_, _ = hash.Write(size[:])
 		_, _ = io.WriteString(hash, root)
@@ -811,6 +843,44 @@ type buildInputDigestEntry struct {
 	digest   [sha256.Size]byte
 }
 
+type archiveIdentityEntry struct {
+	size     int64
+	modified int64
+	entries  int
+	digest   [sha256.Size]byte
+}
+
+var archiveIdentityCache = struct {
+	sync.Mutex
+	values map[string]archiveIdentityEntry
+}{values: make(map[string]archiveIdentityEntry)}
+
+// cachedArchiveIdentity serves an archive's content identity from a stat-keyed
+// cache so an ordinary poll costs one Stat rather than a central-directory
+// read. The rediscovery pass clears this cache, which is what lets it observe a
+// tool that atomically replaced a jar while preserving its size and timestamp.
+// Both passes therefore hash the same bytes for an unchanged archive.
+func cachedArchiveIdentity(path string, info os.FileInfo) ([sha256.Size]byte, int, error) {
+	modified := info.ModTime().UnixNano()
+	archiveIdentityCache.Lock()
+	cached, ok := archiveIdentityCache.values[path]
+	archiveIdentityCache.Unlock()
+	if ok && cached.size == info.Size() && cached.modified == modified {
+		return cached.digest, cached.entries, nil
+	}
+	digest, entries, err := archiveCentralDirectoryDigest(path)
+	if err != nil {
+		return [sha256.Size]byte{}, 0, err
+	}
+	archiveIdentityCache.Lock()
+	if len(archiveIdentityCache.values) >= 8192 {
+		archiveIdentityCache.values = make(map[string]archiveIdentityEntry)
+	}
+	archiveIdentityCache.values[path] = archiveIdentityEntry{size: info.Size(), modified: modified, entries: entries, digest: digest}
+	archiveIdentityCache.Unlock()
+	return digest, entries, nil
+}
+
 var buildInputDigestCache = struct {
 	sync.Mutex
 	values map[string]buildInputDigestEntry
@@ -863,9 +933,11 @@ func cachedBuildInputDigest(path string) ([sha256.Size]byte, error) {
 // watching supplies the invalidation, so ordinary cache checks touch only the
 // previously known build inputs instead of walking an entire monorepo.
 func (i *Index) InvalidateBuildModels() {
-	i.mu.RLock()
+	guard := i.lockGuard()
+	defer guard.release()
+	guard.RLock()
 	roots := append([]string(nil), i.roots...)
-	i.mu.RUnlock()
+	guard.RUnlock()
 	buildInputManifestCache.Lock()
 	for _, root := range roots {
 		absolute, _ := filepath.Abs(root)
@@ -1002,33 +1074,47 @@ func validateClasspathResolution(resolution classpathResolution) error {
 	if len(resolution.Classpath) > 100_000 || !addStrings(resolution.Classpath) {
 		return fmt.Errorf("build model exceeds its classpath/item safety limit")
 	}
-	addFlat := func(values map[string][]string) bool {
+	// Exclusion maps are keyed by dependencyExclusionKey, which joins the
+	// source set and the dependency with a NUL precisely because neither part
+	// can contain one. That single separator is structure, not corruption.
+	validExclusionKey := func(value string) bool {
+		sourceSet, dependency, found := strings.Cut(value, "\x00")
+		return found && sourceSet != "" && validText(sourceSet) && validText(dependency)
+	}
+	addFlatKeyed := func(values map[string][]string, validKey func(string) bool) bool {
 		items += len(values)
 		if len(values) > 4096 || items > maxModelItems {
 			return false
 		}
 		for key, list := range values {
-			if !validText(key) || len(list) > 100_000 || !addStrings(list) {
+			if !validKey(key) || len(list) > 100_000 || !addStrings(list) {
+				return false
+			}
+		}
+		return true
+	}
+	addFlat := func(values map[string][]string) bool {
+		return addFlatKeyed(values, validText)
+	}
+	addNestedKeyed := func(values map[string]map[string][]string, validInnerKey func(string) bool) bool {
+		items += len(values)
+		if len(values) > 4096 || items > maxModelItems {
+			return false
+		}
+		for key, nested := range values {
+			if !validText(key) || len(nested) > 4096 || !addFlatKeyed(nested, validInnerKey) {
 				return false
 			}
 		}
 		return true
 	}
 	addNested := func(values map[string]map[string][]string) bool {
-		items += len(values)
-		if len(values) > 4096 || items > maxModelItems {
-			return false
-		}
-		for key, nested := range values {
-			if !validText(key) || len(nested) > 4096 || !addFlat(nested) {
-				return false
-			}
-		}
-		return true
+		return addNestedKeyed(values, validText)
 	}
 	if !addFlat(resolution.ModuleClasspath) || !addFlat(resolution.Dependencies) ||
 		!addNested(resolution.SourceSetClasspath) || !addNested(resolution.RuntimeSourceSetClasspath) ||
-		!addNested(resolution.SourceSetDependencies) || !addNested(resolution.RuntimeSourceSetDependencies) || !addNested(resolution.SourceSetExported) || !addNested(resolution.DependencyExclusions) || !addNested(resolution.ExternalDependencyExclusions) ||
+		!addNested(resolution.SourceSetDependencies) || !addNested(resolution.RuntimeSourceSetDependencies) || !addNested(resolution.SourceSetExported) ||
+		!addNestedKeyed(resolution.DependencyExclusions, validExclusionKey) || !addNestedKeyed(resolution.ExternalDependencyExclusions, validExclusionKey) ||
 		!addNested(resolution.SourceSetDependsOn) || !addNested(resolution.SourceSetRoots) {
 		return fmt.Errorf("build model exceeds its module/source-set/item safety limit")
 	}
@@ -1064,10 +1150,6 @@ func gradleLauncher(root string) string {
 	return path
 }
 
-func gradleClasspath(parent context.Context, root, gradle string) []string {
-	return gradleClasspathModel(parent, root, gradle).Classpath
-}
-
 func gradleClasspathModel(parent context.Context, root, gradle string) classpathResolution {
 	resolution := newClasspathResolution()
 	resolution.Importer = "gradle"
@@ -1096,7 +1178,16 @@ func gradleClasspathModel(parent context.Context, root, gradle string) classpath
 	// it exit with this request. One worker is sufficient for the synthetic model
 	// task and prevents dependency resolution from competing with foreground LSP
 	// work across every core.
-	cmd := exec.CommandContext(toolContext, gradle, "--no-daemon", "--no-parallel", "--max-workers=1", "--quiet", "--init-script", name, "kotlspClasspath")
+	//
+	// The model task reads the project model while it executes, which the
+	// configuration cache cannot serialize; a project that enables it in
+	// gradle.properties would otherwise fail the import outright and leave
+	// every module without its dependency jars. Command-line system properties
+	// override gradle.properties, and Gradle versions that predate either
+	// property ignore it, unlike --no-configuration-cache.
+	cmd := exec.CommandContext(toolContext, gradle, "--no-daemon", "--no-parallel", "--max-workers=1", "--quiet",
+		"-Dorg.gradle.configuration-cache=false", "-Dorg.gradle.unsafe.configuration-cache=false",
+		"--init-script", name, "kotlspClasspath")
 	cmd.Dir = root
 	cmd.Env = withToolHeapOption(os.Environ(), "GRADLE_OPTS", "-Xmx512m -XX:+ExitOnOutOfMemoryError")
 	release, reserveErr := resourcebudget.Acquire(toolContext, "gradle-import", resourcebudget.BuildToolBytes)
@@ -1135,12 +1226,50 @@ func gradleClasspathModel(parent context.Context, root, gradle string) classpath
 		module, sourceSet, target, group, artifact string
 	}
 	var exclusionRecords []exclusionRecord
+	var scriptAccessorDirs []string
 	for lineIndex, line := range strings.Split(string(output), "\n") {
 		if lineIndex >= 250_000 {
 			resolution.Failure = appendIncompleteReason(resolution.Failure, "Gradle model exceeds its 250000-record safety limit")
 			break
 		}
 		line = strings.TrimSpace(line)
+		if value, ok := strings.CutPrefix(line, "KOTLSP_GRADLE_HOME="); ok {
+			if parts := strings.SplitN(value, "\t", 3); len(parts) == 3 {
+				resolution.GradleHome, resolution.GradleVersion, resolution.GradleUserHome = parts[0], parts[1], parts[2]
+			}
+			continue
+		}
+		if value, ok := strings.CutPrefix(line, "KOTLSP_SCRIPT_ACCESSORS="); ok {
+			scriptAccessorDirs = append(scriptAccessorDirs, value)
+			continue
+		}
+		if value, ok := strings.CutPrefix(line, "KOTLSP_SCRIPT_CLASSPATH="); ok {
+			// The build-script classpath is its own source set: visible from
+			// `*.gradle.kts` and nowhere else, so the Gradle API never shows
+			// up in the project's own code.
+			if parts := strings.SplitN(value, "\t", 2); len(parts) == 2 && gradleScriptClasspathEntry(parts[1]) {
+				if absolute, err := filepath.Abs(parts[1]); err == nil {
+					if resolution.SourceSetClasspath[parts[0]] == nil {
+						resolution.SourceSetClasspath[parts[0]] = make(map[string][]string)
+					}
+					scriptClasspath := resolution.SourceSetClasspath[parts[0]][gradleScriptSourceSet]
+					if !containsString(scriptClasspath, absolute) {
+						paths = append(paths, absolute)
+						resolution.SourceSetClasspath[parts[0]][gradleScriptSourceSet] = append(scriptClasspath, absolute)
+					}
+				}
+			}
+			continue
+		}
+		if value, ok := strings.CutPrefix(line, "KOTLSP_FORMATTER="); ok {
+			if spec, module, parsed := parseFormatterRecord(value); parsed {
+				if resolution.Formatters == nil {
+					resolution.Formatters = make(map[string][]FormatterSpec)
+				}
+				resolution.Formatters[module] = append(resolution.Formatters[module], spec)
+			}
+			continue
+		}
 		if value, ok := strings.CutPrefix(line, "KOTLSP_MODEL_LIMITATION="); ok {
 			parts := strings.SplitN(value, "\t", 2)
 			if len(parts) == 2 {
@@ -1344,6 +1473,27 @@ func gradleClasspathModel(parent context.Context, root, gradle string) classpath
 			resolution.Failure = appendIncompleteReason(resolution.Failure, "Gradle classpath exceeds its 100000-path safety limit")
 			paths = paths[:100_000]
 			break
+		}
+	}
+	// Build scripts also see the generated accessors (`implementation(...)`,
+	// `spotless { }`) and a Kotlin standard library.
+	if accessors := mergeGradleAccessors(scriptAccessorDirs, resolution.GradleVersion); accessors != "" {
+		paths = append(paths, accessors)
+		for module, bySourceSet := range resolution.SourceSetClasspath {
+			if len(bySourceSet[gradleScriptSourceSet]) > 0 {
+				bySourceSet[gradleScriptSourceSet] = append(bySourceSet[gradleScriptSourceSet], accessors)
+				resolution.SourceSetClasspath[module] = bySourceSet
+			}
+		}
+	}
+	for _, bySourceSet := range resolution.SourceSetClasspath {
+		if len(bySourceSet[gradleScriptSourceSet]) == 0 {
+			continue
+		}
+		for _, value := range bySourceSet["main"] {
+			if base := filepath.Base(value); strings.HasPrefix(base, "kotlin-stdlib") && strings.HasSuffix(base, ".jar") && !containsString(bySourceSet[gradleScriptSourceSet], value) {
+				bySourceSet[gradleScriptSourceSet] = append(bySourceSet[gradleScriptSourceSet], value)
+			}
 		}
 	}
 	// A module whose source sets Gradle identified exactly needs no
@@ -1698,6 +1848,13 @@ func sourceJarsFor(binary string) ([]string, bool) {
 	if strings.HasSuffix(binary, "-sources.jar") {
 		return []string{binary}, false
 	}
+	// Gradle's cache keeps `name-1.0-sources.jar` beside `name-1.0.jar` under
+	// a sibling hash directory, so the search starts two levels up. Only the
+	// binary's own attachment counts: Maven keeps every version of an artifact
+	// under that directory, and Arch's /usr/share/kotlin holds the JS and JDK
+	// variants' sources next to kotlin-stdlib.jar, whose JS `String` then
+	// declared kotlin.String twice.
+	wanted := strings.TrimSuffix(filepath.Base(binary), ".jar") + "-sources.jar"
 	versionDir := filepath.Dir(filepath.Dir(binary))
 	var sources []string
 	visited := 0
@@ -1711,16 +1868,12 @@ func sourceJarsFor(binary string) ([]string, bool) {
 			exhausted = true
 			return filepath.SkipAll
 		}
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), "-sources.jar") {
+		if !entry.IsDir() && entry.Name() == wanted {
 			sources = append(sources, path)
 		}
 		return nil
 	})
 	return sources, exhausted
-}
-
-func jdkSources() string {
-	return jdkSourcesForHome("")
 }
 
 func jdkSourcesForHome(configuredHome string) string {
@@ -1794,6 +1947,11 @@ func sourceEntry(name string) bool {
 }
 
 func archiveAccepts(archive sourceArchive, file *zip.File) bool {
+	// Gradle's API jar bundles the libraries Gradle itself runs on (45000
+	// classes); a build script sees Gradle's public API.
+	if gradleDistributionArchive(archive.path) && !gradlePublicEntry(file.Name) {
+		return false
+	}
 	if archive.binary {
 		name := strings.ToLower(file.Name)
 		return strings.HasSuffix(name, ".class") && !strings.HasSuffix(name, "module-info.class")
@@ -2027,4 +2185,136 @@ func languageForEntry(name string) string {
 		return "java"
 	}
 	return "kotlin"
+}
+
+// parseFormatterRecord reads a KOTLSP_FORMATTER line: module, format, tool,
+// version, then the editorconfig path, the overrides ("key=value" lines) and
+// the classpath (one path per line), each base64-encoded.
+func parseFormatterRecord(value string) (FormatterSpec, string, bool) {
+	parts := strings.Split(value, "\t")
+	if len(parts) != 7 || parts[0] == "" || parts[2] != "ktlint" {
+		return FormatterSpec{}, "", false
+	}
+	decode := func(encoded string) (string, bool) {
+		data, err := base64.StdEncoding.DecodeString(encoded)
+		return string(data), err == nil
+	}
+	editorConfig, ok1 := decode(parts[4])
+	overrides, ok2 := decode(parts[5])
+	classpath, ok3 := decode(parts[6])
+	if !ok1 || !ok2 || !ok3 {
+		return FormatterSpec{}, "", false
+	}
+	spec := FormatterSpec{Format: parts[1], Tool: parts[2], Version: parts[3], EditorConfig: editorConfig, Overrides: make(map[string]string)}
+	for _, line := range strings.Split(overrides, "\n") {
+		if key, value, found := strings.Cut(line, "="); found && key != "" {
+			spec.Overrides[key] = value
+		}
+	}
+	for _, entry := range strings.Split(classpath, "\n") {
+		if entry = strings.TrimSpace(entry); entry != "" {
+			spec.Classpath = append(spec.Classpath, entry)
+		}
+	}
+	return spec, parts[0], len(spec.Classpath) > 0
+}
+
+// gradleScriptSourceSet is the source set `*.gradle.kts` files belong to.
+const gradleScriptSourceSet = "gradleScript"
+
+// mergeGradleAccessors gathers the Kotlin DSL accessors Gradle compiled for
+// the build's projects into one jar under kotlsp's cache. Gradle keeps a
+// directory per project schema, and they repeat one another: each accessor
+// class is named by a hash of its content, so their union by file name is
+// every accessor exactly once (indexing the directories listed
+// `implementation` once per schema). A jar, because libraries are archives.
+func mergeGradleAccessors(directories []string, version string) string {
+	if len(directories) == 0 || version == "" || strings.ContainsAny(version, "/\\") {
+		return ""
+	}
+	sources := make(map[string]string)
+	for _, directory := range directories {
+		_ = filepath.WalkDir(directory, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil || entry.IsDir() || !strings.HasSuffix(path, ".class") || len(sources) >= 100_000 {
+				return nil
+			}
+			relative, relErr := filepath.Rel(directory, path)
+			if relErr != nil || strings.HasPrefix(relative, "..") {
+				return nil
+			}
+			relative = filepath.ToSlash(relative)
+			if _, seen := sources[relative]; !seen {
+				sources[relative] = path
+			}
+			return nil
+		})
+	}
+	if len(sources) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(sources))
+	for name := range sources {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	digest := sha256.New()
+	for _, name := range names {
+		digest.Write([]byte(name))
+		digest.Write([]byte{0})
+	}
+	cacheRoot, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	directory := filepath.Join(cacheRoot, "kotlsp", "gradle-accessors", version)
+	target := filepath.Join(directory, "accessors-"+hex.EncodeToString(digest.Sum(nil))[:16]+".jar")
+	if info, statErr := os.Stat(target); statErr == nil && info.Size() > 0 {
+		return target
+	}
+	if os.MkdirAll(directory, 0o700) != nil {
+		return ""
+	}
+	temporary, err := os.CreateTemp(directory, "accessors-*.tmp")
+	if err != nil {
+		return ""
+	}
+	defer os.Remove(temporary.Name())
+	writer := zip.NewWriter(temporary)
+	for _, name := range names {
+		data, readErr := os.ReadFile(sources[name])
+		if readErr != nil {
+			continue
+		}
+		entry, createErr := writer.Create(name)
+		if createErr != nil {
+			writer.Close()
+			temporary.Close()
+			return ""
+		}
+		if _, writeErr := entry.Write(data); writeErr != nil {
+			writer.Close()
+			temporary.Close()
+			return ""
+		}
+	}
+	if writer.Close() != nil || temporary.Close() != nil {
+		return ""
+	}
+	if os.Rename(temporary.Name(), target) != nil {
+		return ""
+	}
+	return target
+}
+
+// gradleScriptClasspathEntry keeps the parts of a build script's classpath a
+// script names: Gradle itself and the plugins (`KotlinCompile`, `BootJar`,
+// `JvmTarget`). The plugins' own implementation libraries -- JGit, Jackson,
+// HTTP clients, a second Kotlin stdlib -- are on that classpath too, cost
+// indexing time and memory, and only crowded completion in build scripts.
+func gradleScriptClasspathEntry(path string) bool {
+	base := strings.ToLower(filepath.Base(path))
+	if !strings.HasSuffix(base, ".jar") {
+		return true
+	}
+	return strings.Contains(base, "gradle") || strings.Contains(base, "plugin")
 }

@@ -29,19 +29,29 @@ func (s *Server) extractActions(uri protocol.URI, selectedRange protocol.Range, 
 	trimmed := strings.TrimSpace(selected)
 	parameters := extractionParameters(file.Symbols, startOffset, endOffset, trimmed)
 	evidence := s.index.ExpressionEvidence(uri, trimmed, startOffset)
-	statementOffset := lineStart(doc.Text, startOffset)
-	indent := indentAt(doc.Text, startOffset)
 	name := uniqueSymbolName(file.Symbols, "extractedValue")
-	variableDeclaration := indent
+	declaration := ""
 	if kotlin {
-		variableDeclaration += "val " + name + " = " + trimmed + "\n"
-	} else {
-		variableDeclaration += evidence.Type + " " + name + " = " + strings.TrimSuffix(trimmed, ";") + ";\n"
+		declaration = "val " + name + " = " + trimmed
+	} else if evidence.Type != "" {
+		declaration = evidence.Type + " " + name + " = " + strings.TrimSuffix(trimmed, ";") + ";"
 	}
-	variable := refactorAction("Extract variable", "refactor.extract.variable", uri,
-		protocol.TextEdit{Range: doc.Range(statementOffset, statementOffset), NewText: variableDeclaration},
-		protocol.TextEdit{Range: selectedRange, NewText: name},
-	)
+	var variable *protocol.CodeAction
+	if insertion, ok := statementInsertionPoint(doc.Text, startOffset, file.Symbols); ok && declaration != "" && isExpressionSelection(trimmed) {
+		text := insertion.indent + declaration + "\n"
+		if insertion.inline {
+			text = "\n" + insertion.indent + declaration + "\n" + insertion.indent
+		}
+		from := insertion.offset
+		if insertion.inline && insertion.replaceFrom > 0 && insertion.replaceFrom < from {
+			from = insertion.replaceFrom
+		}
+		action := refactorAction("Extract variable", "refactor.extract.variable", uri,
+			protocol.TextEdit{Range: doc.Range(from, insertion.offset), NewText: text},
+			protocol.TextEdit{Range: selectedRange, NewText: name},
+		)
+		variable = &action
+	}
 
 	functionName := uniqueSymbolName(file.Symbols, "extractedFunction")
 	functionInsert, functionIndent, owner := extractionInsertion(doc, file.Symbols, startOffset)
@@ -85,11 +95,12 @@ func (s *Server) extractActions(uri protocol.URI, selectedRange protocol.Range, 
 		}
 	}
 	actions := make([]protocol.CodeAction, 0, 4)
-	// Moving a potentially throwing or side-effecting subexpression to the
-	// beginning of its line changes short-circuit/evaluation order. The fast
-	// extractor therefore offers a variable only for proven constants.
-	if evidence.Constant && evidence.Type != "" {
-		actions = append(actions, variable)
+	// The value is computed before the statement instead of where it stood,
+	// as in every editor's extract-variable; a selection that is not a
+	// complete expression, or with nowhere valid to declare it, is not
+	// offered.
+	if variable != nil {
+		actions = append(actions, *variable)
 	}
 	// A local or parameter is passed by value. Moving an assignment/inc/dec of
 	// that binding into a new function would mutate only the extracted
@@ -122,7 +133,13 @@ func (s *Server) extractActions(uri protocol.URI, selectedRange protocol.Range, 
 			if kotlin {
 				declaration := "private const val " + constantName + ": " + evidence.Type + " = " + trimmed
 				if owner.ID != "" && owner.Kind != analysis.KindObject {
-					constantText = "\n" + functionIndent + "companion object {\n" + functionIndent + "    " + declaration + "\n" + functionIndent + "}\n"
+					// Into the companion the class already has; a second one
+					// does not compile.
+					if insert, indent, ok := companionBodyInsertion(doc.Text, file.Symbols, owner); ok {
+						functionInsert, constantText = insert, "\n"+indent+declaration+"\n"
+					} else {
+						constantText = "\n" + functionIndent + "companion object {\n" + functionIndent + "    " + declaration + "\n" + functionIndent + "}\n"
+					}
 				} else {
 					constantText = "\n" + functionIndent + declaration + "\n"
 				}
@@ -372,7 +389,9 @@ func (s *Server) inlineVariableAction(uri protocol.URI, requested protocol.Range
 			return protocol.CodeAction{}, false
 		}
 		for _, reference := range file.References {
-			if reference.Name == symbol.Name && reference.StartByte > symbol.EndByte && reference.Role == analysis.RoleWrite {
+			// A qualified write (`other.value = 1`) names a member of something
+			// else, not this local, so it never invalidates inlining it.
+			if reference.Name == symbol.Name && reference.Qualifier == "" && reference.StartByte > symbol.EndByte && reference.Role == analysis.RoleWrite {
 				return protocol.CodeAction{}, false
 			}
 		}
@@ -426,7 +445,7 @@ func refactorAction(title, kind string, uri protocol.URI, edits ...protocol.Text
 func extractionInsertion(doc *textdoc.Document, symbols []analysis.Symbol, offset int) (int, string, analysis.Symbol) {
 	var owner analysis.Symbol
 	for _, symbol := range symbols {
-		if !analysis.IsTypeKind(symbol.Kind) || symbol.StartByte >= offset || symbol.EndByte < offset {
+		if !analysis.IsTypeKind(symbol.Kind) || symbol.Synthetic || symbol.StartByte >= offset || symbol.EndByte < offset {
 			continue
 		}
 		if owner.ID == "" || symbol.StartByte >= owner.StartByte && symbol.EndByte <= owner.EndByte {

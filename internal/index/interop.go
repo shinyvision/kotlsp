@@ -146,12 +146,20 @@ func interopSymbols(file *analysis.ParsedFile) []analysis.Symbol {
 	// Prefer a getter as the navigation target. A write-only JavaBean still
 	// contributes a Kotlin synthetic property through its setter.
 	properties := make(map[string]analysis.Symbol)
+	// A Kotlin class read from a class file declares its properties in its
+	// metadata; projecting its getters again would list each one twice.
+	declared := make(map[string]bool)
+	for _, property := range file.Symbols {
+		if property.Kind == analysis.KindProperty && property.Language == analysis.LanguageKotlin && property.ContainerID != "" {
+			declared[property.ContainerID+"\x00"+property.Name] = true
+		}
+	}
 	for _, method := range file.Symbols {
 		if method.Kind != analysis.KindMethod || method.ContainerID == "" || !owners[method.ContainerID] || len(method.Parameters) != 0 {
 			continue
 		}
 		name, ok := javaBeanGetterName(method)
-		if ok {
+		if ok && !declared[method.ContainerID+"\x00"+name] {
 			properties[method.ContainerID+"\x00"+name] = interopSymbol(method, name, analysis.KindProperty, kotlinizeBinaryType(method.Type), nil, analysis.LanguageKotlin)
 		}
 	}
@@ -164,7 +172,7 @@ func interopSymbols(file *analysis.ParsedFile) []analysis.Symbol {
 			continue
 		}
 		key := method.ContainerID + "\x00" + name
-		if _, exists := properties[key]; !exists {
+		if _, exists := properties[key]; !exists && !declared[key] {
 			properties[key] = interopSymbol(method, name, analysis.KindProperty, kotlinizeBinaryType(method.Parameters[0].Type), nil, analysis.LanguageKotlin)
 		}
 	}
@@ -248,7 +256,7 @@ func generatedSourceAPISymbols(file *analysis.ParsedFile, owners map[string]anal
 			add(owner, "values", analysis.KindMethod, arrayType, nil, "public", "static")
 			add(owner, "valueOf", analysis.KindMethod, owner.Name, []analysis.Parameter{{Name: "value", Type: "String", Range: owner.SelectionRange}}, "public", "static")
 			if owner.Language == analysis.LanguageKotlin {
-				add(owner, "entries", analysis.KindProperty, "EnumEntries<"+owner.Name+">", nil, "public", "static", "val")
+				add(owner, "entries", analysis.KindProperty, "kotlin.enums.EnumEntries<"+owner.Name+">", nil, "public", "static", "val")
 			}
 		}
 		if owner.Language != analysis.LanguageKotlin || owner.Kind != analysis.KindClass || !containsString(owner.Modifiers, "data") {
@@ -339,6 +347,11 @@ func interopSymbol(origin analysis.Symbol, name string, kind analysis.SymbolKind
 	origin.Kind, origin.Type, origin.Parameters = kind, typ, parameters
 	origin.Initializer, origin.ReceiverType = "", ""
 	origin.Synthetic, origin.InteropLanguage = true, visibleIn
+	// A projected member is never a local binding. Its scope is its own
+	// extent: inheriting the origin's wider scope made a property projected from
+	// a compiled getter look like a local variable, so it was never indexed as
+	// a member of its class.
+	origin.ScopeEndByte = origin.EndByte
 	if visibleIn != analysis.LanguageUnknown {
 		origin.Language = visibleIn
 	}

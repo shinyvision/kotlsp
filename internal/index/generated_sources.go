@@ -51,12 +51,14 @@ func (i *Index) computeGeneratedSourceState() {
 }
 
 func (i *Index) computeGeneratedSourceStateContext(ctx context.Context) error {
-	i.mu.RLock()
+	guard := i.lockGuard()
+	defer guard.release()
+	guard.RLock()
 	modules := make([]ModuleInfo, len(i.modules))
 	for moduleIndex, module := range i.modules {
 		modules[moduleIndex] = cloneModuleInfo(module)
 	}
-	i.mu.RUnlock()
+	guard.RUnlock()
 	unmodelled := make(map[string]bool)
 	for moduleIndex, module := range modules {
 		if moduleIndex&31 == 0 && ctx.Err() != nil {
@@ -99,9 +101,9 @@ func (i *Index) computeGeneratedSourceStateContext(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			accessible, complete := moduleAccessSet(from, set, byName)
-			if !complete {
-				return fmt.Errorf("generated-source dependency closure for %s/%s exceeded its safety limit", from.Name, set)
+			accessible, incomplete := moduleAccessSetExplained(from, set, byName)
+			if incomplete != "" {
+				return fmt.Errorf("generated-source dependency closure for %s/%s is unprovable: %s", from.Name, set, incomplete)
 			}
 			totalStates += len(accessible)
 			if totalStates > 1_000_000 {
@@ -174,11 +176,6 @@ func moduleDeclaresAnnotationProcessor(directory string) bool {
 		}
 	}
 	return false
-}
-
-func moduleHasGeneratedOutput(directory string) bool {
-	found, _ := moduleHasGeneratedOutputContext(context.Background(), directory)
-	return found
 }
 
 func moduleHasGeneratedOutputContext(ctx context.Context, directory string) (bool, bool) {

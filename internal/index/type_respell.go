@@ -32,6 +32,15 @@ func (i *Index) respellDeclaredTypeLocked(file *analysis.ParsedFile, declaration
 	if !strings.ContainsFunc(typ, unicode.IsUpper) {
 		return typ
 	}
+	// A Kotlin declaration read from a class file lives in that file's Java
+	// rendering, where `String` means java.lang.String. Its types come from
+	// the Kotlin metadata, spelled for Kotlin already: builtins by simple name,
+	// everything else qualified. Respelling them by Java's rules turned
+	// `List<String>` into List<java.lang.String>, and the Java class's members
+	// then answered for every string in a lambda.
+	if declaration.Language == analysis.LanguageKotlin && declaringFile.Language != analysis.LanguageKotlin {
+		return typ
+	}
 	key := declaration.ID + "\x00" + string(file.URI) + "\x00" + typ
 	epoch := [2]uint64{i.semanticVersion, i.semanticEnvironmentVersion}
 	if cached, ok := i.respell.lookup(epoch, key); ok {

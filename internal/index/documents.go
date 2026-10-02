@@ -12,6 +12,8 @@ import (
 )
 
 func (i *Index) Open(ctx context.Context, item protocol.TextDocumentItem) *analysis.ParsedFile {
+	guard := i.lockGuard()
+	defer guard.release()
 	if i.IsLibraryMirrorFile(item.URI) {
 		// A mirrored archive entry is a read-only library view. Entering it
 		// into the workspace document set would compile it as project source
@@ -26,6 +28,7 @@ func (i *Index) Open(ctx context.Context, item protocol.TextDocumentItem) *analy
 	ctx = operationCtx
 	i.interactiveOnce.Do(func() { close(i.interactiveStarted) })
 	i.cancelCompilerDiagnostics()
+	i.preemptDiagnostics()
 	doc := textdoc.NewDocument(item.URI, item.LanguageID, item.Version, item.Text)
 	state := analysis.NewSyntaxState()
 	parsed := analysis.ParseIncremental(ctx, doc, state, nil)
@@ -33,7 +36,7 @@ func (i *Index) Open(ctx context.Context, item protocol.TextDocumentItem) *analy
 		state.Close()
 		return parsed
 	}
-	i.mu.Lock()
+	guard.Lock()
 	if previous := i.syntaxStates[item.URI]; previous != nil {
 		previous.Close()
 	}
@@ -51,15 +54,17 @@ func (i *Index) Open(ctx context.Context, item protocol.TextDocumentItem) *analy
 	i.dropCompilerDiagnosticsLocked(item.URI)
 	i.replaceLocked(parsed)
 	i.fileGeneration[item.URI] = i.generation.Load()
-	i.mu.Unlock()
+	guard.Unlock()
 	if i.onParsed != nil {
-		i.onParsed(item.URI, i.Diagnostics(item.URI))
+		i.publishDiagnosticsSoon(item.URI)
 	}
 	i.ScheduleCompilerDiagnostics(ctx)
 	return parsed
 }
 
 func (i *Index) Change(ctx context.Context, params protocol.DidChangeTextDocumentParams) (*analysis.ParsedFile, error) {
+	guard := i.lockGuard()
+	defer guard.release()
 	operationCtx, finish, started := i.beginBackground(ctx)
 	if !started {
 		return nil, errors.New("index is closed")
@@ -68,14 +73,15 @@ func (i *Index) Change(ctx context.Context, params protocol.DidChangeTextDocumen
 	ctx = operationCtx
 	i.interactiveOnce.Do(func() { close(i.interactiveStarted) })
 	i.cancelCompilerDiagnostics()
-	i.mu.RLock()
+	i.preemptDiagnostics()
+	guard.RLock()
 	old := i.docs[params.TextDocument.URI]
 	previousParsed := i.files[params.TextDocument.URI]
 	state := i.syntaxStates[params.TextDocument.URI]
 	if old != nil {
 		old = old.Clone()
 	}
-	i.mu.RUnlock()
+	guard.RUnlock()
 	if old == nil {
 		return nil, errors.New("document is not open")
 	}
@@ -90,12 +96,12 @@ func (i *Index) Change(ctx context.Context, params protocol.DidChangeTextDocumen
 	if old.Text == previousText && previousParsed != nil {
 		updated := *previousParsed
 		updated.Version = params.TextDocument.Version
-		i.mu.Lock()
+		guard.Lock()
 		i.docs[old.URI] = old
 		i.files[old.URI] = &updated
-		i.mu.Unlock()
+		guard.Unlock()
 		if i.onParsed != nil {
-			i.onParsed(old.URI, i.Diagnostics(old.URI))
+			i.publishDiagnosticsSoon(old.URI)
 		}
 		i.ScheduleCompilerDiagnostics(ctx)
 		return &updated, nil
@@ -107,7 +113,7 @@ func (i *Index) Change(ctx context.Context, params protocol.DidChangeTextDocumen
 	if err := ctx.Err(); err != nil {
 		return parsed, err
 	}
-	i.mu.Lock()
+	guard.Lock()
 	i.syntaxStates[old.URI] = state
 	i.docs[old.URI] = old
 	// Compiler findings belong to the exact source/configuration transaction
@@ -117,27 +123,30 @@ func (i *Index) Change(ctx context.Context, params protocol.DidChangeTextDocumen
 	i.dropCompilerDiagnosticsLocked(old.URI)
 	i.replaceLocked(parsed)
 	i.fileGeneration[old.URI] = i.generation.Load()
-	i.mu.Unlock()
+	guard.Unlock()
 	if i.onParsed != nil {
-		i.onParsed(old.URI, i.Diagnostics(old.URI))
+		i.publishDiagnosticsSoon(old.URI)
 	}
 	i.ScheduleCompilerDiagnostics(ctx)
 	return parsed, nil
 }
 
 func (i *Index) CloseDocument(ctx context.Context, uri protocol.URI) {
+	guard := i.lockGuard()
+	defer guard.release()
 	reloadCtx, finish, started := i.beginBackground(ctx)
 	if !started {
 		return
 	}
 	// Invalidate any compiler run which captured the discarded unsaved buffer.
 	i.compilerRun.Add(1)
-	i.mu.Lock()
+	i.preemptDiagnostics()
+	guard.Lock()
 	delete(i.docs, uri)
 	state := i.syntaxStates[uri]
 	delete(i.syntaxStates, uri)
 	revision := i.documentRevision[uri]
-	i.mu.Unlock()
+	guard.Unlock()
 	if state != nil {
 		state.Close()
 	}
@@ -147,6 +156,7 @@ func (i *Index) CloseDocument(ctx context.Context, uri protocol.URI) {
 		return
 	}
 	go func() {
+		defer i.recoverBackground("CloseDocument")
 		defer finish()
 		if reloadCtx.Err() != nil {
 			return
@@ -178,8 +188,8 @@ func (i *Index) CloseDocument(ctx context.Context, uri protocol.URI) {
 		i.replaceLocked(parsed)
 		i.fileGeneration[parsed.URI] = i.generation.Load()
 		i.mu.Unlock()
-		if i.onParsed != nil && !i.closed.Load() {
-			i.onParsed(uri, i.Diagnostics(uri))
+		if !i.closed.Load() {
+			i.publishNow(uri)
 		}
 		i.ScheduleCompilerDiagnostics(reloadCtx)
 	}()
@@ -198,6 +208,7 @@ func (i *Index) Reload(ctx context.Context, uri protocol.URI) <-chan struct{} {
 		return done
 	}
 	go func() {
+		defer i.recoverBackground("Reload")
 		defer finish()
 		defer close(done)
 		select {
@@ -212,6 +223,8 @@ func (i *Index) Reload(ctx context.Context, uri protocol.URI) <-chan struct{} {
 // tells polling watchers to retain their old file stamp and retry: transient
 // replace/read failures must preserve both the old semantics and the retry.
 func (i *Index) ReloadResult(ctx context.Context, uri protocol.URI) <-chan bool {
+	guard := i.lockGuard()
+	defer guard.release()
 	done := make(chan bool, 1)
 	reloadCtx, finish, started := i.beginBackground(ctx)
 	if !started {
@@ -219,10 +232,10 @@ func (i *Index) ReloadResult(ctx context.Context, uri protocol.URI) <-chan bool 
 		close(done)
 		return done
 	}
-	i.mu.RLock()
+	guard.RLock()
 	_, open := i.docs[uri]
 	revision := i.documentRevision[uri]
-	i.mu.RUnlock()
+	guard.RUnlock()
 	if open {
 		finish()
 		done <- true
@@ -237,6 +250,7 @@ func (i *Index) ReloadResult(ctx context.Context, uri protocol.URI) <-chan bool 
 		return done
 	}
 	go func() {
+		defer i.recoverBackground("ReloadResult")
 		defer finish()
 		defer close(done)
 		data, err := readWorkspaceSource(path)
@@ -261,8 +275,8 @@ func (i *Index) ReloadResult(ctx context.Context, uri protocol.URI) <-chan bool 
 		i.replaceLocked(parsed)
 		i.fileGeneration[parsed.URI] = i.generation.Load()
 		i.mu.Unlock()
-		if i.onParsed != nil && !i.closed.Load() {
-			i.onParsed(uri, i.Diagnostics(uri))
+		if !i.closed.Load() {
+			i.publishNow(uri)
 		}
 		done <- true
 	}()
@@ -271,12 +285,14 @@ func (i *Index) ReloadResult(ctx context.Context, uri protocol.URI) <-chan bool 
 
 // Remove evicts every declaration and reference belonging to a deleted file.
 func (i *Index) Remove(uri protocol.URI) {
+	guard := i.lockGuard()
+	defer guard.release()
 	if i.closed.Load() {
 		return
 	}
-	i.mu.Lock()
+	guard.Lock()
 	i.removeLocked(uri)
-	i.mu.Unlock()
+	guard.Unlock()
 }
 
 // RemoveClosed applies a filesystem deletion only when no editor buffer owns
@@ -315,6 +331,7 @@ func (i *Index) removeLocked(uri protocol.URI) {
 	i.invalidateCompilerDiagnosticsLocked()
 	if old := i.files[uri]; old != nil {
 		i.removeFileContentsLocked(old)
+		i.forgetDeclarationsLocked(old.URI)
 	}
 	delete(i.files, uri)
 	delete(i.fileGeneration, uri)
@@ -326,7 +343,7 @@ func (i *Index) removeLocked(uri protocol.URI) {
 	}
 	delete(i.indexedDocs, uri)
 	delete(i.libraryDocs, uri)
-	delete(i.librarySources, uri)
+	i.forgetLibrarySourceLocked(uri)
 }
 
 func (i *Index) dropCompilerDiagnosticsLocked(uri protocol.URI) {
@@ -350,12 +367,14 @@ func (i *Index) invalidateCompilerDiagnosticsLocked() {
 }
 
 func (i *Index) Save(ctx context.Context, uri protocol.URI) {
+	guard := i.lockGuard()
+	defer guard.release()
 	if i.closed.Load() {
 		return
 	}
-	i.mu.RLock()
+	guard.RLock()
 	_, open := i.docs[uri]
-	i.mu.RUnlock()
+	guard.RUnlock()
 	if !open {
 		return
 	}
@@ -373,40 +392,50 @@ func (i *Index) Document(uri protocol.URI) (*textdoc.Document, bool) {
 }
 
 func (i *Index) DocumentContext(ctx context.Context, uri protocol.URI) (*textdoc.Document, bool) {
+	guard := i.lockGuard()
+	defer guard.release()
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if ctx.Err() != nil {
 		return nil, false
 	}
-	i.mu.RLock()
+	guard.RLock()
 	if d := i.docs[uri]; d != nil {
 		clone := d.Clone()
-		i.mu.RUnlock()
+		guard.RUnlock()
 		return clone, true
 	}
 	if d := i.libraryDocs[uri]; d != nil {
 		clone := d.Clone()
-		i.mu.RUnlock()
+		i.noteLibraryCacheUse(uri)
+		guard.RUnlock()
 		return clone, true
 	}
 	if d := i.indexedDocs[uri]; d != nil {
 		clone := d.Clone()
-		i.mu.RUnlock()
+		guard.RUnlock()
 		return clone, true
 	}
 	source, library := i.librarySources[uri]
-	i.mu.RUnlock()
+	guard.RUnlock()
 	if library {
 		document, err := loadLibraryDocumentContext(ctx, uri, source)
 		if err == nil {
-			i.mu.Lock()
-			if current, exists := i.librarySources[uri]; exists && current == source {
-				i.libraryDocs[uri] = document
+			// Filling this cache must never make a foreground request wait. The
+			// document is already in hand, so the exclusive lock buys nothing
+			// but the memo; while a library-indexing or compiler publication
+			// transaction held it, that wait reached 929ms for a read that
+			// itself costs 323µs. Take the lock only when it is free. A later
+			// call populates the cache instead, and no result ever depended on
+			// the write succeeding.
+			if i.mu.TryLock() {
+				if current, exists := i.librarySources[uri]; exists && current == source {
+					i.libraryDocs[uri] = document
+				}
+				guard.Unlock()
 			}
-			clone := document.Clone()
-			i.mu.Unlock()
-			return clone, true
+			return document.Clone(), true
 		}
 	}
 	return nil, false
@@ -486,4 +515,22 @@ func (i *Index) documentTextLocked(uri protocol.URI) string {
 		return document.Text
 	}
 	return ""
+}
+
+// SelectionSpans returns, for each offset, the nested byte spans of the syntax
+// around it, innermost first; ok is false when the document has no syntax tree.
+func (i *Index) SelectionSpans(uri protocol.URI, offsets []int) (spans [][][2]int, ok bool) {
+	guard := i.lockGuard()
+	defer guard.release()
+	guard.RLock()
+	state := i.syntaxStates[uri]
+	guard.RUnlock()
+	if state == nil {
+		return nil, false
+	}
+	spans = make([][][2]int, len(offsets))
+	for index, offset := range offsets {
+		spans[index] = state.SelectionSpans(offset)
+	}
+	return spans, true
 }

@@ -106,10 +106,6 @@ func annotatedBinarySignature(symbol analysis.Symbol) string {
 	return signature.String()
 }
 
-func hasNullableTypeAnnotation(annotations []classfile.TypeAnnotation, target byte, parameter int) bool {
-	return len(nullableTypeAnnotations(annotations, target, parameter)) > 0
-}
-
 func nullableTypeAnnotations(annotations []classfile.TypeAnnotation, target byte, parameter int) []classfile.TypeAnnotation {
 	var result []classfile.TypeAnnotation
 	for _, annotation := range annotations {

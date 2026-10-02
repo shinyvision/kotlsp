@@ -23,10 +23,6 @@ var librarySourceBaseMarker = []byte(index.LibrarySourceBaseMarker)
 // negotiated protocol.
 var uriFields = map[string]bool{"uri": true, "targetUri": true, "oldUri": true, "newUri": true}
 
-func (s *Server) externalURI(uri protocol.URI) protocol.URI {
-	return s.externalURIContext(context.Background(), uri)
-}
-
 func (s *Server) externalURIContext(ctx context.Context, uri protocol.URI) protocol.URI {
 	if mirrored, ok := s.index.LibraryFileURIContext(ctx, uri); ok {
 		return mirrored
@@ -34,17 +30,9 @@ func (s *Server) externalURIContext(ctx context.Context, uri protocol.URI) proto
 	return uri
 }
 
-func (s *Server) externalLocation(location protocol.Location) protocol.Location {
-	return s.externalLocationContext(context.Background(), location)
-}
-
 func (s *Server) externalLocationContext(ctx context.Context, location protocol.Location) protocol.Location {
 	location.URI = s.externalURIContext(ctx, location.URI)
 	return location
-}
-
-func (s *Server) externalLocations(locations []protocol.Location) []protocol.Location {
-	return s.externalLocationsContext(context.Background(), locations)
 }
 
 func (s *Server) externalLocationsContext(ctx context.Context, locations []protocol.Location) []protocol.Location {

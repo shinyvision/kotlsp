@@ -9,8 +9,14 @@ import (
 )
 
 const (
-	ProcessTreeSoftLimitBytes int64 = 3 << 30
-	GoSoftLimitBytes          int64 = 2 << 30
+	// The envelope bounds the whole process tree, and effectiveGoLimitLocked
+	// takes the lower of it and the Go limit: raising one without the other
+	// changes nothing. A 2GiB Go limit put an ordinary Spring workspace
+	// (57840 library symbols) at 77% of its ceiling with the heap in steady
+	// state, so the collector ran hard for the whole session to hold a line
+	// that was never the real constraint on a 64GiB machine.
+	ProcessTreeSoftLimitBytes int64 = 18 << 30
+	GoSoftLimitBytes          int64 = 16 << 30
 	GoMinimumLimitBytes       int64 = 768 << 20
 	// Leave native/metaspace/thread-stack headroom beyond child -Xmx values.
 	// Admitting a full two GiB of Java heaps inside a three-GiB process-tree
@@ -117,6 +123,15 @@ func Current() Snapshot {
 	}
 	sort.Slice(snapshot.Components, func(left, right int) bool { return snapshot.Components[left].Name < snapshot.Components[right].Name })
 	return snapshot
+}
+
+// ApplyGoMemoryLimit installs the runtime limit for the current reservations.
+// Startup calls it before anything is reserved; the coordinator calls it again
+// whenever a child JVM is admitted or released.
+func ApplyGoMemoryLimit() {
+	memory.Lock()
+	defer memory.Unlock()
+	applyGoLimitLocked()
 }
 
 func effectiveGoLimitLocked() int64 {

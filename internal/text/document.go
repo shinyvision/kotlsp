@@ -16,6 +16,11 @@ type Document struct {
 	lines      []int
 	sparse     bool
 	lineCount  int
+	// plain is true when the text holds only single-byte characters and no
+	// carriage returns, so a position's column is its byte distance from the
+	// line start. Position/offset conversion runs millions of times while
+	// resolving a project, and walking each line rune by rune dominated it.
+	plain bool
 }
 
 const (
@@ -35,13 +40,14 @@ type TextEdit struct {
 func NewDocument(uri protocol.URI, languageID string, version int, content string) *Document {
 	d := &Document{URI: uri, LanguageID: languageID, Version: version, Text: content}
 	d.reindexLines()
+	d.plain = isPlainText(content)
 	return d
 }
 
 func (d *Document) Clone() *Document {
 	lines := make([]int, len(d.lines))
 	copy(lines, d.lines)
-	return &Document{URI: d.URI, LanguageID: d.LanguageID, Version: d.Version, Text: d.Text, lines: lines, sparse: d.sparse, lineCount: d.lineCount}
+	return &Document{URI: d.URI, LanguageID: d.LanguageID, Version: d.Version, Text: d.Text, lines: lines, sparse: d.sparse, lineCount: d.lineCount, plain: d.plain}
 }
 
 func (d *Document) LineCount() int { return d.lineCount }
@@ -54,6 +60,9 @@ func (d *Document) Position(offset int) protocol.Position {
 		offset = len(d.Text)
 	}
 	line, start := d.byteLineAtString(offset)
+	if d.plain {
+		return protocol.Position{Line: line, Character: offset - start}
+	}
 	return protocol.Position{Line: line, Character: utf16Len(d.Text[start:offset])}
 }
 
@@ -68,6 +77,12 @@ func (d *Document) Offset(pos protocol.Position) int {
 	target := pos.Character
 	if target <= 0 {
 		return start
+	}
+	if d.plain {
+		if start+target > end {
+			return end
+		}
+		return start + target
 	}
 	units := 0
 	for i := start; i < end; {
@@ -225,6 +240,7 @@ func (d *Document) ApplyWithEdits(version int, changes []protocol.TextDocumentCo
 		}
 	}
 	updated.Text = string(content)
+	updated.plain = isPlainText(updated.Text)
 	updated.Version = version
 	*d = *updated
 	return edits, nil
@@ -452,4 +468,15 @@ func utf16Len(s string) int {
 		}
 	}
 	return n
+}
+
+// isPlainText reports whether every byte is ASCII and none is a carriage
+// return.
+func isPlainText(text string) bool {
+	for index := 0; index < len(text); index++ {
+		if text[index] >= 0x80 || text[index] == '\r' {
+			return false
+		}
+	}
+	return true
 }

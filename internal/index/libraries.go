@@ -15,6 +15,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -51,8 +53,34 @@ gradle.projectsEvaluated {
 					println(marker + projectPath + "\t" + owner + "\t" + target + "\t" + (rule.group ?: "*") + "\t" + (rule.module ?: "*"))
 				}
 			}
+			// Build scripts compile against the Gradle API, the Kotlin DSL, the
+			// plugins the build applies and the accessors Gradle generates for
+			// each project -- none of it any source set's classpath.
+			def kotlspScriptJars = []
+			try {
+				println("KOTLSP_GRADLE_HOME=" + gradle.gradleHomeDir.absolutePath + "\t" + gradle.gradleVersion + "\t" + gradle.gradleUserHomeDir.absolutePath)
+				def kotlspGradleLib = new File(gradle.gradleHomeDir, "lib")
+				def kotlspGeneratedApi = new File(gradle.gradleUserHomeDir, "caches/" + gradle.gradleVersion + "/generated-gradle-jars/gradle-api-" + gradle.gradleVersion + ".jar")
+				if (kotlspGeneratedApi.isFile()) {
+					kotlspScriptJars << kotlspGeneratedApi
+				} else {
+					(kotlspGradleLib.listFiles() ?: []).findAll { it.name.startsWith("gradle-") && it.name.contains("-api-") && it.name.endsWith(".jar") }.each { kotlspScriptJars << it }
+				}
+				(kotlspGradleLib.listFiles() ?: []).findAll { it.name.startsWith("gradle-kotlin-dsl") && it.name.endsWith(".jar") && !it.name.contains("tooling") }.each { kotlspScriptJars << it }
+				def kotlspAccessors = new File(gradle.gradleUserHomeDir, "caches/" + gradle.gradleVersion + "/kotlin-dsl/accessors")
+				(kotlspAccessors.listFiles() ?: []).each { directory ->
+					def classes = new File(directory, "classes")
+					if (classes.isDirectory()) println("KOTLSP_SCRIPT_ACCESSORS=" + classes.absolutePath)
+				}
+			} catch (Throwable ignored) {}
             rootProject.allprojects.each { project ->
 				println("KOTLSP_MODULE=" + project.path + "\t" + project.projectDir.absolutePath)
+				try {
+					def scriptUrls = null
+					try { scriptUrls = project.buildscript.classLoader.getURLs() } catch (Throwable ignored) {}
+					(scriptUrls ?: []).each { url -> if (url.protocol == "file") println("KOTLSP_SCRIPT_CLASSPATH=" + project.path + "\t" + new File(url.toURI()).absolutePath) }
+					kotlspScriptJars.each { println("KOTLSP_SCRIPT_CLASSPATH=" + project.path + "\t" + it.absolutePath) }
+				} catch (Throwable ignored) {}
 				println("KOTLSP_MODULE_COORDINATE=" + project.path + "\t" + (project.group ?: "") + "\t" + project.name + "\t" + (project.version ?: ""))
                 project.configurations.findAll {
 					it.canBeResolved && (it.name.endsWith("CompileClasspath") || it.name == "compileClasspath")
@@ -70,6 +98,23 @@ gradle.projectsEvaluated {
 							println("KOTLSP_DEPENDENCY=" + project.path + "\t" + configuration.name + "\t" + dependency.dependencyProject.path)
 						}
 						kotlspEmitExclusions("KOTLSP_DEPENDENCY_EXCLUSION=", project.path, configuration.name, dependency)
+					}
+				}
+				// A JVM source set sees another through that one's output on its
+				// compile classpath -- test sees main -- not through Kotlin's
+				// dependsOn, which only multiplatform source sets declare.
+				def jvmSourceSets = project.extensions.findByName("sourceSets")
+				if (jvmSourceSets != null) {
+					jvmSourceSets.each { consumer ->
+						try {
+							def visible = consumer.compileClasspath.files
+							jvmSourceSets.each { producer ->
+								if (producer.name != consumer.name && producer.output.classesDirs.files.any { visible.contains(it) }) {
+									println("KOTLSP_SOURCESET_DEPENDENCY=" + project.path + "\t" + consumer.name + "\t" + producer.name)
+								}
+							}
+						} catch (Throwable ignored) {
+						}
 					}
 				}
 				def kotlinExtension = project.extensions.findByName("kotlin")
@@ -158,7 +203,7 @@ gradle.projectsEvaluated {
 				project.tasks.each { task ->
 					if (!task.class.name.toLowerCase().contains("kotlin") || !task.name.toLowerCase().contains("compile")) return
 					try {
-						def sourceSet = task.hasProperty("sourceSetName") ? task.sourceSetName.toString() : task.name.replaceFirst(/^compile/, "").replaceFirst(/Kotlin.*$/, "")
+						def sourceSet = task.hasProperty("sourceSetName") ? ((((task.sourceSetName instanceof org.gradle.api.provider.Provider) ? task.sourceSetName.getOrNull() : task.sourceSetName)?.toString()) ?: task.name.replaceFirst(/^compile/, "").replaceFirst(/Kotlin.*$/, "")) : task.name.replaceFirst(/^compile/, "").replaceFirst(/Kotlin.*$/, "")
 						if (sourceSet == "") sourceSet = "main"
 						sourceSet = sourceSet.substring(0, 1).toLowerCase() + sourceSet.substring(1)
 						def options = task.hasProperty("compilerOptions") ? task.compilerOptions : null
@@ -173,25 +218,84 @@ gradle.projectsEvaluated {
 							kotlspEmitSetting(project.path, sourceSet, "kotlin.jvmTarget", task.kotlinOptions.jvmTarget)
 							task.kotlinOptions.freeCompilerArgs.each { argument -> kotlspEmitSetting(project.path, sourceSet, "kotlin.arg", argument) }
 						}
+						def kotlinVersionEmitted = false
 						if (task.hasProperty("compilerClasspath")) {
 							task.compilerClasspath.files.each { compilerFile ->
 								def match = (compilerFile.name =~ /kotlin-compiler(?:-embeddable)?-(.+)\.jar/)
-								if (match.matches()) kotlspEmitSetting(project.path, sourceSet, "kotlin.version", match.group(1))
+								if (match.matches()) {
+									kotlspEmitSetting(project.path, sourceSet, "kotlin.version", match.group(1))
+									kotlinVersionEmitted = true
+								}
 							}
 						}
+						if (!kotlinVersionEmitted) {
+							// Kotlin Gradle plugin 2.x runs the compiler through the build
+							// tools API and exposes no compiler classpath; the version the
+							// build compiles with is the plugin's own.
+							def kotlinPlugin = project.plugins.find { plugin -> plugin.class.name.startsWith("org.jetbrains.kotlin.gradle.plugin.") && plugin.hasProperty("pluginVersion") }
+							if (kotlinPlugin != null) kotlspEmitSetting(project.path, sourceSet, "kotlin.version", kotlinPlugin.pluginVersion)
+						}
 						if (task.hasProperty("pluginClasspath") && task.pluginClasspath != null) {
+							// Every jar, as Gradle passes them: a plugin jar needs the
+							// libraries beside it on the same plugin classpath.
 							task.pluginClasspath.files.each { pluginFile -> kotlspEmitSetting(project.path, sourceSet, "kotlin.arg", "-Xplugin=" + pluginFile.absolutePath) }
 						}
 					} catch (Throwable limitation) {
 						println("KOTLSP_MODEL_LIMITATION=" + project.path + "\tKotlin compiler settings unavailable for " + task.name + ": " + limitation.class.simpleName)
 					}
 				}
+				// A task name is not evidence: "ksp" occurs inside ordinary names.
+				// KAPT and KSP are plugins, and their tasks have their own types.
+				def generatedCompilerPlugins = ["org.jetbrains.kotlin.kapt", "kotlin-kapt", "com.google.devtools.ksp"].findAll { id -> project.plugins.hasPlugin(id) }
 				def generatedCompilerTasks = project.tasks.findAll { task ->
-					def lowerName = task.name.toLowerCase()
-					lowerName.contains("kapt") || lowerName.contains("ksp")
+					def type = task.class.name
+					type.contains(".kapt.") || type.contains("KaptTask") || type.contains("KaptGenerateStubs") || type.contains("com.google.devtools.ksp")
 				}
-				if (!generatedCompilerTasks.empty) {
+				if (!generatedCompilerPlugins.empty || !generatedCompilerTasks.empty) {
 					println("KOTLSP_MODEL_LIMITATION=" + project.path + "\tKAPT/KSP generated-source execution is not reproduced by diagnostics; generated roots are indexed when the build exposes them")
+				}
+				// The build's own formatter: Spotless running ktlint. kotlsp formats
+				// through the same adapter with the same version, classpath and
+				// overrides, so its output is exactly what spotlessCheck accepts.
+				try {
+					def spotless = project.extensions.findByName("spotless")
+					if (spotless != null) {
+						def formatsField = null
+						for (def type = spotless.class; type != null && formatsField == null; type = type.superclass) { formatsField = type.declaredFields.find { it.name == "formats" } }
+						if (formatsField != null) {
+							formatsField.accessible = true
+							formatsField.get(spotless).each { formatName, format ->
+								// Steps are added when the format's task is configured.
+								project.tasks.findByName("spotless" + formatName.capitalize())
+								def stepsField = null
+								for (def type = format.class; type != null && stepsField == null; type = type.superclass) { stepsField = type.declaredFields.find { it.name == "steps" } }
+								if (stepsField == null) return
+								stepsField.accessible = true
+								stepsField.get(format).findAll { it.name == "ktlint" }.each { step ->
+									def initializer = step.class.declaredFields.find { it.name == "initializer" }
+									if (initializer == null) return
+									initializer.accessible = true
+									def state = initializer.get(step).get()
+									def field = { owner, name -> def found = owner.class.declaredFields.find { it.name == name }; if (found == null) return null; found.accessible = true; found.get(owner) }
+									def version = field(state, "version")
+									def overrides = field(state, "editorConfigOverride") ?: [:]
+									def config = field(state, "config")
+									def editorConfig = ""
+									if (config != null) {
+										def files = config.hasProperty("files") ? config.files() : null
+										if (files != null && !files.empty) editorConfig = files[0].absolutePath
+									}
+									def jar = field(state, "jarState").get()
+									def classpath = field(jar, "fileSignature").files().collect { it.absolutePath }
+									def adapterJar = state.class.protectionDomain.codeSource.location.toURI().path
+									def encode = { value -> value.toString().getBytes("UTF-8").encodeBase64().toString() }
+									println("KOTLSP_FORMATTER=" + project.path + "\t" + formatName + "\tktlint\t" + version + "\t" + encode(editorConfig) + "\t" + encode(overrides.collect { key, value -> key + "=" + value }.join("\n")) + "\t" + encode((classpath + [adapterJar]).join("\n")))
+								}
+							}
+						}
+					}
+				} catch (Throwable limitation) {
+					println("KOTLSP_FORMATTER_UNAVAILABLE=" + project.path + "\t" + limitation.class.simpleName + ": " + limitation.message)
 				}
 				def androidExtension = project.extensions.findByName("android")
 				if (androidExtension != null && androidExtension.hasProperty("sourceSets")) {
@@ -238,11 +342,22 @@ func filterArchives(archives []sourceArchive) []sourceArchive {
 // cold start: KOTLSP_SCAN_TIMING=1.
 var scanTiming = os.Getenv("KOTLSP_SCAN_TIMING") != ""
 
-// scanDeclarationsCompleteHook lets a test hold the scan immediately after the
-// complete declaration/source barrier becomes ready.
-var scanDeclarationsCompleteHook func()
+// cachedPhaseWorkers decode cached archives at once. Each holds one staged
+// archive while it waits to commit, so more workers trade startup time for
+// peak memory.
+var cachedPhaseWorkers = func() int {
+	if value, err := strconv.Atoi(os.Getenv("KOTLSP_CACHED_WORKERS")); err == nil && value >= 1 && value <= 16 {
+		return value
+	}
+	// Measured on a 300-archive Spring/jOOQ classpath: one worker ready in
+	// 16 s, two in 12.6 s, four in 10.4 s, with peaks of 2.72, 2.78 and
+	// 2.85 GiB -- all below the single-worker decode-twice loader's 2.96.
+	return 4
+}()
 
 func (i *Index) scanLibraries(ctx context.Context, roots []string, generation uint64, declarationsComplete func(), prepared ...map[string]classpathResolution) {
+	guard := i.lockGuard()
+	defer guard.release()
 	// Not complete until this pass finishes; a rescan starts incomplete again.
 	i.setLibrariesScanned(false)
 	if skipLibraryScan {
@@ -310,6 +425,13 @@ func (i *Index) scanLibraries(ctx context.Context, roots []string, generation ui
 			if statErr != nil || info.IsDir() || !strings.HasSuffix(lowerBinary, ".jar") {
 				continue
 			}
+			// A sibling module's own build output sits on this module's
+			// classpath. Its sources are already indexed, so indexing the jar
+			// as well declares every type twice -- and a name with two
+			// declarations resolves to neither.
+			if workspaceBuildOutputJar(binary, cleanRoot) {
+				continue
+			}
 			// Source attachments provide navigation text, but the compiled archive
 			// remains the authoritative API. Annotation processors, Lombok, and
 			// compiler-generated members commonly exist only in bytecode.
@@ -338,7 +460,19 @@ func (i *Index) scanLibraries(ctx context.Context, roots []string, generation ui
 		libraryScanComplete = false
 		i.recordHealth("library", "Kotlin standard library", "no bounded Kotlin standard-library inventory was available; unresolved fast diagnostics will abstain")
 	}
+	// The default libraries are a fallback for a directory with no build model.
+	// When the project's own classpath already carries the artifact -- at
+	// whatever version -- adding the compiler's or the cache's copy as well
+	// declares every function of it twice, and a call then has two equally good
+	// candidates.
+	classpathArtifacts := make(map[string]bool, len(classpath))
+	for _, entry := range classpath {
+		classpathArtifacts[libraryArtifactName(entry)] = true
+	}
 	for _, binary := range defaultKotlin {
+		if classpathArtifacts[libraryArtifactName(binary)] {
+			continue
+		}
 		if !classpathSeen[binary] {
 			classpathSeen[binary] = true
 			classpath = append(classpath, binary)
@@ -360,6 +494,16 @@ func (i *Index) scanLibraries(ctx context.Context, roots []string, generation ui
 				seen[source] = true
 				sourceArchives = append(sourceArchives, sourceArchive{path: source})
 			}
+		}
+	}
+	// Without the stdlib sources jar nothing declares Kotlin's built-in types,
+	// so supply the copy that ships with the server.
+	if !hasKotlinStdlibSources(sourceArchives) {
+		if builtins, err := builtinSourcesArchive(); err != nil {
+			i.recordHealth("library", "Kotlin builtins", "embedded builtin declarations could not be prepared: "+err.Error())
+		} else if !seen[builtins] {
+			seen[builtins] = true
+			sourceArchives = append(sourceArchives, sourceArchive{path: builtins})
 		}
 	}
 	wantedImports := i.workspaceLibraryImports(ctx)
@@ -467,13 +611,13 @@ func (i *Index) scanLibraries(ctx context.Context, roots []string, generation ui
 	archives = append(archives, jdkAdditional...)
 	archives = append(archives, deferredSources...)
 	sort.Strings(classpath)
-	i.mu.Lock()
+	guard.Lock()
 	if i.generation.Load() != generation {
-		i.mu.Unlock()
+		guard.Unlock()
 		return
 	}
 	i.classpath = classpath
-	i.mu.Unlock()
+	guard.Unlock()
 	var total int64
 	for _, archive := range archives {
 		if archive.manifestOK {
@@ -503,9 +647,9 @@ func (i *Index) scanLibraries(ctx context.Context, roots []string, generation ui
 	p := i.Progress()
 	p.LibrariesTotal = total
 	i.progress.Store(&p)
-	i.mu.Lock()
+	guard.Lock()
 	i.reserveLibraryCapacityLocked(total)
-	i.mu.Unlock()
+	guard.Unlock()
 	// An archive is staged completely before publication. The commit itself is
 	// serialized, so concurrent decoders do not increase commit throughput: they
 	// merely retain several complete archive transactions while waiting for
@@ -520,6 +664,13 @@ func (i *Index) scanLibraries(ctx context.Context, roots []string, generation ui
 	scanStart := time.Now()
 	indexPhase := func(phase []sourceArchive, countProgress bool) bool {
 		workers := parseWorkers
+		// A cached archive's transaction is a decode of its snapshot, small
+		// beside a parse, so a cached phase decodes several at once; their
+		// commits still go one at a time. On one worker a warm start spent
+		// 18 s here, a few milliseconds of real work per archive at a time.
+		if archivesAreCached(ctx, phase) {
+			workers = min(cachedPhaseWorkers, max(1, runtime.GOMAXPROCS(0)/2))
+		}
 		if scanTiming {
 			defer func(started time.Time, count int, workers int) {
 				fmt.Fprintf(os.Stderr, "kotlsp scan: %d archives on %d workers in %s (t+%s)\n", count, workers, time.Since(started).Round(time.Millisecond), time.Since(scanStart).Round(time.Millisecond))
@@ -531,6 +682,7 @@ func (i *Index) scanLibraries(ctx context.Context, roots []string, generation ui
 		for worker := 0; worker < workers; worker++ {
 			wg.Add(1)
 			go func() {
+				defer i.recoverBackground("scanLibraries")
 				defer wg.Done()
 				for archive := range jobs {
 					select {
@@ -626,18 +778,17 @@ func (i *Index) scanLibraries(ctx context.Context, roots []string, generation ui
 	if declarationsComplete != nil {
 		declarationsComplete()
 	}
-	if scanDeclarationsCompleteHook != nil {
-		scanDeclarationsCompleteHook()
-	}
 }
 
 func (i *Index) openDocumentLibraryImports(ctx context.Context) []string {
+	guard := i.lockGuard()
+	defer guard.release()
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	const maxOpenDocuments = 4096
 	const maxOpenImports = 100_000
-	i.mu.RLock()
+	guard.RLock()
 	seen := make(map[string]bool)
 	documents := 0
 	for uri := range i.docs {
@@ -664,7 +815,7 @@ func (i *Index) openDocumentLibraryImports(ctx context.Context) []string {
 			seen["java.lang.Object"] = true
 		}
 	}
-	i.mu.RUnlock()
+	guard.RUnlock()
 	if documents >= maxOpenDocuments || len(seen) >= maxOpenImports {
 		i.recordHealth("library-priority", "open documents", "open-document import inventory exceeded its 4096-document/100000-import safety limit")
 	}
@@ -807,6 +958,14 @@ func kotlinBuiltinSourceEntry(name string) bool {
 		if rest == "kotlin/internal/AnnotationsBuiltin.kt" || rest == "kotlin/util/Standard.kt" {
 			return true
 		}
+		// kotlin.jvm is a default import, so `javaClass` and its neighbours are
+		// spelled bare in ordinary Kotlin and have no class file of their own:
+		// they are extensions on a facade. Leaving this one file out of the
+		// selection made every `javaClass` an undefined name on code that
+		// compiles.
+		if rest == "kotlin/jvm/JvmClassMapping.kt" {
+			return true
+		}
 	}
 	return false
 }
@@ -943,7 +1102,45 @@ func libraryEntryImportScore(entries, imports []string) int {
 }
 
 // archivesAreCached reports whether every archive of a phase has a snapshot,
-// in which case the phase does no parsing and may use many workers.
+// in which case the phase only decodes and may use several workers.
+func archivesAreCached(ctx context.Context, phase []sourceArchive) bool {
+	for _, archive := range phase {
+		path, ok := archiveCachePathContext(ctx, archive)
+		if !ok {
+			return false
+		}
+		if _, err := os.Stat(path); err != nil {
+			return false
+		}
+	}
+	return len(phase) > 0
+}
+
+var kotlinHomeAssignment = regexp.MustCompile(`(?m)^\s*KOTLIN_HOME=["']?(/[^"'\s$]+)["']?\s*$`)
+
+// kotlinHomes lists where a kotlinc launcher's distribution may live: around
+// the resolved executable (an unpacked zip, Homebrew, SDKMAN), $KOTLIN_HOME,
+// and the home a wrapper script names. Arch installs /usr/bin/kotlinc as a
+// script that sets KOTLIN_HOME=/usr/share/kotlin, so the directory around
+// the executable is /usr and holds no Kotlin libraries at all.
+func kotlinHomes(executable string) []string {
+	var homes []string
+	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
+		homes = append(homes, filepath.Dir(filepath.Dir(resolved)))
+		if info, err := os.Stat(resolved); err == nil && info.Size() < 64<<10 {
+			if script, err := os.ReadFile(resolved); err == nil {
+				for _, match := range kotlinHomeAssignment.FindAllStringSubmatch(string(script), -1) {
+					homes = append(homes, filepath.Clean(match[1]))
+				}
+			}
+		}
+	}
+	if home := os.Getenv("KOTLIN_HOME"); home != "" {
+		homes = append(homes, filepath.Clean(home))
+	}
+	return uniqueSortedStrings(homes)
+}
+
 func defaultKotlinLibraries(ctx context.Context) []string {
 	seen := make(map[string]bool)
 	var libraries []string
@@ -960,10 +1157,9 @@ func defaultKotlinLibraries(ctx context.Context) []string {
 	if compiler, ok := findKotlinCompilerContext(ctx); ok {
 		add(compiler.stdlib)
 		if compiler.executable != "" && !compiler.embedded {
-			if resolved, err := filepath.EvalSymlinks(compiler.executable); err == nil {
-				lib := filepath.Join(filepath.Dir(filepath.Dir(resolved)), "lib")
+			for _, home := range kotlinHomes(compiler.executable) {
 				for _, name := range []string{"kotlin-stdlib.jar", "kotlin-stdlib-jdk7.jar", "kotlin-stdlib-jdk8.jar", "kotlin-script-runtime.jar"} {
-					add(filepath.Join(lib, name))
+					add(filepath.Join(home, "lib", name))
 				}
 			}
 		}
@@ -982,7 +1178,7 @@ func defaultKotlinLibraries(ctx context.Context) []string {
 	return libraries
 }
 
-const libraryCacheVersion = 34
+const libraryCacheVersion = 50
 
 const maxLibraryCacheRecordBytes = 64 << 20
 
@@ -1029,6 +1225,8 @@ func libraryFileStagingWeight(file LibraryFile) int64 {
 }
 
 func (i *Index) indexSourceArchive(ctx context.Context, archive sourceArchive, generation uint64, progress func(int64), accessSnapshots ...map[string]bool) bool {
+	guard := i.lockGuard()
+	defer guard.release()
 	// Content identity is needed by the cache and source mirror, but computing
 	// it for the entire classpath before publishing the first archive creates a
 	// long artificial period in which LibrariesParsed remains zero. Hash each
@@ -1036,9 +1234,9 @@ func (i *Index) indexSourceArchive(ctx context.Context, archive sourceArchive, g
 	if !archive.digestOK {
 		if digest, err := digestArchiveContext(ctx, archive.path); err == nil {
 			archive.digest, archive.digestOK = digest, true
-			i.mu.Lock()
+			guard.Lock()
 			i.storeArchiveDigestLocked(archive.path, digest)
-			i.mu.Unlock()
+			guard.Unlock()
 		} else if ctx.Err() != nil {
 			return false
 		} else {
@@ -1102,6 +1300,9 @@ func (i *Index) indexSourceArchive(ctx context.Context, archive sourceArchive, g
 		progress(int64(len(staged)))
 		return true
 	}
+	// A cache that failed part-way may have staged some of its records; the
+	// archive is indexed from scratch below, so those must not stay staged.
+	staged, stagedSymbols, stagedWeight, stagingComplete = staged[:0], 0, 0, true
 	reader, err := zip.OpenReader(archive.path)
 	if err != nil {
 		i.recordHealth("library", archive.path, err.Error())
@@ -1261,14 +1462,16 @@ func (i *Index) indexSourceArchive(ctx context.Context, archive sourceArchive, g
 }
 
 func (i *Index) retainLibraryArchiveGeneration(path string, generation uint64) {
+	guard := i.lockGuard()
+	defer guard.release()
 	path = filepath.Clean(path)
-	i.mu.Lock()
+	guard.Lock()
 	for uri, source := range i.librarySources {
 		if filepath.Clean(source.Archive) == path {
 			i.fileGeneration[uri] = generation
 		}
 	}
-	i.mu.Unlock()
+	guard.Unlock()
 }
 
 func parsedBinaryClassfile(document *textdoc.Document, class *classfile.Class) *analysis.ParsedFile {
@@ -1603,6 +1806,8 @@ func archiveCachePathContext(ctx context.Context, archive sourceArchive) (string
 }
 
 func (i *Index) populateArchiveMetadata(ctx context.Context, archives []sourceArchive, generations ...uint64) {
+	guard := i.lockGuard()
+	defer guard.release()
 	current := func() bool {
 		return len(generations) == 0 || i.generation.Load() == generations[0]
 	}
@@ -1638,9 +1843,9 @@ func (i *Index) populateArchiveMetadata(ctx context.Context, archives []sourceAr
 				i.recordHealth("library", archives[index].path, moduleErr.Error())
 			}
 			if ok {
-				i.mu.Lock()
+				guard.Lock()
 				if !current() {
-					i.mu.Unlock()
+					guard.Unlock()
 					_ = reader.Close()
 					return
 				}
@@ -1652,7 +1857,7 @@ func (i *Index) populateArchiveMetadata(ctx context.Context, archives []sourceAr
 						i.libraryModules[source] = module
 					}
 				}
-				i.mu.Unlock()
+				guard.Unlock()
 			}
 		}
 		_ = reader.Close()
@@ -1901,18 +2106,11 @@ func loadArchiveCache(ctx context.Context, archive sourceArchive, consume func(c
 			allowed[name] = true
 		}
 	}
-	// First pass validates the complete stream and every cache-owned identity.
-	// No index mutation occurs until EOF has proved the snapshot complete.
-	count, valid := validateArchiveCacheStream(ctx, file, archive, allowed)
-	if ctx.Err() != nil {
-		return true
-	}
-	if !valid {
-		return false
-	}
-	if _, err = file.Seek(0, io.SeekStart); err != nil {
-		return false
-	}
+	// One pass: every record is validated as it is decoded and handed to
+	// consume, which only stages it. Nothing reaches the index unless this
+	// returns true, so EOF still has to prove the snapshot complete before
+	// any of it is used -- the earlier separate validation pass decoded every
+	// cache twice, a third of the time a warm start took.
 	reader, closeReader, err := newArchiveCacheReader(file)
 	if err != nil {
 		return false
@@ -1926,24 +2124,66 @@ func loadArchiveCache(ctx context.Context, archive sourceArchive, consume func(c
 	if json.Unmarshal(headerRecord, &header) != nil || !validCachedArchiveHeader(header, archive, len(allowed)) {
 		return false
 	}
-	for index := 0; index < count; index++ {
+	expanded := uint64(len(headerRecord) + 1)
+	seen := make(map[string]bool, min(header.Entries, archiveio.MaxArchiveEntries))
+	// Records are read in order and decoded in batches across cores: JSON
+	// decoding was most of a warm start, on one core. Validation and staging
+	// stay in record order.
+	const batchSize = 256
+	decoders := min(runtime.GOMAXPROCS(0), 8)
+	records := make([][]byte, 0, batchSize)
+	entries := make([]cachedSourceFile, batchSize)
+	failed := make([]bool, batchSize)
+	count := 0
+	for {
 		if ctx.Err() != nil {
+			// The caller sees the cancellation and abandons what was staged.
 			return true
 		}
-		record, readErr := readArchiveCacheRecord(reader)
-		if readErr != nil {
-			return false
+		records = records[:0]
+		atEnd := false
+		for len(records) < batchSize {
+			record, readErr := readArchiveCacheRecord(reader)
+			if readErr == io.EOF {
+				atEnd = true
+				break
+			}
+			if readErr != nil || count+len(records) >= archiveio.MaxArchiveEntries || uint64(len(record)+1) > archiveio.MaxArchiveExpandedBytes-expanded {
+				return false
+			}
+			expanded += uint64(len(record) + 1)
+			records = append(records, record)
 		}
-		var entry cachedSourceFile
-		if json.Unmarshal(record, &entry) != nil || !validCachedSourceFile(entry, archive, allowed) {
-			return false
+		var wait sync.WaitGroup
+		for worker := 0; worker < decoders; worker++ {
+			wait.Add(1)
+			go func(worker int) {
+				defer wait.Done()
+				for index := worker; index < len(records); index += decoders {
+					entries[index] = cachedSourceFile{}
+					failed[index] = json.Unmarshal(records[index], &entries[index]) != nil
+				}
+			}(worker)
 		}
-		if !consume(entry) {
-			return true
+		wait.Wait()
+		for index := range records {
+			entry := entries[index]
+			entries[index] = cachedSourceFile{}
+			if failed[index] || !validCachedSourceFile(entry, archive, allowed) || seen[entry.Source.Entry] {
+				return false
+			}
+			seen[entry.Source.Entry] = true
+			count++
+			if !consume(entry) {
+				// Staging refused (its limit, a newer generation): the caller
+				// knows why and does not publish.
+				return true
+			}
+		}
+		if atEnd {
+			return count == header.Entries && (!archive.manifestOK || len(seen) == len(allowed))
 		}
 	}
-	_, err = readArchiveCacheRecord(reader)
-	return err == io.EOF
 }
 
 func newArchiveCacheReader(file io.Reader) (*bufio.Reader, func(), error) {
@@ -1979,45 +2219,6 @@ func readArchiveCacheRecord(reader *bufio.Reader) ([]byte, error) {
 	}
 }
 
-func validateArchiveCacheStream(ctx context.Context, file io.Reader, archive sourceArchive, allowed map[string]bool) (int, bool) {
-	reader, closeReader, err := newArchiveCacheReader(file)
-	if err != nil {
-		return 0, false
-	}
-	defer closeReader()
-	headerRecord, err := readArchiveCacheRecord(reader)
-	if err != nil {
-		return 0, false
-	}
-	var header cachedArchive
-	if json.Unmarshal(headerRecord, &header) != nil || !validCachedArchiveHeader(header, archive, len(allowed)) {
-		return 0, false
-	}
-	expanded := uint64(len(headerRecord) + 1)
-	seen := make(map[string]bool, min(header.Entries, archiveio.MaxArchiveEntries))
-	for count := 0; ; count++ {
-		if ctx.Err() != nil {
-			return count, true
-		}
-		record, readErr := readArchiveCacheRecord(reader)
-		if readErr == io.EOF {
-			return count, count == header.Entries && (!archive.manifestOK || len(seen) == len(allowed))
-		}
-		if readErr != nil || count >= archiveio.MaxArchiveEntries || uint64(len(record)+1) > archiveio.MaxArchiveExpandedBytes-expanded {
-			return count, false
-		}
-		expanded += uint64(len(record) + 1)
-		var entry cachedSourceFile
-		if json.Unmarshal(record, &entry) != nil || !validCachedSourceFile(entry, archive, allowed) {
-			return count, false
-		}
-		if seen[entry.Source.Entry] {
-			return count, false
-		}
-		seen[entry.Source.Entry] = true
-	}
-}
-
 func validCachedArchiveHeader(header cachedArchive, archive sourceArchive, allowed int) bool {
 	if header.Version != libraryCacheVersion || header.Entries < 0 || header.Entries > archiveio.MaxArchiveEntries {
 		return false
@@ -2029,7 +2230,7 @@ func validCachedArchiveHeader(header cachedArchive, archive sourceArchive, allow
 }
 
 func validCachedSourceFile(entry cachedSourceFile, archive sourceArchive, allowed map[string]bool) bool {
-	if filepath.Clean(entry.Source.Archive) != filepath.Clean(archive.path) || entry.Source.Binary != archive.binary || entry.Source.Entry == "" {
+	if entry.Source.Archive != archive.path && filepath.Clean(entry.Source.Archive) != filepath.Clean(archive.path) || entry.Source.Binary != archive.binary || entry.Source.Entry == "" {
 		return false
 	}
 	normalizedEntry := filepath.ToSlash(entry.Source.Entry)
@@ -2318,10 +2519,6 @@ func (e archiveEntry) URI() protocol.URI {
 	return protocol.URI("jar://" + filepath.ToSlash(e.archive.path) + "!/" + name)
 }
 
-func loadLibraryDocument(uri protocol.URI, source LibrarySource) (*textdoc.Document, error) {
-	return loadLibraryDocumentContext(context.Background(), uri, source)
-}
-
 func loadLibraryDocumentContext(ctx context.Context, uri protocol.URI, source LibrarySource) (*textdoc.Document, error) {
 	reader, err := zip.OpenReader(source.Archive)
 	if err != nil {
@@ -2350,4 +2547,41 @@ func loadLibraryDocumentContext(ctx context.Context, uri protocol.URI, source Li
 		return textdoc.NewDocument(uri, languageID, 0, content), nil
 	}
 	return nil, os.ErrNotExist
+}
+
+// workspaceBuildOutputJar reports whether the jar is the build output of a
+// module inside the workspace: a jar under the workspace root in a build-tool
+// output directory. Jars the project vendors (a lib/ directory) are not.
+func workspaceBuildOutputJar(jar, workspaceRoot string) bool {
+	if !pathWithin(jar, workspaceRoot) {
+		return false
+	}
+	slashed := filepath.ToSlash(jar)
+	return strings.Contains(slashed, "/build/libs/") || strings.Contains(slashed, "/build/distributions/") || strings.Contains(slashed, "/target/") && !strings.Contains(slashed, "/target/dependency/")
+}
+
+var libraryVersionSuffix = regexp.MustCompile(`^(.+?)-\d[\w.+\-]*$`)
+
+// libraryArtifactName is a jar's name without its version:
+// kotlin-stdlib-2.4.10.jar -> kotlin-stdlib, kotlin-stdlib-jdk8.jar -> kotlin-stdlib-jdk8.
+func libraryArtifactName(path string) string {
+	name := strings.TrimSuffix(filepath.Base(path), ".jar")
+	if match := libraryVersionSuffix.FindStringSubmatch(name); match != nil {
+		return match[1]
+	}
+	return name
+}
+
+// gradleDistributionArchive reports whether path is one of the Gradle
+// distribution's own jars that build scripts compile against: the generated
+// gradle-api jar or the Kotlin DSL.
+func gradleDistributionArchive(path string) bool {
+	base := filepath.Base(path)
+	return strings.HasSuffix(base, ".jar") && (strings.HasPrefix(base, "gradle-api-") || strings.HasPrefix(base, "gradle-kotlin-dsl") || strings.HasPrefix(base, "gradle-") && strings.Contains(base, "-api-") && strings.Contains(filepath.ToSlash(path), "/lib/"))
+}
+
+// gradlePublicEntry keeps Gradle's public API: `org/gradle/...` outside its
+// `internal` packages.
+func gradlePublicEntry(name string) bool {
+	return strings.HasPrefix(name, "org/gradle/") && !strings.Contains(name, "/internal/")
 }

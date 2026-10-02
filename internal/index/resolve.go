@@ -5,6 +5,7 @@ import (
 	"math/big"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"unicode"
 	"unicode/utf8"
 
@@ -16,8 +17,106 @@ import (
 
 const maxResolutionCandidates = 512
 
-func (i *Index) resolveLocked(file *analysis.ParsedFile, r analysis.Reference) []analysis.Symbol {
-	return i.resolveContextLocked(context.Background(), file, r)
+// maxResolutionNesting bounds how deeply resolution may re-enter itself through
+// expression inference: resolving a qualified name needs its receiver's type,
+// and typing a receiver call needs that callee resolved. Each step consumes
+// syntax, so real Kotlin/Java chains nest a handful of levels and a bound with
+// this much headroom cannot cost a real answer. An unbounded cycle costs the
+// whole process, because Go cannot recover from a stack overflow.
+const maxResolutionNesting = 48
+
+type resolutionDepthKey struct{}
+
+// resolutionNesting is what a resolution chain carries down through its
+// context: how deep it is, and a flag shared by the whole chain that records
+// whether any step was cut off by the bound. A cut-off step answers "unknown",
+// which is right for the request but must not be remembered as the answer.
+type resolutionNesting struct {
+	depth     int
+	truncated *atomic.Bool
+	active    *resolutionFrame
+}
+
+// resolutionFrame is one reference being resolved somewhere up the chain. A
+// reference whose answer depends on itself -- an incomplete edit can parse
+// as a call whose own lambda needs that call's receiver -- has no answer, and
+// asking again would only repeat the question until the depth bound.
+type resolutionFrame struct {
+	uri        protocol.URI
+	start, end int
+	name       string
+	role       analysis.ReferenceRole
+	outer      *resolutionFrame
+}
+
+// enterResolution returns ctx with r recorded as being resolved, or false
+// when r is already being resolved further up the same chain.
+func enterResolution(ctx context.Context, file *analysis.ParsedFile, r analysis.Reference) (context.Context, bool) {
+	nesting, _ := ctx.Value(resolutionDepthKey{}).(resolutionNesting)
+	for frame := nesting.active; frame != nil; frame = frame.outer {
+		if frame.start == r.StartByte && frame.end == r.EndByte && frame.name == r.Name && frame.role == r.Role && frame.uri == file.URI {
+			if nesting.truncated != nil {
+				nesting.truncated.Store(true)
+			}
+			return ctx, false
+		}
+	}
+	if nesting.truncated == nil {
+		nesting.truncated = new(atomic.Bool)
+	}
+	nesting.depth++
+	nesting.active = &resolutionFrame{uri: file.URI, start: r.StartByte, end: r.EndByte, name: r.Name, role: r.Role, outer: nesting.active}
+	return context.WithValue(withReceiverSpellingsMemo(ctx), resolutionDepthKey{}, nesting), true
+}
+
+func resolutionDepth(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	nesting, _ := ctx.Value(resolutionDepthKey{}).(resolutionNesting)
+	return nesting.depth
+}
+
+func withResolutionDepth(ctx context.Context, depth int) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	nesting, _ := ctx.Value(resolutionDepthKey{}).(resolutionNesting)
+	if nesting.truncated == nil {
+		nesting.truncated = new(atomic.Bool)
+	}
+	nesting.depth = depth
+	return context.WithValue(ctx, resolutionDepthKey{}, nesting)
+}
+
+// resolutionNestingExceeded reports whether ctx is at the bound, and marks the
+// chain as truncated when it is.
+func resolutionNestingExceeded(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	nesting, _ := ctx.Value(resolutionDepthKey{}).(resolutionNesting)
+	if nesting.depth < maxResolutionNesting {
+		return false
+	}
+	if nesting.truncated != nil {
+		nesting.truncated.Store(true)
+	}
+	return true
+}
+
+// resolutionTruncated reports whether some step of ctx's chain hit the bound,
+// so its answers are incomplete and must not be cached.
+func resolutionTruncated(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	nesting, _ := ctx.Value(resolutionDepthKey{}).(resolutionNesting)
+	return nesting.truncated != nil && nesting.truncated.Load()
+}
+
+func (i *Index) resolveLocked(ctx context.Context, file *analysis.ParsedFile, r analysis.Reference) []analysis.Symbol {
+	return i.resolveContextLocked(ctx, file, r)
 }
 
 // resolveContextLocked is always called with i.mu held. It bounds the total
@@ -29,6 +128,37 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 		ctx = context.Background()
 	}
 	if ctx.Err() != nil || file == nil {
+		return nil
+	}
+	// A reference that resolved to exactly one declaration is remembered, keyed
+	// on the declaration around it (see lateKey), so an edit elsewhere in the
+	// file -- or a request that comes round again -- does not repeat inference.
+	// Everything that resolves references shares this: diagnostics, hints,
+	// highlighting, references, rename and call hierarchy.
+	if r.ResolvedID == "" && !r.Synthetic {
+		if cached, ok := i.cachedResolutionLocked(file, r); ok {
+			return cached
+		}
+		ctx = withResolutionDepth(ctx, resolutionDepth(ctx))
+		resolved := i.resolveUncachedLocked(ctx, file, r)
+		if ctx.Err() == nil && !resolutionTruncated(ctx) {
+			i.rememberResolutionLocked(file, r, resolved)
+		}
+		return resolved
+	}
+	return i.resolveUncachedLocked(ctx, file, r)
+}
+
+func (i *Index) resolveUncachedLocked(ctx context.Context, file *analysis.ParsedFile, r analysis.Reference) []analysis.Symbol {
+	if resolutionNestingExceeded(ctx) {
+		return nil
+	}
+	// Every resolution below this one -- a qualifier's type, the callee whose
+	// lambda this reference sits in, an initializer -- counts one level deeper,
+	// so a cycle through any of them ends at the bound instead of the stack,
+	// and the same reference asked again inside its own chain ends at once.
+	ctx, fresh := enterResolution(ctx, file, r)
+	if !fresh {
 		return nil
 	}
 	access := newAccessibilityMemoLocked(i, file)
@@ -46,23 +176,23 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 		return i.resolveArgumentLabelContextLocked(ctx, file, r)
 	}
 	ids := make([]string, 0)
-	exhausted := false
+	exhausted, exhaustedBy := false, ""
 	appendIDs := func(bucket []string) {
 		if exhausted || !access.consumeWork(len(bucket)) || len(bucket) > maxResolutionCandidates-len(ids) {
-			exhausted = true
+			exhausted, exhaustedBy = true, "#1 if exhausted  access.consumeWork(len(bucket))  len(bucket) >"
 			return
 		}
 		ids = append(ids, bucket...)
 	}
 	appendID := func(id string) {
 		if exhausted || !access.consumeWork(1) || len(ids) >= maxResolutionCandidates {
-			exhausted = true
+			exhausted, exhaustedBy = true, "#2 if exhausted  access.consumeWork(1)  len(ids) > maxResolutio"
 			return
 		}
 		ids = append(ids, id)
 	}
 	finishExhausted := func() []analysis.Symbol {
-		i.recordHealth("resolution", r.Name, "candidate inventory exceeded its 512-symbol safety limit and was withheld")
+		i.recordHealth("resolution", r.Name, "candidate inventory exceeded its 512-symbol safety limit and was withheld ("+exhaustedBy+")")
 		return nil
 	}
 	if !i.prepareResolutionImportsLocked(file, access) {
@@ -77,7 +207,7 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 	relevantImports := make([]analysis.Import, 0, len(access.importsByLocal[r.Name])+len(access.wildcardImports))
 	relevantImports = append(relevantImports, access.importsByLocal[r.Name]...)
 	relevantImports = append(relevantImports, access.wildcardImports...)
-	if !access.consumeWork(len(relevantImports)) {
+	if !access.consumeWork(len(relevantImports) - access.implicitWildcards) {
 		return finishExhausted()
 	}
 	qualifier := r.Qualifier
@@ -90,9 +220,11 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 		// generic return arguments survive through longer chains and a dotted
 		// call never falls back to unqualified name lookup. Synthetic references
 		// built by type inference borrow an outer reference's position while
-		// naming a callee elsewhere; the text must spell the reference itself
-		// before the dot is trusted, or inference would re-enter itself.
-		if referenceSpelledAt(text, r) {
+		// naming a callee elsewhere, so they say so and are never re-qualified
+		// from the text: spelling alone cannot tell them apart, because the name
+		// at the borrowed position can be the same one (`x.param(a).param(b)`),
+		// and resolution would then analyse that expression forever.
+		if !r.Synthetic && referenceSpelledAt(text, r) {
 			if textual := expressionQualifierBefore(text, r.StartByte); textual != "" {
 				qualifier = textual
 			}
@@ -100,13 +232,15 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 	}
 	if qualifier == "" {
 		if qualifier == "" && file.Language == analysis.LanguageKotlin {
-			implicitReceiverTypes = append(implicitReceiverTypes, i.contextualLambdaReceiverTypeLocked(file, r.StartByte), i.enclosingExtensionReceiverTypeLocked(file, r.StartByte))
+			implicitReceiverTypes = append(implicitReceiverTypes, i.contextualLambdaReceiverTypeLocked(ctx, file, r.StartByte), i.enclosingExtensionReceiverTypeLocked(file, r.StartByte))
+			implicitReceiverTypes = append(implicitReceiverTypes, i.thisSmartCastTypesLocked(file, r.StartByte)...)
 			implicitReceiverTypes = append(implicitReceiverTypes, i.enclosingContextReceiverTypesLocked(file, r.StartByte)...)
 			if enclosing := i.enclosingTypeLocked(file, r.StartByte); enclosing.ID != "" {
 				implicitReceiverTypes = append(implicitReceiverTypes, enclosing.Name)
 			}
+			implicitReceiverTypes = append(implicitReceiverTypes, gradleScriptReceiverTypes(file)...)
 		} else if file.Language == analysis.LanguageJava {
-			implicitReceiverTypes = append(implicitReceiverTypes, i.javaSwitchLabelReceiverTypeLocked(file, r.StartByte))
+			implicitReceiverTypes = append(implicitReceiverTypes, i.javaSwitchLabelReceiverTypeLocked(ctx, file, r.StartByte))
 		}
 	}
 	typeQualifierSymbols := i.resolveTypeSymbolsForOwnerMemoLocked(file, qualifier, analysis.Symbol{}, access)
@@ -117,23 +251,35 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 	if r.Role == analysis.RoleImport && r.Qualifier != "" {
 		appendIDs(i.byFQN[r.Qualifier+"."+r.Name])
 	}
+	qualifierType := ""
 	if qualifier != "" {
 		anonymous, complete := i.anonymousObjectMemberIDsBoundedLocked(ctx, file, qualifier, r.Name, r.StartByte, maxResolutionCandidates-len(ids))
 		if !complete {
-			exhausted = true
+			exhausted, exhaustedBy = true, "#3 if complete "
 		} else {
 			appendIDs(anonymous)
 		}
-		typ := i.inferExpressionResultLocked(file, qualifier, r.StartByte).Type
+		typ := i.inferExpressionResultContextLocked(ctx, file, qualifier, r.StartByte).Type
 		if explicit := explicitReceiverType(qualifier); explicit != "" {
 			typ = explicit
 		}
+		// `Outer.Nested(1)`: a class is no value, so nothing infers a type
+		// for it, but its nested types, statics and companion members are
+		// what follows the dot. The filters below keep them to exactly those.
+		if typ == "" && typeQualifier && len(typeQualifierSymbols) == 1 && analysis.IsTypeKind(typeQualifierSymbols[0].Kind) && typeQualifierSymbols[0].FQN != "" {
+			typ = typeQualifierSymbols[0].FQN
+		}
+		qualifierType = typ
 		if typ != "" {
 			nullableReceiver := file.Language == analysis.LanguageKotlin && strings.HasSuffix(strings.TrimSpace(typ), "?")
 			memberAccessAllowed := !nullableReceiver || kotlinNullableMemberAccessAllowed(i.documentTextLocked(file.URI), r.StartByte)
+			dot := qualifiedAccess{
+				receiverType: typ, typeQualifier: typeQualifier, typeQualifierValue: typeQualifierValue, typeQualifierSymbols: typeQualifierSymbols,
+				unboundCallableReference: unboundCallableReference, memberAccessAllowed: memberAccessAllowed, at: r.StartByte,
+			}
 			validContainers, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, typ, maxIntAtLeastOne(maxResolutionCandidates-len(ids)), access)
 			if !complete {
-				exhausted = true
+				exhausted, exhaustedBy = true, "#4 if complete "
 			}
 			for _, instantiated := range validContainers {
 				if ctx.Err() != nil {
@@ -143,29 +289,36 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 				if memberAccessAllowed {
 					bucket := i.byContainerMember[memberKey(owner.ID, r.Name)]
 					if len(bucket) > maxResolutionCandidates-len(ids) {
-						exhausted = true
+						exhausted, exhaustedBy = true, "#5 if len(bucket) > maxResolutionCandidates-len(ids) "
 						break
 					}
 					for _, id := range bucket {
-						if symbol := i.symbols[id]; i.memberInheritedForReceiverLocked(file, *symbol, typ) && (!typeQualifier || unboundCallableReference || i.memberAvailableThroughTypeQualifierLocked(file, *symbol, typeQualifierSymbols)) && i.accessibleWithMemoLocked(file, *symbol, access, r.StartByte) {
+						if symbol := i.symbols[id]; i.qualifiedMemberViableLocked(file, access, dot, *symbol) {
+							appendID(id)
+						}
+					}
+				}
+				if typeQualifier {
+					for _, id := range i.binaryNestedTypeIDsLocked(owner, r.Name) {
+						if i.accessibleWithMemoLocked(file, *i.symbols[id], access, r.StartByte) {
 							appendID(id)
 						}
 					}
 				}
 				extensions, complete := i.extensionMemberCandidatesBoundedLocked(owner, r.Name, maxResolutionCandidates-len(ids))
 				if !complete {
-					exhausted = true
+					exhausted, exhaustedBy = true, "#6 if complete "
 					break
 				}
 				for _, id := range extensions {
-					if symbol := i.symbols[id]; (!typeQualifier || typeQualifierValue || unboundCallableReference) && i.extensionReceiverApplicableLocked(file, *symbol, typ) && (memberAccessAllowed || strings.HasSuffix(strings.TrimSpace(symbol.ReceiverType), "?")) && i.accessibleWithMemoLocked(file, *symbol, access, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) {
+					if symbol := i.symbols[id]; i.qualifiedExtensionViableLocked(ctx, file, access, dot, *symbol) {
 						appendID(id)
 					}
 				}
-				if file.Language == analysis.LanguageKotlin {
+				if qualifiedCompanionMembersViable(file, dot) {
 					companionMembers, complete := i.companionMembersForOwnerBoundedLocked(ctx, owner, nil, maxResolutionCandidates-len(ids))
 					if !complete {
-						exhausted = true
+						exhausted, exhaustedBy = true, "#7 if complete "
 						break
 					}
 					for _, member := range companionMembers {
@@ -179,11 +332,11 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 				for _, owner := range spellingReceiverOwners(typ) {
 					extensions, complete := i.extensionMemberCandidatesBoundedLocked(owner, r.Name, maxResolutionCandidates-len(ids))
 					if !complete {
-						exhausted = true
+						exhausted, exhaustedBy = true, "#8 if complete "
 						break
 					}
 					for _, id := range extensions {
-						if symbol := i.symbols[id]; (!typeQualifier || typeQualifierValue || unboundCallableReference) && i.extensionReceiverApplicableLocked(file, *symbol, typ) && (memberAccessAllowed || strings.HasSuffix(strings.TrimSpace(symbol.ReceiverType), "?")) && i.accessibleWithMemoLocked(file, *symbol, access, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) {
+						if symbol := i.symbols[id]; i.qualifiedExtensionViableLocked(ctx, file, access, dot, *symbol) {
 							appendID(id)
 						}
 					}
@@ -205,14 +358,14 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 		}
 		hierarchy, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, implicitReceiverType, maxIntAtLeastOne(maxResolutionCandidates-len(ids)), access)
 		if !complete {
-			exhausted = true
+			exhausted, exhaustedBy = true, "#9 if complete "
 			break
 		}
 		for _, instantiated := range hierarchy {
 			owner := instantiated.symbol
 			bucket := i.byContainerMember[memberKey(owner.ID, r.Name)]
 			if len(bucket) > maxResolutionCandidates-len(ids) {
-				exhausted = true
+				exhausted, exhaustedBy = true, "#10 if len(bucket) > maxResolutionCandidates-len(ids) "
 				break
 			}
 			for _, id := range bucket {
@@ -222,11 +375,11 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 			}
 			extensions, complete := i.extensionMemberCandidatesBoundedLocked(owner, r.Name, maxResolutionCandidates-len(ids))
 			if !complete {
-				exhausted = true
+				exhausted, exhaustedBy = true, "#11 if complete "
 				break
 			}
 			for _, id := range extensions {
-				if symbol := i.symbols[id]; i.extensionReceiverApplicableLocked(file, *symbol, implicitReceiverType) && i.accessibleWithMemoLocked(file, *symbol, access, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) {
+				if symbol := i.symbols[id]; i.extensionReceiverApplicableLocked(ctx, file, *symbol, implicitReceiverType) && i.accessibleWithMemoLocked(file, *symbol, access, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) {
 					appendID(id)
 				}
 			}
@@ -235,11 +388,11 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 			for _, owner := range spellingReceiverOwners(implicitReceiverType) {
 				extensions, complete := i.extensionMemberCandidatesBoundedLocked(owner, r.Name, maxResolutionCandidates-len(ids))
 				if !complete {
-					exhausted = true
+					exhausted, exhaustedBy = true, "#12 if complete "
 					break
 				}
 				for _, id := range extensions {
-					if symbol := i.symbols[id]; i.extensionReceiverApplicableLocked(file, *symbol, implicitReceiverType) && i.accessibleWithMemoLocked(file, *symbol, access, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) {
+					if symbol := i.symbols[id]; i.extensionReceiverApplicableLocked(ctx, file, *symbol, implicitReceiverType) && i.accessibleWithMemoLocked(file, *symbol, access, r.StartByte) && i.extensionVisibleLocked(file, *symbol, r.StartByte) {
 						appendID(id)
 					}
 				}
@@ -254,7 +407,7 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 			if imp.Wildcard || imp.LocalName() == r.Name {
 				members, complete := i.staticImportMemberIDsBoundedWithMemoLocked(ctx, file, imp, r.Name, r.StartByte, maxResolutionCandidates-len(ids), access)
 				if !complete {
-					exhausted = true
+					exhausted, exhaustedBy = true, "#13 if complete "
 					break
 				}
 				appendIDs(members)
@@ -262,7 +415,23 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 			continue
 		}
 		if !imp.Wildcard && imp.LocalName() == r.Name {
-			appendIDs(i.byFQN[imp.Path])
+			if qualifier == "" || imp.Alias == "" {
+				appendIDs(i.byFQN[imp.Path])
+				continue
+			}
+			// `}.listAsFlow()` through `import ...asFlow as listAsFlow`: a
+			// qualified call can only be one of the aliased extensions, and
+			// only one whose receiver takes the qualifier.
+			for _, id := range i.byFQN[imp.Path] {
+				symbol := i.symbols[id]
+				if symbol == nil || symbol.ReceiverType == "" {
+					continue
+				}
+				if qualifierType == "" || i.extensionReceiverApplicableLocked(ctx, file, *symbol, qualifierType) {
+					appendID(id)
+				}
+			}
+			continue
 		}
 		if imp.Wildcard {
 			appendIDs(i.byFQN[imp.Path+"."+r.Name])
@@ -283,13 +452,27 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 			}
 			bucket := i.byContainerMember[memberKey(c.ID, r.Name)]
 			if len(bucket) > maxResolutionCandidates-len(ids) {
-				exhausted = true
+				exhausted, exhaustedBy = true, "#14 if len(bucket) > maxResolutionCandidates-len(ids) "
 				break
 			}
 			for _, id := range bucket {
 				s := i.symbols[id]
 				if (s.ContainerID == c.ID || s.ContainerName == c.Name) && (instanceReceiver || i.staticOrNestedMemberLocked(*s)) {
 					appendID(id)
+				}
+			}
+			// A class sees its companion's members as bare names, the
+			// companion's private `logger` included.
+			if file.Language == analysis.LanguageKotlin && analysis.IsTypeKind(c.Kind) {
+				companionMembers, complete := i.companionMembersForOwnerBoundedLocked(ctx, *c, nil, maxResolutionCandidates-len(ids))
+				if !complete {
+					exhausted, exhaustedBy = true, "companion members of an enclosing class"
+					break
+				}
+				for _, member := range companionMembers {
+					if member.Name == r.Name {
+						appendID(member.ID)
+					}
 				}
 			}
 			nextID := c.ContainerID
@@ -302,7 +485,7 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 	if len(ids) == 0 && qualifier == "" {
 		bucket := i.byName[r.Name]
 		if len(bucket) > maxResolutionCandidates {
-			exhausted = true
+			exhausted, exhaustedBy = true, "#15 if len(bucket) > maxResolutionCandidates "
 		}
 		for _, id := range bucket {
 			if exhausted || ctx.Err() != nil {
@@ -348,10 +531,20 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 		if !i.accessibleWithMemoLocked(file, s, access, r.StartByte) || !i.extensionVisibleLocked(file, s, r.StartByte) {
 			return false
 		}
-		if typeQualifier && !unboundCallableReference && !i.memberAvailableThroughTypeQualifierLocked(file, s, typeQualifierSymbols) {
-			return false
+		if typeQualifier && !unboundCallableReference {
+			// `Outer.Nested(1)` calls Nested's constructor: whether the type
+			// qualifier reaches it is whether it reaches Nested.
+			reached := s
+			if s.Kind == analysis.KindConstructor {
+				if owner := i.symbols[s.ContainerID]; owner != nil {
+					reached = *owner
+				}
+			}
+			if !i.memberAvailableThroughTypeQualifierLocked(file, reached, typeQualifierSymbols) {
+				return false
+			}
 		}
-		if !i.protectedReceiverAccessibleLocked(file, s, r) {
+		if !i.protectedReceiverAccessibleLocked(ctx, file, s, r) {
 			return false
 		}
 		if isLexicalSymbol(s) && s.URI == file.URI {
@@ -360,6 +553,12 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 			}
 		}
 		if r.Role == analysis.RoleCall {
+			// `JsonSubTypes.Type(value = X::class, name = "x")` instantiates an
+			// annotation inside another's arguments: its "parameters" are its
+			// methods, which no declared parameter list records.
+			if s.Kind == analysis.KindAnnotation && file.Language == analysis.LanguageKotlin {
+				return true
+			}
 			return (analysis.IsCallableKind(s.Kind) || analysis.IsTypeKind(s.Kind)) && (r.Arity < 0 || matchesArityForLanguage(s, r.Arity, file.Language))
 		}
 		if r.Role == analysis.RoleType {
@@ -382,7 +581,7 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 	if r.Qualifier != "" || len(implicitReceiverTypes) > 0 {
 		receiverTypes := implicitReceiverTypes
 		if r.Qualifier != "" {
-			receiverTypes = []string{i.typeOfExpressionLocked(file, r.Qualifier, r.StartByte)}
+			receiverTypes = []string{i.typeOfExpressionLocked(ctx, file, r.Qualifier, r.StartByte)}
 		}
 		for _, receiverType := range receiverTypes {
 			if receiverType != "" {
@@ -425,10 +624,44 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 		if candidate.Package == file.Package {
 			score += 10
 		}
-		if candidate.StartByte <= r.StartByte {
+		// Declared before the reference: only meaningful within one file. A
+		// library declaration's offset is a position in another document, and
+		// comparing it with this one ranked jOOQ's first `mapping` overloads
+		// above the rest by where in Records.class they happen to sit.
+		if candidate.URI == file.URI && candidate.StartByte <= r.StartByte {
 			score += 2
 		}
 		return score
+	}
+	// A call candidate that provably cannot take these arguments is out
+	// before ranking, not after: ranking keeps only the best-placed group,
+	// and when that group was a member the call cannot use -- Gradle's
+	// `dependencies(Closure)` before the Kotlin DSL's extension -- nothing
+	// was left.
+	type compatibility struct {
+		score int
+		typed bool
+	}
+	compatibilityOf := make(map[string]compatibility, len(candidates))
+	callCompatibility := func(candidate analysis.Symbol) (int, bool) {
+		if known, ok := compatibilityOf[candidate.ID]; ok {
+			return known.score, known.typed
+		}
+		score, typed := i.callCompatibilityLocked(ctx, file, r, candidate)
+		compatibilityOf[candidate.ID] = compatibility{score, typed}
+		return score, typed
+	}
+	if r.Role == analysis.RoleCall && file.Language == analysis.LanguageKotlin && len(candidates) > 1 {
+		viable := make([]analysis.Symbol, 0, len(candidates))
+		for _, candidate := range candidates {
+			if score, typed := callCompatibility(candidate); typed && score <= -1<<19 {
+				continue
+			}
+			viable = append(viable, candidate)
+		}
+		if len(viable) > 0 {
+			candidates = viable
+		}
 	}
 	sort.SliceStable(candidates, func(a, b int) bool {
 		as, bs := resolutionRank(candidates[a]), resolutionRank(candidates[b])
@@ -491,7 +724,7 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 			if n&31 == 0 && ctx.Err() != nil {
 				return nil
 			}
-			score, typed := i.callCompatibilityLocked(file, r, candidate)
+			score, typed := callCompatibility(candidate)
 			scores[n] = score
 			typedScores[n] = typed
 		}
@@ -537,13 +770,13 @@ func (i *Index) resolveContextLocked(ctx context.Context, file *analysis.ParsedF
 					filtered = append(filtered, candidate)
 				}
 			}
-			candidates = i.preferMostSpecificCallCandidatesLocked(file, filtered)
+			candidates = i.preferMostSpecificCallCandidatesLocked(ctx, file, filtered)
 		}
 	}
 	return candidates
 }
 
-func (i *Index) preferMostSpecificCallCandidatesLocked(file *analysis.ParsedFile, candidates []analysis.Symbol) []analysis.Symbol {
+func (i *Index) preferMostSpecificCallCandidatesLocked(ctx context.Context, file *analysis.ParsedFile, candidates []analysis.Symbol) []analysis.Symbol {
 	if len(candidates) < 2 {
 		return candidates
 	}
@@ -561,7 +794,7 @@ func (i *Index) preferMostSpecificCallCandidatesLocked(file *analysis.ParsedFile
 			if typeContainsAnyParameter(leftType, left.TypeParameters) && !typeContainsAnyParameter(rightType, right.TypeParameters) {
 				return false
 			}
-			if !i.isSubtypeLocked(file, leftType, rightType) {
+			if !i.isSubtypeLocked(ctx, file, leftType, rightType) {
 				return false
 			}
 			strict = true
@@ -675,14 +908,6 @@ func (i *Index) callableReferenceExpectedParametersLocked(file *analysis.ParsedF
 	return nil, false
 }
 
-func (i *Index) anonymousObjectMemberIDsLocked(file *analysis.ParsedFile, qualifier, name string, at int) []string {
-	ids, complete := i.anonymousObjectMemberIDsBoundedLocked(context.Background(), file, qualifier, name, at, maxResolutionCandidates)
-	if !complete {
-		return nil
-	}
-	return ids
-}
-
 func (i *Index) anonymousObjectMemberIDsBoundedLocked(ctx context.Context, file *analysis.ParsedFile, qualifier, name string, at, limit int) ([]string, bool) {
 	qualifier = strings.TrimSpace(qualifier)
 	if limit < 0 || strings.ContainsAny(qualifier, ".()[]{} 	\r\n") {
@@ -699,7 +924,7 @@ func (i *Index) anonymousObjectMemberIDsBoundedLocked(ctx context.Context, file 
 			return nil, false
 		}
 		symbol := candidates[index]
-		if symbol.ScopeEndByte > 0 && at > symbol.ScopeEndByte {
+		if !symbol.InScopeAt(at) {
 			continue
 		}
 		owner = *symbol
@@ -766,18 +991,6 @@ func (i *Index) memberInheritedForReceiverLocked(file *analysis.ParsedFile, symb
 	return false
 }
 
-func (i *Index) staticImportMemberIDsLocked(file *analysis.ParsedFile, imported analysis.Import, name string, at int) []string {
-	ids, complete := i.staticImportMemberIDsBoundedLocked(context.Background(), file, imported, name, at, maxResolutionCandidates)
-	if !complete {
-		return nil
-	}
-	return ids
-}
-
-func (i *Index) staticImportMemberIDsBoundedLocked(ctx context.Context, file *analysis.ParsedFile, imported analysis.Import, name string, at, limit int) ([]string, bool) {
-	return i.staticImportMemberIDsBoundedWithMemoLocked(ctx, file, imported, name, at, limit, newAccessibilityMemoLocked(i, file))
-}
-
 func (i *Index) staticImportMemberIDsBoundedWithMemoLocked(ctx context.Context, file *analysis.ParsedFile, imported analysis.Import, name string, at, limit int, access *accessibilityMemo) ([]string, bool) {
 	if limit < 0 {
 		return nil, false
@@ -830,7 +1043,7 @@ func maxIntAtLeastOne(value int) int {
 	return value
 }
 
-func (i *Index) javaSwitchLabelReceiverTypeLocked(file *analysis.ParsedFile, at int) string {
+func (i *Index) javaSwitchLabelReceiverTypeLocked(ctx context.Context, file *analysis.ParsedFile, at int) string {
 	if file.Language != analysis.LanguageJava {
 		return ""
 	}
@@ -859,7 +1072,7 @@ func (i *Index) javaSwitchLabelReceiverTypeLocked(file *analysis.ParsedFile, at 
 	if close < 0 || close >= caseAt {
 		return ""
 	}
-	return i.typeOfExpressionLocked(file, strings.TrimSpace(source[open+1:close]), at)
+	return i.typeOfExpressionLocked(ctx, file, strings.TrimSpace(source[open+1:close]), at)
 }
 
 func matchingDelimiter(source string, open int, opening, closing byte) int {
@@ -886,7 +1099,9 @@ func (i *Index) resolveArgumentLabelContextLocked(ctx context.Context, file *ana
 		document = i.indexedDocs[file.URI]
 	}
 	if document == nil {
-		document = i.libraryDocs[file.URI]
+		if document = i.libraryDocs[file.URI]; document != nil {
+			i.noteLibraryCacheUse(file.URI)
+		}
 	}
 	if document == nil {
 		return nil
@@ -975,23 +1190,6 @@ func (i *Index) resolveAnnotationAttributeLocked(file *analysis.ParsedFile, docu
 	return uniqueSymbols(out)
 }
 
-func (i *Index) companionMembersLocked(file *analysis.ParsedFile, container string) []analysis.Symbol {
-	seen := make(map[string]bool)
-	var members []analysis.Symbol
-	for _, owner := range i.resolveTypeSymbolsLocked(file, container) {
-		members = append(members, i.companionMembersForOwnerLocked(owner, seen)...)
-	}
-	return members
-}
-
-func (i *Index) companionMembersForOwnerLocked(owner analysis.Symbol, seen map[string]bool) []analysis.Symbol {
-	members, complete := i.companionMembersForOwnerBoundedLocked(context.Background(), owner, seen, maxResolutionCandidates)
-	if !complete {
-		return nil
-	}
-	return members
-}
-
 func (i *Index) companionMembersForOwnerBoundedLocked(ctx context.Context, owner analysis.Symbol, seen map[string]bool, limit int) ([]analysis.Symbol, bool) {
 	if limit < 0 {
 		return nil, false
@@ -1000,10 +1198,14 @@ func (i *Index) companionMembersForOwnerBoundedLocked(ctx context.Context, owner
 		seen = make(map[string]bool)
 	}
 	var members []analysis.Symbol
-	companions := i.byContainerName[owner.ID]
-	if len(companions) > maxResolutionCandidates {
-		return nil, false
+	// Only Kotlin declares companions. The owner's member list is scanned to
+	// find them, and its size is no bound on the answer: jOOQ's DSLContext
+	// has over 512 methods and no companion, and bounding the scan withheld
+	// every call on a DSLContext.
+	if owner.Language != analysis.LanguageKotlin {
+		return nil, true
 	}
+	companions := i.byContainerName[owner.ID]
 	for index, companionID := range companions {
 		if index&31 == 0 && ctx.Err() != nil {
 			return nil, false
@@ -1032,17 +1234,6 @@ func (i *Index) companionMembersForOwnerBoundedLocked(ctx context.Context, owner
 		}
 	}
 	return members, true
-}
-
-func (i *Index) companionMemberIDsForOwnerLocked(owner analysis.Symbol, name string) []string {
-	members := i.companionMembersForOwnerLocked(owner, nil)
-	ids := make([]string, 0, len(members))
-	for _, member := range members {
-		if member.Name == name {
-			ids = append(ids, member.ID)
-		}
-	}
-	return ids
 }
 
 // Extension declarations are indexed by their source spelling because their
@@ -1089,6 +1280,34 @@ func (i *Index) extensionMemberCandidatesBoundedLocked(owner analysis.Symbol, na
 	return ids, true
 }
 
+// genericExtensionCandidatesLocked lists extensions whose declared receiver is
+// a type parameter, so they apply to any receiver: `let`, `takeIf`, `also` and
+// the rest of the standard library's scope functions. They are filed by member
+// name rather than by receiver, so completion reaches them through the prefix
+// the author has typed; the caller still proves applicability against the
+// actual receiver type. An empty prefix is the common case, not an edge:
+// editors ask once, right after the dot, and filter what they got as the user
+// types, so leaving these out there hid them for good.
+func (i *Index) genericExtensionCandidatesLocked(prefix string, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	lower := strings.ToLower(prefix)
+	ids := make([]string, 0, 8)
+	for name, candidates := range i.byGenericReceiverMember {
+		if !strings.HasPrefix(strings.ToLower(name), lower) {
+			continue
+		}
+		for _, id := range candidates {
+			ids = append(ids, id)
+			if len(ids) >= limit {
+				return ids
+			}
+		}
+	}
+	return ids
+}
+
 func (i *Index) extensionCandidatesLocked(owner analysis.Symbol) []string {
 	seen := make(map[string]bool)
 	var ids []string
@@ -1101,17 +1320,6 @@ func (i *Index) extensionCandidatesLocked(owner analysis.Symbol) []string {
 				seen[id] = true
 				ids = append(ids, id)
 			}
-		}
-	}
-	return ids
-}
-
-func (i *Index) companionMemberIDsLocked(file *analysis.ParsedFile, container, name string) []string {
-	members := i.companionMembersLocked(file, container)
-	ids := make([]string, 0, len(members))
-	for _, member := range members {
-		if member.Name == name {
-			ids = append(ids, member.ID)
 		}
 	}
 	return ids
@@ -1152,7 +1360,7 @@ func sameCallableShape(left, right analysis.Symbol) bool {
 	return true
 }
 
-func (i *Index) protectedReceiverAccessibleLocked(file *analysis.ParsedFile, symbol analysis.Symbol, reference analysis.Reference) bool {
+func (i *Index) protectedReceiverAccessibleLocked(ctx context.Context, file *analysis.ParsedFile, symbol analysis.Symbol, reference analysis.Reference) bool {
 	if symbol.Language != analysis.LanguageJava || symbol.Package == file.Package || !containsString(symbol.Modifiers, "protected") {
 		return true
 	}
@@ -1167,7 +1375,7 @@ func (i *Index) protectedReceiverAccessibleLocked(file *analysis.ParsedFile, sym
 	if qualifier == "" || qualifier == "this" || qualifier == "super" {
 		return true
 	}
-	receiverType := i.typeOfExpressionLocked(file, qualifier, reference.StartByte)
+	receiverType := i.typeOfExpressionLocked(ctx, file, qualifier, reference.StartByte)
 	for _, receiver := range i.resolveTypeSymbolsAtLocked(file, receiverType, reference.StartByte) {
 		if receiver.ID == current.ID || i.containerInheritsLocked(receiver.ID, current.ID) {
 			return true
@@ -1215,15 +1423,7 @@ func lexicalCandidateMatches(reference analysis.Reference, symbol analysis.Symbo
 }
 
 func symbolInScopeAt(symbol analysis.Symbol, at int) bool {
-	if !(symbol.ScopeStartByte > 0 && at < symbol.ScopeStartByte || symbol.ScopeEndByte > 0 && at > symbol.ScopeEndByte) {
-		return true
-	}
-	for _, scope := range symbol.AdditionalScopes {
-		if scope.StartByte <= at && at <= scope.EndByte {
-			return true
-		}
-	}
-	return false
+	return symbol.InScopeAt(at)
 }
 
 func expressionQualifierBefore(source string, start int) string {
@@ -1238,6 +1438,26 @@ func expressionQualifierBefore(source string, start int) string {
 	allowLambdaGap := false
 	for index >= 0 {
 		value := source[index]
+		// A string or character literal is one atom: its closing quote is
+		// not an identifier character, so without this a literal receiver
+		// ("abc".) had no qualifier at all and completion fell back to every
+		// name in scope.
+		if (value == '"' || value == '\'') && parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 && angleDepth == 0 {
+			if open := literalStartBefore(source, index); open >= 0 {
+				return normalizeQualifier(source[open:end])
+			}
+		}
+		// A fluent chain continues on the next line:
+		//
+		//	items
+		//	    .filter { ... }
+		//	    .
+		//
+		// Whitespace next to a dot belongs to the expression.
+		if (value == ' ' || value == '\t' || value == '\r' || value == '\n') && parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 && angleDepth == 0 && whitespaceContinuesChain(source, index, end) {
+			index--
+			continue
+		}
 		switch value {
 		case ')':
 			parenDepth++
@@ -1277,12 +1497,95 @@ func expressionQualifierBefore(source string, start int) string {
 				allowLambdaGap = false
 			}
 			if !lambdaGap && parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 && angleDepth == 0 && !(isIdentRune(rune(value)) || value == '.' || value == ':' || value == '?' || value == '!' || value == '`') {
-				return strings.Trim(strings.TrimSpace(source[index+1:end]), ".?!")
+				return normalizeQualifier(strings.Trim(strings.TrimSpace(source[index+1:end]), ".?!"))
 			}
 		}
 		index--
 	}
-	return strings.Trim(strings.TrimSpace(source[:end]), ".?!")
+	return normalizeQualifier(strings.Trim(strings.TrimSpace(source[:end]), ".?!"))
+}
+
+// whitespaceContinuesChain reports whether the whitespace at index sits
+// beside a member-access dot (`.` or `?.`) that joins two pieces of one
+// expression: either the text to its right (up to end) starts with a dot, or
+// the text to its left ends with one.
+func whitespaceContinuesChain(source string, index, end int) bool {
+	right := index + 1
+	for right < end && strings.IndexByte(" \t\r\n", source[right]) >= 0 {
+		right++
+	}
+	if right >= end {
+		// The whitespace runs up to the dot being completed. A line break
+		// before it means the dot opens a new line of a chain.
+		runStart := index
+		for runStart > 0 && strings.IndexByte(" \t\r\n", source[runStart-1]) >= 0 {
+			runStart--
+		}
+		return strings.ContainsAny(source[runStart:end], "\r\n")
+	}
+	if right < end && (source[right] == '.' || source[right] == '?' && right+1 < end && source[right+1] == '.') {
+		return true
+	}
+	left := index
+	for left >= 0 && strings.IndexByte(" \t\r\n", source[left]) >= 0 {
+		left--
+	}
+	return left >= 0 && source[left] == '.' && right < end
+}
+
+// literalStartBefore returns the offset of the opening quote of the string or
+// character literal whose closing quote is at closing, or -1 when the quote is
+// not the end of a literal. Raw (""") and escaped quotes are understood;
+// templates are skipped as text, which only matters for nesting.
+func literalStartBefore(source string, closing int) int {
+	quote := source[closing]
+	if quote == '"' && closing >= 2 && source[closing-1] == '"' && source[closing-2] == '"' {
+		// raw string """..."""
+		if open := strings.LastIndex(source[:closing-2], `"""`); open >= 0 {
+			return open
+		}
+		return -1
+	}
+	for index := closing - 1; index >= 0; index-- {
+		if source[index] == '\n' {
+			return -1
+		}
+		if source[index] != quote {
+			continue
+		}
+		backslashes := 0
+		for before := index - 1; before >= 0 && source[before] == '\\'; before-- {
+			backslashes++
+		}
+		if backslashes%2 == 0 {
+			return index
+		}
+	}
+	return -1
+}
+
+// normalizeQualifier removes the line breaks and indentation that sit before a
+// continuing dot, so a chain written over several lines reads as one expression.
+func normalizeQualifier(expression string) string {
+	if !strings.ContainsAny(expression, "\r\n") {
+		return expression
+	}
+	var out strings.Builder
+	runes := []rune(expression)
+	for index := 0; index < len(runes); index++ {
+		if runes[index] == '\n' || runes[index] == '\r' {
+			next := index
+			for next < len(runes) && unicode.IsSpace(runes[next]) {
+				next++
+			}
+			if next < len(runes) && (runes[next] == '.' || runes[next] == '?' && next+1 < len(runes) && runes[next+1] == '.') {
+				index = next - 1
+				continue
+			}
+		}
+		out.WriteRune(runes[index])
+	}
+	return strings.TrimSpace(out.String())
 }
 
 func explicitReceiverSourceBefore(source string, start int) string {
@@ -1324,7 +1627,7 @@ func isLexicalSymbol(symbol analysis.Symbol) bool {
 		symbol.Kind == analysis.KindProperty && symbol.ScopeEndByte > symbol.EndByte
 }
 
-func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.Reference, candidate analysis.Symbol) (int, bool) {
+func (i *Index) callCompatibilityLocked(ctx context.Context, file *analysis.ParsedFile, ref analysis.Reference, candidate analysis.Symbol) (int, bool) {
 	doc := i.docs[file.URI]
 	if doc == nil {
 		doc = i.indexedDocs[file.URI]
@@ -1356,7 +1659,7 @@ func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.
 		return -1 << 20, true
 	}
 	score, typed := 0, true
-	ownerBindings, ownerBindingsKnown := i.receiverOwnerTypeBindingsLocked(file, ref, candidate)
+	ownerBindings, ownerBindingsKnown := i.receiverOwnerTypeBindingsLocked(ctx, file, ref, candidate)
 	provided := make(map[int]bool, len(ref.Arguments))
 	inferredTypeParameters := make(map[string]string, len(candidate.TypeParameters))
 	for n, argumentRange := range ref.Arguments {
@@ -1382,7 +1685,9 @@ func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.
 		}
 		provided[parameterIndex] = true
 		parameter := candidate.Parameters[parameterIndex]
-		expectedType := strings.TrimSpace(substituteTypeBindings(parameter.Type, ownerBindings))
+		// Spelled as the declaring file spelled it: `UUID` in ColorDto.kt is an
+		// import the call site need not share.
+		expectedType := strings.TrimSpace(substituteTypeBindings(i.respellDeclaredTypeLocked(file, candidate, parameter.Type), ownerBindings))
 		if parameter.Variadic || strings.Contains(expectedType, "...") || strings.Contains(expectedType, "vararg") {
 			expectedType = variadicElementType(expectedType)
 		}
@@ -1407,10 +1712,51 @@ func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.
 			score += 48
 			continue
 		}
+		// `mapping(Product::create)`: a callable reference fits a function
+		// type only with as many parameters as the referenced function takes.
+		// jOOQ overloads `mapping` for Function1 to Function22 and nothing
+		// else tells them apart.
+		if file.Language == analysis.LanguageKotlin {
+			if reference := callableReferenceArgument.FindStringSubmatch(strings.TrimSpace(expression)); reference != nil && reference[2] != "class" {
+				expectedParameters := kotlinFunctionParameterTypes(expectedType)
+				functional := expectedParameters != nil || strings.Contains(expectedType, "->")
+				if !functional {
+					if sam := i.samFunctionTypeLocked(candidate, expectedType); sam != "" {
+						expectedParameters, functional = kotlinFunctionParameterTypes(sam), true
+					}
+				}
+				if functional {
+					arities := i.callableReferenceAritiesLocked(ctx, file, reference[1], reference[2], ref.StartByte)
+					if len(arities) > 0 {
+						if !arities[len(expectedParameters)] {
+							return -1 << 20, true
+						}
+						score += 40
+						continue
+					}
+				}
+			}
+		}
+		// `dependencies { implementation(...) }` has no arrow, but braces make
+		// it a lambda all the same, and a lambda never converts to a class:
+		// Gradle's `dependencies(Closure)` is not the Kotlin DSL's call.
+		if trimmed := strings.TrimSpace(expression); file.Language == analysis.LanguageKotlin && strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") &&
+			len(kotlinFunctionParameterTypes(expectedType)) == 0 && !strings.Contains(expectedType, "->") && i.samFunctionTypeLocked(candidate, expectedType) == "" && i.provablyNotFunctionalLocked(candidate, expectedType) {
+			return -1 << 20, true
+		}
 		if lambdaArity, lambda := untypedLambdaArity(expression); lambda {
 			expectedParameters := kotlinFunctionParameterTypes(expectedType)
 			if file.Language == analysis.LanguageJava {
 				expectedParameters = i.functionalParameterTypesLocked(file, expectedType)
+			}
+			if expectedParameters == nil && file.Language == analysis.LanguageKotlin {
+				if sam := i.samFunctionTypeLocked(candidate, expectedType); sam != "" {
+					expectedParameters = kotlinFunctionParameterTypes(sam)
+				} else if i.provablyNotFunctionalLocked(candidate, expectedType) {
+					// `dependencies(Closure)` from Kotlin: a lambda is no
+					// Groovy Closure, so the Kotlin DSL's extension is the call.
+					return -1 << 20, true
+				}
 			}
 			if expectedParameters == nil {
 				typed = false
@@ -1436,7 +1782,7 @@ func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.
 			score += 28
 			continue
 		}
-		inferred := i.inferExpressionResultLocked(file, expression, ref.StartByte)
+		inferred := i.inferExpressionResultLocked(ctx, file, expression, ref.StartByte)
 		actualType := strings.TrimSpace(inferred.Type)
 		if inferred.Expression.Kind == expressionUnknown || inferred.Expression.Kind == expressionBlock {
 			typed = false
@@ -1454,16 +1800,23 @@ func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.
 			score += 2
 		}
 		if typeContainsAnyParameter(expectedType, candidate.TypeParameters) {
-			if !i.inferTypeParameterBindingsLocked(file, expectedType, actualType, candidate.TypeParameters, inferredTypeParameters) {
+			if !i.inferTypeParameterBindingsLocked(ctx, file, expectedType, actualType, candidate.TypeParameters, inferredTypeParameters) {
 				typed = false
 				continue
 			}
-			if substituted := substituteTypeBindings(expectedType, inferredTypeParameters); substituted != expectedType && !i.typePatternApplicableLocked(file, substituted, actualType) {
+			if substituted := substituteTypeBindings(expectedType, inferredTypeParameters); substituted != expectedType && !i.typePatternApplicableLocked(ctx, file, substituted, actualType) {
 				return -1 << 20, true
 			}
 			// A solved type variable is applicable evidence but is less specific
 			// than an otherwise equal concrete parameter.
 			score += 28
+			continue
+		}
+		// `Field<T>.eq(T)` on a receiver whose binding of T was not worked out:
+		// the expected type is still the owner's type variable, which says
+		// nothing about this argument -- it is not a mismatch.
+		if owner := i.symbols[candidate.ContainerID]; owner != nil && typeContainsAnyParameter(expectedType, owner.TypeParameters) {
+			typed = false
 			continue
 		}
 		identity, identityKnown := i.typesIdenticalAtLocked(file, actualType, expectedType, ref.StartByte)
@@ -1472,7 +1825,7 @@ func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.
 		} else if file.Language == analysis.LanguageKotlin {
 			if conversion, ok := kotlinIntegerLiteralConversionScore(expression, expected); ok {
 				score += conversion
-			} else if subtype, known := i.subtypeRelationAtLocked(file, actualType, expectedType, ref.StartByte); subtype {
+			} else if subtype, known := i.subtypeRelationAtLocked(ctx, file, actualType, expectedType, ref.StartByte); subtype {
 				score += 24
 			} else if !known || !identityKnown {
 				typed = false
@@ -1480,7 +1833,7 @@ func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.
 			} else {
 				return -1 << 20, true
 			}
-		} else if subtype, known := i.subtypeRelationAtLocked(file, actualType, expectedType, ref.StartByte); subtype {
+		} else if subtype, known := i.subtypeRelationAtLocked(ctx, file, actualType, expectedType, ref.StartByte); subtype {
 			score += 24
 		} else if file.Language == analysis.LanguageJava {
 			if conversion, ok := javaConstantInvocationConversionScore(expression, expected); ok {
@@ -1522,7 +1875,7 @@ func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.
 			typed = false
 			continue
 		}
-		if !i.typeArgumentSatisfiesBoundsLocked(file, inferred, bounds) {
+		if !i.typeArgumentSatisfiesBoundsLocked(ctx, file, inferred, bounds) {
 			return -1 << 20, true
 		}
 	}
@@ -1566,7 +1919,7 @@ func (i *Index) callCompatibilityLocked(file *analysis.ParsedFile, ref analysis.
 // its own type parameter bounded by an owner parameter (CrudRepository's
 // `<S extends T> S save(S)` is the common example); checking `S` against the
 // literal spelling `T` incorrectly rejects an otherwise proven call.
-func (i *Index) receiverOwnerTypeBindingsLocked(file *analysis.ParsedFile, ref analysis.Reference, candidate analysis.Symbol) (map[string]string, bool) {
+func (i *Index) receiverOwnerTypeBindingsLocked(ctx context.Context, file *analysis.ParsedFile, ref analysis.Reference, candidate analysis.Symbol) (map[string]string, bool) {
 	owner := i.symbols[candidate.ContainerID]
 	if owner == nil || len(owner.TypeParameters) == 0 {
 		return nil, true
@@ -1582,12 +1935,12 @@ func (i *Index) receiverOwnerTypeBindingsLocked(file *analysis.ParsedFile, ref a
 	if qualifier == "" {
 		return nil, false
 	}
-	receiverType := i.inferExpressionTypeLocked(file, qualifier, ref.StartByte)
+	receiverType := i.inferExpressionTypeLocked(ctx, file, qualifier, ref.StartByte)
 	if receiverType == "" {
 		return nil, false
 	}
 	var found map[string]string
-	for _, instantiated := range i.instantiatedTypeHierarchyLocked(file, receiverType) {
+	for _, instantiated := range i.instantiatedTypeHierarchyLocked(ctx, file, receiverType) {
 		if instantiated.symbol.ID != owner.ID || len(instantiated.arguments) != len(owner.TypeParameters) {
 			continue
 		}
@@ -1628,12 +1981,12 @@ func typeContainsAnyParameter(value string, parameters []string) bool {
 	return false
 }
 
-func (i *Index) typePatternApplicableLocked(file *analysis.ParsedFile, expected, actual string) bool {
-	if sameJvmType(expected, actual) || i.isSubtypeLocked(file, actual, expected) {
+func (i *Index) typePatternApplicableLocked(ctx context.Context, file *analysis.ParsedFile, expected, actual string) bool {
+	if sameJvmType(expected, actual) || i.isSubtypeLocked(ctx, file, actual, expected) {
 		return true
 	}
 	expectedBase, expectedArguments := splitInstantiatedType(expected)
-	for _, owner := range i.instantiatedTypeHierarchyLocked(file, actual) {
+	for _, owner := range i.instantiatedTypeHierarchyLocked(ctx, file, actual) {
 		if !sameJvmType(owner.symbol.Name, expectedBase) && !sameJvmType(owner.symbol.FQN, expectedBase) || len(owner.arguments) != len(expectedArguments) {
 			continue
 		}
@@ -1759,9 +2112,33 @@ func explicitLambdaParameterTypes(expression string, language analysis.Language)
 	return types, true
 }
 
-func (i *Index) typeArgumentSatisfiesBoundsLocked(file *analysis.ParsedFile, actual string, bounds []string) bool {
+func (i *Index) typeArgumentSatisfiesBoundsLocked(ctx context.Context, file *analysis.ParsedFile, actual string, bounds []string) bool {
+	memo, _ := ctx.Value(receiverSpellingsKey{}).(*receiverSpellingsMemo)
 	for _, bound := range bounds {
-		if !sameJvmType(actual, bound) && !i.isSubtypeLocked(file, actual, bound) {
+		if sameJvmType(actual, bound) {
+			continue
+		}
+		key := string(file.URI) + "\x00" + actual + "\x00" + bound
+		if memo != nil {
+			memo.mu.Lock()
+			known, ok := memo.subtypes[key]
+			memo.mu.Unlock()
+			if ok {
+				if !known {
+					return false
+				}
+				continue
+			}
+		}
+		subtype := i.isSubtypeLocked(ctx, file, actual, bound)
+		if memo != nil && ctx.Err() == nil {
+			memo.mu.Lock()
+			if len(memo.subtypes) < 4096 {
+				memo.subtypes[key] = subtype
+			}
+			memo.mu.Unlock()
+		}
+		if !subtype {
 			return false
 		}
 	}
@@ -2158,12 +2535,12 @@ func javaInvocationType(value string) string {
 	}
 }
 
-func (i *Index) isSubtypeLocked(file *analysis.ParsedFile, actual, expected string) bool {
-	matched, _ := i.subtypeRelationAtLocked(file, actual, expected, -1)
+func (i *Index) isSubtypeLocked(ctx context.Context, file *analysis.ParsedFile, actual, expected string) bool {
+	matched, _ := i.subtypeRelationAtLocked(ctx, file, actual, expected, -1)
 	return matched
 }
 
-func (i *Index) subtypeRelationAtLocked(file *analysis.ParsedFile, actual, expected string, at int) (bool, bool) {
+func (i *Index) subtypeRelationAtLocked(ctx context.Context, file *analysis.ParsedFile, actual, expected string, at int) (bool, bool) {
 	if file == nil || strings.TrimSpace(actual) == "" || strings.TrimSpace(expected) == "" {
 		return false, false
 	}
@@ -2191,7 +2568,7 @@ func (i *Index) subtypeRelationAtLocked(file *analysis.ParsedFile, actual, expec
 		return false, false
 	}
 	access := newAccessibilityMemoLocked(i, file)
-	hierarchy, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(context.Background(), file, actual, maxResolutionCandidates, access)
+	hierarchy, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, actual, maxResolutionCandidates, access)
 	if !complete || access.workExhausted || len(hierarchy) == 0 {
 		return false, false
 	}
@@ -2204,10 +2581,6 @@ func (i *Index) subtypeRelationAtLocked(file *analysis.ParsedFile, actual, expec
 }
 
 func memberKey(container, name string) string { return container + "\x00" + name }
-
-func matchesArity(symbol analysis.Symbol, count int) bool {
-	return matchesArityForLanguage(symbol, count, analysis.LanguageKotlin)
-}
 
 func matchesArityForLanguage(symbol analysis.Symbol, count int, language analysis.Language) bool {
 	if len(symbol.Parameters) == count {
@@ -2228,6 +2601,17 @@ func matchesArityForLanguage(symbol analysis.Symbol, count int, language analysi
 		}
 	}
 	return count >= required && (variadic || count <= len(symbol.Parameters))
+}
+
+// takesArityWithoutVararg reports whether a call with count arguments fits
+// symbol without spreading any of them into a vararg.
+func takesArityWithoutVararg(symbol analysis.Symbol, count int, language analysis.Language) bool {
+	for _, parameter := range symbol.Parameters {
+		if parameter.Variadic || strings.Contains(parameter.Type, "...") || strings.Contains(parameter.Type, "vararg") {
+			return false
+		}
+	}
+	return matchesArityForLanguage(symbol, count, language)
 }
 
 // simpleNameInScopeLocked reports whether a declaration can be named by its
@@ -2273,4 +2657,20 @@ func (i *Index) simpleNameInScopeLocked(file *analysis.ParsedFile, symbol analys
 	// A declaration the index recorded without a package cannot be placed, so
 	// it is accepted rather than hidden.
 	return symbol.Package == ""
+}
+
+// thisSmartCastTypesLocked lists the types the implicit receiver is refined to
+// at offset: inside `when (this) { is A -> ... }` the receiver is an A, and A's
+// members are bare names there.
+func (i *Index) thisSmartCastTypesLocked(file *analysis.ParsedFile, at int) []string {
+	if file == nil {
+		return nil
+	}
+	var types []string
+	for _, cast := range i.fileSmartCastsByName[file.URI]["this"] {
+		if cast.StartByte <= at && at <= cast.EndByte {
+			types = append(types, cast.Type)
+		}
+	}
+	return types
 }

@@ -476,6 +476,7 @@ func TestLocalTypeLookupHonorsDeclarationOrder(t *testing.T) {
 }
 
 func TestHierarchyExhaustsTypeAliasEdgesBeforeNextDistance(t *testing.T) {
+	ctx := context.Background()
 	idx := New(nil)
 	defer idx.Close()
 	uri := protocol.URI("file:///workspace/AliasDistance.kt")
@@ -484,7 +485,7 @@ func TestHierarchyExhaustsTypeAliasEdgesBeforeNextDistance(t *testing.T) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	file := idx.files[uri]
-	owners := idx.instantiatedTypeHierarchyLocked(file, "Via & Alias")
+	owners := idx.instantiatedTypeHierarchyLocked(ctx, file, "Via & Alias")
 	for _, owner := range owners {
 		if owner.symbol.Name == "Root" {
 			if owner.distance != 0 {
@@ -1215,28 +1216,36 @@ func TestCompletionStaysBelowBudgetDuringLibraryInsertion(t *testing.T) {
 		}
 		files[fileIndex].Parsed = parsed
 	}
+	// The point is that completion stays responsive while library insertion
+	// holds the index, so insertion must still be running while the requests
+	// are measured. A single batch lands before a fast machine can ask twice,
+	// which failed the test for having nothing to contend with; feeding rounds
+	// until enough requests have been served measures the same thing without
+	// depending on how quick this machine is.
+	stopInserting := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
-		idx.AddLibraryBatch(files)
-		close(done)
+		defer close(done)
+		for round := 0; round < 64; round++ {
+			select {
+			case <-stopInserting:
+				return
+			default:
+			}
+			idx.AddLibraryBatch(files)
+		}
 	}()
-	requests := 0
-	for {
+	for requests := 0; requests < 4; requests++ {
 		started := time.Now()
 		_ = idx.Completion(uri, position, 150)
 		if elapsed := time.Since(started); elapsed >= testTimingBudget {
+			close(stopInserting)
+			<-done
 			t.Fatalf("completion blocked for %s during library insertion", elapsed)
 		}
-		requests++
-		select {
-		case <-done:
-			if requests < 2 {
-				t.Fatalf("library insertion completed before contention was exercised")
-			}
-			return
-		default:
-		}
 	}
+	close(stopInserting)
+	<-done
 }
 
 func TestLibrarySummaryDropsLocalsButKeepsMembers(t *testing.T) {
@@ -2044,7 +2053,7 @@ func TestKotlinBinaryTypesAreTransformedByToken(t *testing.T) {
 	if supportedKotlinMetadataVersion([]int{3, 0, 0}) {
 		t.Fatal("unknown Kotlin metadata major version was accepted")
 	}
-	if supportedKotlinMetadataVersion([]int{2, 3, 0}) {
+	if supportedKotlinMetadataVersion([]int{2, 9, 0}) {
 		t.Fatal("unknown Kotlin metadata minor version was accepted")
 	}
 	if supportedKotlinMetadataVersion([]int{2}) {
@@ -2054,7 +2063,7 @@ func TestKotlinBinaryTypesAreTransformedByToken(t *testing.T) {
 
 func TestKotlinMetadataFailsClosedForUnknownAndMalformedSchemas(t *testing.T) {
 	for _, metadata := range []*classfile.KotlinMetadata{
-		{Kind: 1, MetadataVersion: []int{2, 3, 0}, Data1: []string{"future"}},
+		{Kind: 1, MetadataVersion: []int{2, 9, 0}, Data1: []string{"future"}},
 		{Kind: 1, MetadataVersion: []int{2, 2, 0}, Data1: []string{"\x00\x80"}},
 	} {
 		parsed := &analysis.ParsedFile{Language: analysis.LanguageJava, Symbols: []analysis.Symbol{{ID: "owner", Name: "Binary", FQN: "demo.Binary", Kind: analysis.KindClass}}}
@@ -2629,8 +2638,8 @@ func TestParameterHintsMapNamedAndRepeatedVarargArguments(t *testing.T) {
 	idx.Open(context.Background(), protocol.TextDocumentItem{URI: uri, LanguageID: "kotlin", Version: 1, Text: source})
 	doc := textdoc.NewDocument(uri, "kotlin", 1, source)
 	hints := idx.ParameterHints(uri, doc.Range(0, len(source)))
-	if len(hints) != 3 {
-		t.Fatalf("parameter hints = %#v, want three vararg hints and no redundant named-argument hints", hints)
+	if len(hints) != 1 {
+		t.Fatalf("parameter hints = %#v, want one hint before the vararg's first element and no redundant named-argument hints", hints)
 	}
 	for _, hint := range hints {
 		if hint.Label != "values:" || hint.ParameterIndex != 0 {
@@ -2806,5 +2815,46 @@ func TestOpenIgnoresLibraryMirrorFilesOfAnyVersion(t *testing.T) {
 	}
 	if len(idx.OpenDocuments()) != 0 || len(idx.WorkspaceFiles()) != 0 {
 		t.Fatalf("mirror file entered the index: %v", idx.OpenDocuments())
+	}
+}
+
+func TestRuntimeClasspathSkipsSourcelessAggregatorModules(t *testing.T) {
+	root := t.TempDir()
+	appDir, libDir := filepath.Join(root, "app"), filepath.Join(root, "lib")
+	appMain, libMain := filepath.Join(appDir, "src", "main", "kotlin"), filepath.Join(libDir, "src", "main", "kotlin")
+	if err := os.MkdirAll(filepath.Join(libDir, "build", "classes", "kotlin", "main"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	idx := New(nil)
+	defer idx.Close()
+	// :services is a build-model project with no sources, so the index holds
+	// no module for it; :app still depends on it alongside :lib.
+	idx.setModules([]ModuleInfo{
+		{Name: ":app", Root: root, Dir: appDir, SourceRoots: []string{appMain}, SourceSets: map[string][]string{"main": {appMain}},
+			RuntimeDependenciesBySourceSet: map[string][]string{"main": {":lib", ":services"}},
+			RuntimeClasspathBySourceSet:    map[string][]string{"main": {"/deps/driver.jar"}}},
+		{Name: ":lib", Root: root, Dir: libDir, SourceRoots: []string{libMain}, SourceSets: map[string][]string{"main": {libMain}}},
+	})
+	runtime := idx.RuntimeClasspathFor(uriutil.File(filepath.Join(appMain, "Main.kt")))
+	for _, want := range []string{"/deps/driver.jar", filepath.Join(libDir, "build", "classes", "kotlin", "main")} {
+		if !containsString(runtime, want) {
+			t.Fatalf("runtime classpath %#v is missing %s", runtime, want)
+		}
+	}
+}
+
+func TestRuntimeClasspathStopsOnAmbiguousModules(t *testing.T) {
+	root := t.TempDir()
+	appMain := filepath.Join(root, "app", "src", "main", "kotlin")
+	idx := New(nil)
+	defer idx.Close()
+	idx.setModules([]ModuleInfo{
+		{Name: ":app", Root: root, Dir: filepath.Join(root, "app"), SourceRoots: []string{appMain}, SourceSets: map[string][]string{"main": {appMain}},
+			RuntimeDependenciesBySourceSet: map[string][]string{"main": {":lib"}}},
+		{Name: ":lib", Root: root, Dir: filepath.Join(root, "lib-a")},
+		{Name: ":lib", Root: root, Dir: filepath.Join(root, "lib-b")},
+	})
+	if runtime := idx.RuntimeClasspathFor(uriutil.File(filepath.Join(appMain, "Main.kt"))); runtime != nil {
+		t.Fatalf("ambiguous dependency produced a guessed runtime classpath: %#v", runtime)
 	}
 }

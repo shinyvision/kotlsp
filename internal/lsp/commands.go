@@ -590,10 +590,6 @@ func (s *Server) applyModCommand(ctx context.Context, args []json.RawMessage) (a
 	return true, nil
 }
 
-func (s *Server) executeModCommand(ctx context.Context, command map[string]any) error {
-	return s.executeModCommandState(ctx, command, make(map[string]string))
-}
-
 func (s *Server) executeModCommandState(ctx context.Context, command map[string]any, changedFiles map[string]string) error {
 	kind := commandKind(command)
 	switch {
@@ -887,10 +883,22 @@ func (s *Server) applyCompletionCommand(ctx context.Context, command string, arg
 		}
 		s.completionMu.Unlock()
 		if !ok {
+			s.log.Printf("completion apply: session %d is gone", id)
 			return nil, &jsonrpc.ResponseError{Code: -32803, Message: "completion session has expired"}
 		}
+		if application.ImportFQN != "" {
+			// Place the import against the document as it is now.
+			if fresh, needed := s.currentImportEdit(ctx, application.URI, application.ImportFQN); needed {
+				edit := protocol.WorkspaceEdit{Changes: map[protocol.URI][]protocol.TextEdit{application.URI: {fresh}}}
+				application.Edit = &edit
+			} else {
+				application.Edit = nil
+			}
+		}
+		s.log.Printf("completion apply: session %d import=%q edit=%v", id, application.ImportFQN, application.Edit != nil)
 		if application.Edit != nil {
 			if err := s.applyWorkspaceEdit(ctx, "Apply Kotlin completion", *application.Edit); err != nil {
+				s.log.Printf("completion apply: applying the edit failed: %v", err)
 				return nil, &jsonrpc.ResponseError{Code: jsonrpc.InternalError, Message: err.Error()}
 			}
 		}
@@ -1004,4 +1012,22 @@ func lspURI(value string) protocol.URI {
 		return uriutil.File(value)
 	}
 	return uriutil.File(value)
+}
+
+// currentImportEdit computes the edit that imports fqn into the document as it
+// is now. needed is false when the import is already present, as when two
+// accepted items name the same type.
+func (s *Server) currentImportEdit(ctx context.Context, uri protocol.URI, fqn string) (protocol.TextEdit, bool) {
+	doc, ok := s.index.DocumentContext(ctx, uri)
+	if !ok {
+		return protocol.TextEdit{}, false
+	}
+	if file, parsed := s.index.Parsed(uri); parsed && file != nil {
+		for _, imported := range file.Imports {
+			if imported.Path == fqn {
+				return protocol.TextEdit{}, false
+			}
+		}
+	}
+	return addImportEdit(doc.Text, uri, fqn)
 }

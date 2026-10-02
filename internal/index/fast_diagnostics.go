@@ -1,8 +1,10 @@
 package index
 
 import (
+	"context"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
 	"github.com/shinyvision/kotlsp/internal/protocol"
@@ -42,7 +44,7 @@ type fastRule struct {
 	// wait until the symbol universe they reason about is complete.
 	usesWorkspaceIndex bool
 	// apply returns findings that are provably errors.
-	apply func(i *Index, file *analysis.ParsedFile) []protocol.Diagnostic
+	apply func(ctx context.Context, i *Index, file *analysis.ParsedFile) []protocol.Diagnostic
 }
 
 // fastRules is the registry. Order is irrelevant: every rule sees the same
@@ -77,7 +79,7 @@ func (r fastRule) handles(language analysis.Language) bool {
 // cold scan. Rules whose proof depends on absence or uniqueness in the symbol
 // universe wait for a complete index and modelled generated sources. Syntax
 // damage is declaration-local: independent declarations on either side survive.
-func (i *Index) fastDiagnosticsLocked(file *analysis.ParsedFile) []protocol.Diagnostic {
+func (i *Index) fastDiagnosticsLocked(ctx context.Context, file *analysis.ParsedFile) []protocol.Diagnostic {
 	if file == nil || !predictionsApplyTo(file) {
 		return nil
 	}
@@ -86,7 +88,7 @@ func (i *Index) fastDiagnosticsLocked(file *analysis.ParsedFile) []protocol.Diag
 		if rule.apply == nil || !rule.handles(file.Language) || !i.fastRuleEligibleLocked(file, rule) {
 			continue
 		}
-		findings := rule.apply(i, file)
+		findings := rule.apply(ctx, i, file)
 		remaining := maxCompilerDiagnosticsPerFile - len(out)
 		if remaining <= 0 {
 			break
@@ -168,6 +170,53 @@ type FastDiagnosticStatus struct {
 // workspace-dependent predictions currently abstain. It never returns file
 // names or an unbounded per-document list.
 func (i *Index) FastDiagnosticStatus() FastDiagnosticStatus {
+	guard := i.lockGuard()
+	defer guard.release()
+	ctx := context.Background()
+	// The answer changes only when the index does, yet computing it evaluates
+	// the rules over a sample of files while holding the global read lock -- a
+	// second or more, during which a waiting writer also blocks every new
+	// reader. A client polling status (to wait for readiness, or a status
+	// line) kept the server saturated. Answer from memory while nothing moved.
+	guard.RLock()
+	key := fastStatusKey{
+		semantic: i.semanticVersion, environment: i.semanticEnvironmentVersion,
+		state: i.diagnosticStateVersion.Load(), declarations: i.late.declarations.Load(),
+		progress: i.Progress(),
+	}
+	guard.RUnlock()
+	i.fastStatusMu.Lock()
+	if i.fastStatusValid && i.fastStatusKey == key && time.Since(i.fastStatusAt) < fastStatusMaxAge {
+		cached := cloneFastDiagnosticStatus(i.fastStatus)
+		i.fastStatusMu.Unlock()
+		return cached
+	}
+	i.fastStatusMu.Unlock()
+	status := i.computeFastDiagnosticStatus(ctx)
+	i.fastStatusMu.Lock()
+	i.fastStatus, i.fastStatusKey, i.fastStatusAt, i.fastStatusValid = cloneFastDiagnosticStatus(status), key, time.Now(), true
+	i.fastStatusMu.Unlock()
+	return status
+}
+
+const fastStatusMaxAge = 30 * time.Second
+
+type fastStatusKey struct {
+	semantic, environment, state, declarations uint64
+	progress                                   Progress
+}
+
+func cloneFastDiagnosticStatus(status FastDiagnosticStatus) FastDiagnosticStatus {
+	status.Codes = append([]string(nil), status.Codes...)
+	reasons := make(map[string]int, len(status.UnavailableFilesByReason))
+	for reason, count := range status.UnavailableFilesByReason {
+		reasons[reason] = count
+	}
+	status.UnavailableFilesByReason = reasons
+	return status
+}
+
+func (i *Index) computeFastDiagnosticStatus(ctx context.Context) FastDiagnosticStatus {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	status := FastDiagnosticStatus{UnavailableFilesByReason: make(map[string]int)}
@@ -191,12 +240,27 @@ func (i *Index) FastDiagnosticStatus() FastDiagnosticStatus {
 	}
 	sort.Strings(status.Codes)
 	progress := i.Progress()
+	// While the project is still being indexed, evaluating the rules over a
+	// half-built index is meaningless (most files would report missing
+	// declarations) and holds the read lock the indexer needs: a client polling
+	// for readiness slowed down the very scan it was waiting for. The reasons
+	// below are cheap and stay; only the evaluation waits for a ready index.
 	// Status is a foreground request. Rule evaluation is intentionally sampled
 	// over a bounded file set; StatusTruncated makes the aggregate explicitly a
 	// lower bound instead of monopolizing the global read lock on a large tree.
+	// Sample the workspace, not the classpath. i.files is dominated by library
+	// entries -- 57840 of them against 58 sources on an ordinary Spring
+	// project -- so a bounded walk of the whole map reported only archive
+	// files, which belong to no module and therefore abstain. The status then
+	// read "0 eligible, every file abstained: generated declarations have not
+	// been indexed", describing a classpath nobody asked about while the
+	// author's own files were eligible.
 	const maxStatusFiles = 256
-	for _, file := range i.files {
+	for uri, file := range i.files {
 		if file == nil {
+			continue
+		}
+		if _, library := i.librarySources[uri]; library {
 			continue
 		}
 		if status.Files >= maxStatusFiles {
@@ -213,7 +277,9 @@ func (i *Index) FastDiagnosticStatus() FastDiagnosticStatus {
 		} else if predictionsApplyTo(file) {
 			status.WorkspaceAbstainedFiles++
 		}
-		status.CurrentPredictions += len(i.fastDiagnosticsLocked(file))
+		if progress.Ready {
+			status.CurrentPredictions += len(i.fastDiagnosticsLocked(ctx, file))
+		}
 		switch {
 		case !predictionsApplyTo(file):
 			status.UnavailableFilesByReason["script classpath is owned by the build tool"]++
@@ -362,6 +428,27 @@ func reconcilePredictions(predictions, compiler []protocol.Diagnostic) ([]protoc
 			continue
 		}
 		keptPredictions = append(keptPredictions, diagnostic)
+	}
+	// A deprecation is the one finding both sides state in their own words:
+	// the index names the declaration, the compiler renders its signature
+	// ("'class Foo : Bar' is deprecated. Deprecated in Java."). Neither code
+	// nor message can match, so the reader saw the same deprecation twice on
+	// one line. The compiler's copy is the authoritative one.
+	deprecatedByCompiler := make(map[int]bool)
+	for _, diagnostic := range keptCompiler {
+		if code, _ := diagnostic.Code.(string); strings.EqualFold(code, "DEPRECATION") {
+			deprecatedByCompiler[diagnostic.Range.Start.Line] = true
+		}
+	}
+	if len(deprecatedByCompiler) > 0 {
+		filtered := keptPredictions[:0]
+		for _, diagnostic := range keptPredictions {
+			if code, _ := diagnostic.Code.(string); code == "deprecated" && deprecatedByCompiler[diagnostic.Range.Start.Line] {
+				continue
+			}
+			filtered = append(filtered, diagnostic)
+		}
+		keptPredictions = filtered
 	}
 	return keptPredictions, keptCompiler
 }

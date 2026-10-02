@@ -12,11 +12,6 @@ import (
 
 const maxInspectedChildren = 200
 
-func expandableResult(value string) bool {
-	trimmed := strings.TrimSpace(value)
-	return trimmed != "" && trimmed != "null" && trimmed != "true" && trimmed != "false" && !allDigits(trimmed)
-}
-
 func childExpression(parent, name string) string {
 	if strings.HasPrefix(name, "[") {
 		return parent + name

@@ -373,7 +373,7 @@ func TestFormatterHonorsCanceledContext(t *testing.T) {
 func TestFormatterNormalizesSafeKotlinAndJavaSpacing(t *testing.T) {
 	options := protocol.FormattingOptions{TabSize: 4, InsertSpaces: true}
 	kotlin := formatSource("class Demo{\nfun sum(first:Int,second:Int):Int{return first+second}\n}\n", options, true)
-	for _, expected := range []string{"class Demo {", "fun sum(first: Int, second: Int): Int {\n        return first + second\n    }"} {
+	for _, expected := range []string{"class Demo {", "    fun sum(first: Int, second: Int): Int { return first + second }"} {
 		if !strings.Contains(kotlin, expected) {
 			t.Fatalf("Kotlin formatter lacks %q:\n%s", expected, kotlin)
 		}
@@ -408,7 +408,9 @@ func TestFormatterSeparatesEnumConstantsFromMembers(t *testing.T) {
 		t.Fatalf("Java enum formatting:\ngot:\n%s\nwant:\n%s", java, expected)
 	}
 	kotlin := formatSource(`enum class K{A,B;fun x():Int{return 1}}`, options, true)
-	if expected := "enum class K {\n    A, B;\n    fun x(): Int {\n        return 1\n    }\n}"; kotlin != expected {
+	// Kotlin keeps one-line blocks on one line, as ktlint does; only Java's
+	// convention expands them.
+	if expected := "enum class K { A, B; fun x(): Int { return 1 } }"; kotlin != expected {
 		t.Fatalf("Kotlin enum formatting:\ngot:\n%s\nwant:\n%s", kotlin, expected)
 	}
 }
@@ -449,7 +451,7 @@ func TestRangeFormattingPreservesLinesOutsideSelection(t *testing.T) {
 	if !strings.HasPrefix(formatted, "class Demo{\nfun untouched( ):Int{return 1}\n") {
 		t.Fatalf("range formatting changed text before the selection:\n%s", formatted)
 	}
-	if !strings.Contains(formatted, "    fun target(value: Int): Int {\n        return value + 1\n    }") {
+	if !strings.Contains(formatted, "    fun target(value: Int): Int { return value + 1 }") {
 		t.Fatalf("selected line was not formatted:\n%s", formatted)
 	}
 }
@@ -657,7 +659,9 @@ func TestInlayHintInfersConstructorAndFactoryTypes(t *testing.T) {
 			serviceHints++
 		}
 	}
-	if serviceHints != 2 {
+	// `val direct = Service()` names its type already; only the factory
+	// call's result needs a hint.
+	if serviceHints != 1 {
 		t.Fatalf("Service inlay hints = %#v", result)
 	}
 }
@@ -1320,4 +1324,27 @@ func containsCompletionLabel(items []protocol.CompletionItem, label string) bool
 		}
 	}
 	return false
+}
+
+// The built-in formatter runs where the build declares no formatter. On
+// ktlint-clean Kotlin it must change nothing, and it must never turn type
+// arguments into comparisons or flatten Kotlin's continuation indents.
+func TestKotlinFormatterKeepsKtlintLayout(t *testing.T) {
+	options := protocol.FormattingOptions{TabSize: 4, InsertSpaces: true}
+	for _, source := range []string{
+		"tasks.withType<JavaCompile> {\n    options.encoding = \"UTF-8\"\n}\n",
+		"val ids = items.map { it.id }\n    .toSet()\n",
+		"class A :\n    B(),\n    C {\n    val x = 1\n}\n",
+		"class Users(\n    private val repo: Repo,\n) : InternalUsers,\n    InternalDealerUsers {\n    fun f() = 1\n}\n",
+		"val value =\n    entries\n        .groupBy { it.value }\n        .filter { it.size > 1 }\n",
+		"fun f() = when (cell) {\n    is Fixed ->\n        dsl.insertInto(T)\n            .set(T.ID, id)\n            .setGrille(\n                grille,\n            )\n            .execute()\n    else -> null\n}\n",
+		"private fun <R : Record> Step<R>.props(\n    cell: Cell,\n): Step<R> = set(a, cell.a)\n    .set(b, cell.b)\n",
+		"fun `it works if the DFE doesn't have one`() {\n    val dfe = mockk<Env>()\n}\n",
+		"val total = first +\n    second\n",
+		"val node = Outer(\n    inner = Inner(\n        x = 1,\n    ),\n)\n",
+	} {
+		if formatted := formatSource(source, options, true); formatted != source {
+			t.Errorf("changed ktlint-clean source:\n%s\ninto:\n%s", source, formatted)
+		}
+	}
 }

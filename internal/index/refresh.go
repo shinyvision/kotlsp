@@ -33,10 +33,12 @@ type SourceFileStamp struct {
 // is incomplete; callers must then retain their previous snapshot rather than
 // infer deletions from partial data.
 func (i *Index) WorkspaceSourceSnapshot(ctx context.Context, limit int, verifyContent ...bool) (map[protocol.URI]SourceFileStamp, bool) {
-	i.mu.RLock()
+	guard := i.lockGuard()
+	defer guard.release()
+	guard.RLock()
 	modules := append([]ModuleInfo(nil), i.modules...)
 	roots := append([]string(nil), i.roots...)
-	i.mu.RUnlock()
+	guard.RUnlock()
 	forceContent := len(verifyContent) > 0 && verifyContent[0]
 	const maxVerifiedSourceBytes int64 = 2 << 30
 	var verifiedBytes int64
@@ -117,7 +119,7 @@ func (i *Index) WorkspaceSourceSnapshot(ctx context.Context, limit int, verifyCo
 				return snapshot, true
 			}
 			end := min(start+256, len(uris))
-			i.mu.RLock()
+			guard.RLock()
 			for _, uri := range uris[start:end] {
 				if file := i.files[uri]; file != nil {
 					stamp := snapshot[uri]
@@ -125,7 +127,7 @@ func (i *Index) WorkspaceSourceSnapshot(ctx context.Context, limit int, verifyCo
 					snapshot[uri] = stamp
 				}
 			}
-			i.mu.RUnlock()
+			guard.RUnlock()
 		}
 	}
 	return snapshot, exhausted || ctx.Err() != nil
@@ -171,6 +173,7 @@ func (i *Index) RefreshBuildChanges(ctx context.Context, changes []protocol.URI)
 		return done
 	}
 	go func() {
+		defer i.recoverBackground("RefreshBuildChanges")
 		defer finish()
 		defer close(done)
 		select {
@@ -193,6 +196,7 @@ func (i *Index) RefreshBuildChangesResult(ctx context.Context, changes []protoco
 		return done
 	}
 	go func() {
+		defer i.recoverBackground("RefreshBuildChangesResult")
 		defer finish()
 		done <- i.refreshBuildChanges(refreshCtx, changes)
 		close(done)
@@ -201,6 +205,8 @@ func (i *Index) RefreshBuildChangesResult(ctx context.Context, changes []protoco
 }
 
 func (i *Index) refreshBuildChanges(ctx context.Context, changes []protocol.URI) (succeeded bool) {
+	guard := i.lockGuard()
+	defer guard.release()
 	i.buildRefreshMu.Lock()
 	if ctx.Err() != nil || i.closed.Load() {
 		i.buildRefreshMu.Unlock()
@@ -222,10 +228,10 @@ func (i *Index) refreshBuildChanges(ctx context.Context, changes []protocol.URI)
 		}
 	}()
 	generation := i.generation.Load()
-	i.mu.RLock()
+	guard.RLock()
 	roots := append([]string(nil), i.roots...)
 	previousModules := append([]ModuleInfo(nil), i.modules...)
-	i.mu.RUnlock()
+	guard.RUnlock()
 	affectedRoots := make(map[string]bool)
 	archives := make(map[string]bool)
 	refreshAllArchives := len(changes) == 0
@@ -253,14 +259,14 @@ func (i *Index) refreshBuildChanges(ctx context.Context, changes []protocol.URI)
 		// attachments are not classpath entries, so include those explicitly or
 		// a fallback watcher would detect their fingerprint and then refresh
 		// nothing which could change navigation text.
-		i.mu.RLock()
+		guard.RLock()
 		for _, source := range i.librarySources {
 			archivePath := filepath.Clean(source.Archive)
 			if strings.HasSuffix(strings.ToLower(archivePath), "-sources.jar") && pathInAnyRoot(archivePath, affectedRoots) {
 				archives[archivePath] = true
 			}
 		}
-		i.mu.RUnlock()
+		guard.RUnlock()
 	}
 	if len(affectedRoots) == 0 || ctx.Err() != nil {
 		for archive := range archives {
@@ -373,7 +379,7 @@ func (i *Index) refreshBuildChanges(ctx context.Context, changes []protocol.URI)
 	// Determine deletions before the write phase. Foreground opens and revision
 	// changes are rechecked in each slice, so this snapshot cannot delete a
 	// newly opened or edited document.
-	i.mu.RLock()
+	guard.RLock()
 	staleSources := make([]protocol.URI, 0)
 	for uri := range i.files {
 		if i.docs[uri] != nil || i.librarySources[uri].Archive != "" || wantedSources[uri] {
@@ -383,11 +389,11 @@ func (i *Index) refreshBuildChanges(ctx context.Context, changes []protocol.URI)
 			staleSources = append(staleSources, uri)
 		}
 	}
-	i.mu.RUnlock()
+	guard.RUnlock()
 	i.workspaceCommitMu.Lock()
-	i.mu.Lock()
+	guard.Lock()
 	if ctx.Err() != nil || i.closed.Load() || i.generation.Load() != generation {
-		i.mu.Unlock()
+		guard.Unlock()
 		i.workspaceCommitMu.Unlock()
 		return false
 	}
@@ -412,12 +418,12 @@ func (i *Index) refreshBuildChanges(ctx context.Context, changes []protocol.URI)
 	i.replaceWorkspaceClasspathSliceLocked(oldPaths, newPaths)
 	i.modules = append([]ModuleInfo(nil), replacementModules...)
 	i.semanticEnvironmentVersion++
-	i.mu.Unlock()
+	guard.Unlock()
 	for start := 0; start < len(staleSources); start += 32 {
 		end := min(start+32, len(staleSources))
-		i.mu.Lock()
+		guard.Lock()
 		if i.closed.Load() {
-			i.mu.Unlock()
+			guard.Unlock()
 			i.workspaceCommitMu.Unlock()
 			return false
 		}
@@ -429,7 +435,7 @@ func (i *Index) refreshBuildChanges(ctx context.Context, changes []protocol.URI)
 				i.removeLocked(uri)
 			}
 		}
-		i.mu.Unlock()
+		guard.Unlock()
 	}
 	for start := 0; start < len(stagedSources); {
 		end, work := start, 0
@@ -441,9 +447,9 @@ func (i *Index) refreshBuildChanges(ctx context.Context, changes []protocol.URI)
 			work += weight
 			end++
 		}
-		i.mu.Lock()
+		guard.Lock()
 		if i.closed.Load() {
-			i.mu.Unlock()
+			guard.Unlock()
 			i.workspaceCommitMu.Unlock()
 			return false
 		}
@@ -456,7 +462,7 @@ func (i *Index) refreshBuildChanges(ctx context.Context, changes []protocol.URI)
 			i.replaceLocked(source.parsed)
 			i.fileGeneration[source.uri] = generation
 		}
-		i.mu.Unlock()
+		guard.Unlock()
 		start = end
 	}
 	i.workspaceCommitMu.Unlock()
@@ -504,6 +510,8 @@ type stagedWorkspaceSource struct {
 // before the module model is published. A failed or oversized inventory leaves
 // the previous model and all of its sources intact.
 func (i *Index) stageModuleSourceRefresh(ctx context.Context, modules, previous []ModuleInfo, affected map[string]bool) ([]stagedWorkspaceSource, map[protocol.URI]bool, map[string]bool, error) {
+	guard := i.lockGuard()
+	defer guard.release()
 	const maxRefreshEntries = 2_000_000
 	const maxRefreshSources = 100_000
 	const maxRefreshBytes int64 = 1 << 30
@@ -525,7 +533,7 @@ func (i *Index) stageModuleSourceRefresh(ctx context.Context, modules, previous 
 			}
 		}
 	}
-	i.mu.RLock()
+	guard.RLock()
 	indexed := make(map[protocol.URI]bool, len(i.files))
 	revisions := make(map[protocol.URI]uint64, len(i.documentRevision))
 	for uri := range i.files {
@@ -534,7 +542,7 @@ func (i *Index) stageModuleSourceRefresh(ctx context.Context, modules, previous 
 	for uri, revision := range i.documentRevision {
 		revisions[uri] = revision
 	}
-	i.mu.RUnlock()
+	guard.RUnlock()
 	wanted := make(map[protocol.URI]bool)
 	seenEntries := make(map[string]bool)
 	staged := make([]stagedWorkspaceSource, 0)
@@ -636,10 +644,12 @@ func minimalRefreshRoots(set map[string]bool) []string {
 }
 
 func (i *Index) clearLibraryAccessForRoots(modules []ModuleInfo, roots map[string]bool) {
-	i.mu.Lock()
+	guard := i.lockGuard()
+	defer guard.release()
+	guard.Lock()
 	i.clearLibraryAccessForRootsLocked(modules, roots)
 	i.semanticEnvironmentVersion++
-	i.mu.Unlock()
+	guard.Unlock()
 }
 
 func (i *Index) clearLibraryAccessForRootsLocked(modules []ModuleInfo, roots map[string]bool) {
@@ -757,13 +767,6 @@ func modulePathsWithinRoots(modules []ModuleInfo, roots map[string]bool) map[str
 	return paths
 }
 
-func (i *Index) replaceWorkspaceClasspathSlice(oldPaths, newPaths map[string]bool) {
-	i.mu.Lock()
-	i.replaceWorkspaceClasspathSliceLocked(oldPaths, newPaths)
-	i.semanticEnvironmentVersion++
-	i.mu.Unlock()
-}
-
 func (i *Index) replaceWorkspaceClasspathSliceLocked(oldPaths, newPaths map[string]bool) {
 	kept := i.classpath[:0]
 	for _, path := range i.classpath {
@@ -792,19 +795,21 @@ func containsPath(paths []string, wanted string) bool {
 }
 
 func (i *Index) refreshLibraryArchive(ctx context.Context, path string, requestedAccess ...map[string]bool) bool {
+	guard := i.lockGuard()
+	defer guard.release()
 	if ctx.Err() != nil || i.closed.Load() {
 		return false
 	}
 	path = filepath.Clean(path)
 	archive := sourceArchive{path: path, binary: !strings.HasSuffix(strings.ToLower(path), "-sources.jar"), release: i.javaReleaseForLibrary(path)}
-	i.mu.RLock()
+	guard.RLock()
 	for _, source := range i.librarySources {
 		if filepath.Clean(source.Archive) == path {
 			archive.binary = source.Binary
 			break
 		}
 	}
-	i.mu.RUnlock()
+	guard.RUnlock()
 	wanted := make(map[string]bool)
 	reader, err := zip.OpenReader(path)
 	if err == nil {
@@ -847,9 +852,9 @@ func (i *Index) refreshLibraryArchive(ctx context.Context, path string, requeste
 	if hasAccess {
 		access = requestedAccess[0]
 	} else {
-		i.mu.RLock()
+		guard.RLock()
 		access, hasAccess = i.libraryAccess[path]
-		i.mu.RUnlock()
+		guard.RUnlock()
 	}
 	var accessSnapshots []map[string]bool
 	if hasAccess {
@@ -870,11 +875,13 @@ func (i *Index) refreshLibraryArchive(ctx context.Context, path string, requeste
 }
 
 func (i *Index) pruneLibraryArchive(path string, wanted map[string]bool) {
+	guard := i.lockGuard()
+	defer guard.release()
 	if i.closed.Load() {
 		return
 	}
 	path = filepath.Clean(path)
-	i.mu.Lock()
+	guard.Lock()
 	var stale []protocol.URI
 	for uri, source := range i.librarySources {
 		if filepath.Clean(source.Archive) == path && (wanted == nil || !wanted[filepath.ToSlash(source.Entry)]) {
@@ -891,5 +898,5 @@ func (i *Index) pruneLibraryArchive(path string, wanted map[string]bool) {
 		delete(i.archiveDigests, path)
 		i.semanticEnvironmentVersion++
 	}
-	i.mu.Unlock()
+	guard.Unlock()
 }

@@ -146,3 +146,73 @@ func TestCompletionOffersOneEntryPerQualifiedType(t *testing.T) {
 		t.Fatalf("expected both distinct Marker types, got %v", counts)
 	}
 }
+
+// Accepting an item routinely happens after the document has moved on: the menu
+// keeps the previous request's items on screen while the next request is in
+// flight. The import must still be written, and placed against the text as it
+// is when the item is accepted.
+func TestAcceptingCompletionAfterTheDocumentChangedStillImports(t *testing.T) {
+	s, uri, offset := qualifiedFixture(t, map[string]any{})
+	var applied []protocol.WorkspaceEdit
+	s.clientCall = func(_ context.Context, method string, params, result any) error {
+		if method != "workspace/applyEdit" {
+			return nil
+		}
+		raw, _ := json.Marshal(params)
+		var request struct {
+			Edit protocol.WorkspaceEdit `json:"edit"`
+		}
+		_ = json.Unmarshal(raw, &request)
+		applied = append(applied, request.Edit)
+		if response, ok := result.(*struct {
+			Applied       bool   `json:"applied"`
+			FailureReason string `json:"failureReason"`
+		}); ok {
+			response.Applied = true
+		}
+		return nil
+	}
+
+	var accepted *protocol.CompletionItem
+	for _, item := range completeAt(t, s, uri, offset) {
+		if item.Label == "Marker" && item.Command != nil {
+			copy := item
+			accepted = &copy
+			break
+		}
+	}
+	if accepted == nil {
+		t.Fatal("no Marker completion item with an apply command")
+	}
+
+	// The user keeps typing, and the next completion request arrives.
+	document, _ := s.index.Document(uri)
+	text := document.Text
+	for version := 2; version <= 6; version++ {
+		text = "// edit\n" + text
+		if _, err := s.index.Change(context.Background(), protocol.DidChangeTextDocumentParams{
+			TextDocument:   protocol.VersionedTextDocumentIdentifier{URI: uri, Version: version},
+			ContentChanges: []protocol.TextDocumentContentChangeEvent{{Text: text}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		completeAt(t, s, uri, strings.Index(text, "Mark")+len("Mark"))
+	}
+
+	arguments, _ := json.Marshal(accepted.Command.Arguments)
+	params, _ := json.Marshal(map[string]any{"command": accepted.Command.Command, "arguments": json.RawMessage(arguments)})
+	if _, responseErr := s.Request(context.Background(), "workspace/executeCommand", params); responseErr != nil {
+		t.Fatalf("accepting the item failed: %v", responseErr)
+	}
+	if len(applied) != 1 {
+		t.Fatalf("want one workspace edit, got %d", len(applied))
+	}
+	for _, edits := range applied[0].Changes {
+		if len(edits) != 1 || !strings.Contains(edits[0].NewText, "import ") || !strings.Contains(edits[0].NewText, "Marker") {
+			t.Fatalf("unexpected edit: %+v", edits)
+		}
+		if edits[0].Range.Start.Line < 1 {
+			t.Fatalf("import placed above the lines added since the menu was built: %+v", edits[0].Range)
+		}
+	}
+}

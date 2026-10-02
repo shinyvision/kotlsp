@@ -1,6 +1,8 @@
 package index
 
 import (
+	"context"
+
 	"regexp"
 	"strings"
 
@@ -23,7 +25,7 @@ func init() {
 // other shapes -- no parentheses.
 var bareLocal = regexp.MustCompile(`^(val|var)\s+` + "`?" + `[\p{L}_][\p{L}\p{N}_]*` + "`?" + `\s*$`)
 
-func incompleteDeclarations(i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
+func incompleteDeclarations(_ context.Context, i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
 	text := i.documentTextLocked(file.URI)
 	if text == "" {
 		return nil

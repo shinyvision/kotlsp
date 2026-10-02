@@ -186,14 +186,17 @@ func TokenizeBounded(text string, kotlin bool, limit int) ([]Token, bool) {
 			}
 			continue
 		}
-		at += size
-		for at < len(text) {
-			next, nextSize := utf8.DecodeRuneInString(text[at:])
-			if unicode.IsSpace(next) || unicode.IsLetter(next) || unicode.IsDigit(next) || strings.ContainsRune("()[]{};,\"'`", next) {
+		// The longest operator the languages define, not the longest run of
+		// operator characters: `<*>` in `Iterable<*>` is three tokens, and as
+		// one it hid both the list's bracket and its star projection.
+		width := size
+		for _, operator := range multiCharacterOperators {
+			if strings.HasPrefix(text[at:], operator) {
+				width = len(operator)
 				break
 			}
-			at += nextSize
 		}
+		at += width
 		if !appendToken(Token{Start: start, End: at, Kind: Operator, Text: text[start:at]}) {
 			return nil, false
 		}
@@ -262,8 +265,10 @@ func splitTopLevel(text string, separator string, kotlin, typeGrammar bool) []st
 				angles--
 			}
 		default:
-			if strings.Trim(token.Text, ">") == "" {
-				angles -= min(angles, len(token.Text))
+			// `>>`, `?>` (a nullable last type argument) and `*>` (a star
+			// projection) close lists too.
+			if strings.Trim(token.Text, "?*>") == "" && strings.Contains(token.Text, ">") {
+				angles -= min(angles, strings.Count(token.Text, ">"))
 			}
 		}
 	}
@@ -355,8 +360,10 @@ func TopLevelTokenIndex(text, wanted string, kotlin bool) int {
 				angles--
 			}
 		default:
-			if strings.Trim(token.Text, ">") == "" {
-				angles -= min(angles, len(token.Text))
+			// `>>`, `?>` (a nullable last type argument) and `*>` (a star
+			// projection) close lists too.
+			if strings.Trim(token.Text, "?*>") == "" && strings.Contains(token.Text, ">") {
+				angles -= min(angles, strings.Count(token.Text, ">"))
 			}
 		}
 	}
@@ -387,8 +394,14 @@ func MatchingDelimiter(text string, open int, opening, closing string, kotlin bo
 			if depth == 0 {
 				return token.Start
 			}
-		} else if closing == ">" && strings.Trim(token.Text, ">") == "" {
+		} else if closing == ">" && strings.Trim(token.Text, "?*>") == "" && strings.Contains(token.Text, ">") {
+			// `>>` closes two lists, `?>` a list whose last argument is
+			// nullable (`Map<String, Int?>`), `*>` one ending in a star
+			// projection (`Iterable<*>`).
 			for offset := range len(token.Text) {
+				if token.Text[offset] != '>' {
+					continue
+				}
 				depth--
 				if depth == 0 {
 					return token.Start + offset
@@ -397,20 +410,6 @@ func MatchingDelimiter(text string, open int, opening, closing string, kotlin bo
 		}
 	}
 	return -1
-}
-
-func (r Region) Contains(offset int) bool {
-	if offset < r.Start {
-		return false
-	}
-	if r.Nested {
-		return offset < r.End
-	}
-	return offset <= r.End
-}
-
-func ScanRegions(text string, kotlin bool, visit func(Region)) {
-	_ = ScanRegionsBounded(text, kotlin, 100_000, visit)
 }
 
 // ScanRegionsBounded returns false instead of emitting a partial region model
@@ -632,6 +631,14 @@ func (state *State) ScanStructure(line string, kotlin bool) (opens, closes, pare
 			at++
 			continue
 		}
+		if kotlin && line[at] == '`' {
+			// A backtick name is one token, whatever it holds: the apostrophe
+			// in `it works if the DFE doesn't have one` opens no char literal.
+			if close := strings.IndexByte(line[at+1:], '`'); close >= 0 {
+				at += close + 1
+			}
+			continue
+		}
 		if line[at] == '\'' || line[at] == '"' {
 			state.Quote = line[at]
 			continue
@@ -649,4 +656,12 @@ func (state *State) ScanStructure(line string, kotlin bool) (opens, closes, pare
 	}
 	state.Quote, state.Escaped = 0, false
 	return opens, closes, parenDelta
+}
+
+// multiCharacterOperators lists Kotlin's and Java's multi-character operators,
+// longest first so a prefix never wins over the operator it begins.
+var multiCharacterOperators = []string{
+	">>>=", "===", "!==", "<<=", ">>=", ">>>", "...", "..<", "!!.",
+	"?.", "?:", "!!", "::", "->", "..", "++", "--", "&&", "||", "==", "!=",
+	"<=", ">=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<", ">>",
 }

@@ -619,19 +619,6 @@ func (p *jdiProcess) assign(expression, value string, contexts ...context.Contex
 	return values[0], nil
 }
 
-func (p *jdiProcess) setLineBreakpoint(className string, line int, contexts ...context.Context) (bool, string, error) {
-	rows, err := p.requestFor(contexts, "BREAK_LINE", className, strconv.Itoa(line))
-	if err != nil || len(rows) == 0 || len(rows[0]) < 2 {
-		return false, "", err
-	}
-	return rows[0][0] == "true", rows[0][1], nil
-}
-
-func (p *jdiProcess) clearLineBreakpoint(className string, line int, contexts ...context.Context) error {
-	_, err := p.requestFor(contexts, "CLEAR_LINE", className, strconv.Itoa(line))
-	return err
-}
-
 // replaceLineBreakpoints is one bridge command: the helper validates every
 // new location before changing the VM and restores the prior set if JDI still
 // rejects an installation. Go-side condition/log metadata is committed only
@@ -648,14 +635,6 @@ func (p *jdiProcess) replaceLineBreakpoints(old, replacement []lineBreakpointSpe
 	}
 	_, err := p.requestFor(contexts, "REPLACE_LINES", arguments...)
 	return err
-}
-
-func (p *jdiProcess) setFunctionBreakpoint(name string, contexts ...context.Context) (bool, string, error) {
-	rows, err := p.requestFor(contexts, "BREAK_FUNCTION", name)
-	if err != nil || len(rows) == 0 || len(rows[0]) < 2 {
-		return false, "", err
-	}
-	return rows[0][0] == "true", rows[0][1], nil
 }
 
 func (p *jdiProcess) replaceFunctionBreakpoints(old, replacement []string, contexts ...context.Context) (map[string][]string, error) {

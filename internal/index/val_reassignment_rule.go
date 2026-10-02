@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"github.com/shinyvision/kotlsp/internal/analysis"
 	"github.com/shinyvision/kotlsp/internal/protocol"
 )
@@ -22,14 +23,21 @@ func init() {
 	})
 }
 
-func valReassignments(i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
+func valReassignments(ctx context.Context, i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
 	var out []protocol.Diagnostic
 	for index := range file.References {
 		reference := &file.References[index]
 		if reference.Role != analysis.RoleWrite || reference.Qualifier != "" || reference.ArgumentLabel {
 			continue
 		}
-		resolved := i.resolveLocked(file, *reference)
+		// `list += x` on a val is `list.plusAssign(x)` when the type has that
+		// operator -- every mutable collection does -- and no reassignment at all.
+		// Proving the type lacks it needs inference this rule does not do, so a
+		// compound assignment is left alone; plain `=` and `++`/`--` are not.
+		if compoundAssignmentAfter(i.documentTextLocked(file.URI), reference.EndByte) {
+			continue
+		}
+		resolved := i.resolveLocked(ctx, file, *reference)
 		if len(resolved) != 1 {
 			// Ambiguity means the write might bind to something assignable.
 			continue
@@ -55,4 +63,20 @@ func valReassignments(i *Index, file *analysis.ParsedFile) []protocol.Diagnostic
 		})
 	}
 	return out
+}
+
+// compoundAssignmentAfter reports whether the text at offset, past whitespace,
+// is `+=`, `-=`, `*=`, `/=` or `%=`.
+func compoundAssignmentAfter(text string, offset int) bool {
+	for offset < len(text) && (text[offset] == ' ' || text[offset] == '\t') {
+		offset++
+	}
+	if offset+1 >= len(text) || text[offset+1] != '=' {
+		return false
+	}
+	switch text[offset] {
+	case '+', '-', '*', '/', '%':
+		return offset+2 >= len(text) || text[offset+2] != '='
+	}
+	return false
 }

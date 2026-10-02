@@ -1054,7 +1054,7 @@ func RenderJava(class *Class) string {
 		out.WriteString(";\n")
 	}
 	for _, method := range class.Methods {
-		if method.Name == "<clinit>" || method.Access&(accSynthetic|accBridge) != 0 {
+		if method.Name == "<clinit>" || method.Access&accBridge != 0 || method.Access&accSynthetic != 0 && !kotlinDeclaredSyntheticMethod(class, method.Name) {
 			continue
 		}
 		constructor := method.Name == "<init>"
@@ -1294,7 +1294,7 @@ func JavaDeclarations(class *Class, rendered string) []JavaDeclaration {
 		declarations = append(declarations, declaration)
 	}
 	for _, method := range class.Methods {
-		if method.Name == "<clinit>" || method.Access&(accSynthetic|accBridge) != 0 {
+		if method.Name == "<clinit>" || method.Access&accBridge != 0 || method.Access&accSynthetic != 0 && !kotlinDeclaredSyntheticMethod(class, method.Name) {
 			continue
 		}
 		parameters, result, ok := parseMethodDescriptor(method.Descriptor)
@@ -1569,26 +1569,6 @@ func canonicalRecordConstructorDescriptor(components []RecordComponent) string {
 	}
 	descriptor.WriteString(")V")
 	return descriptor.String()
-}
-
-func splitClassName(qualified string) (string, string) {
-	packageName, nested := splitBinaryClassName(qualified)
-	return packageName, nested[len(nested)-1]
-}
-
-func splitBinaryClassName(qualified string) (string, []string) {
-	lastDot := strings.LastIndexByte(qualified, '.')
-	packageName, binaryName := "", qualified
-	if lastDot >= 0 {
-		packageName, binaryName = qualified[:lastDot], qualified[lastDot+1:]
-	}
-	parts := strings.Split(binaryName, "$")
-	for _, part := range parts {
-		if !validJavaIdentifier(part) {
-			return packageName, []string{binaryName}
-		}
-	}
-	return packageName, parts
 }
 
 func javaClassName(internal string) string {
@@ -2014,4 +1994,22 @@ func RestoreSourceJavaIdentifiers(value string) string {
 		at = searchFrom + relative
 	}
 	return value
+}
+
+// kotlinDeclaredSyntheticMethod reports whether a synthetic method is a real
+// Kotlin declaration. Kotlin marks an inline function with reified type
+// parameters synthetic -- Java cannot call it -- but to Kotlin it is an
+// ordinary member: mockk's `anyConstructed<T>()`, the stdlib's
+// `filterIsInstance<R>()`. Its Kotlin metadata names it; compiler-generated
+// helpers (`access$`, `lambda$`, `$default`) carry a '$' and are never named.
+func kotlinDeclaredSyntheticMethod(class *Class, name string) bool {
+	if class == nil || class.KotlinMetadata == nil || name == "" || strings.ContainsRune(name, '$') || name == "<init>" {
+		return false
+	}
+	for _, value := range class.KotlinMetadata.Data2 {
+		if value == name {
+			return true
+		}
+	}
+	return false
 }

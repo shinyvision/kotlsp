@@ -57,6 +57,8 @@ func RunBenchmarkCLI(ctx context.Context, args []string, out io.Writer) error {
 	iterations := fs.Int("iterations", 100, "iterations per LSP request")
 	wait := fs.Duration("index-timeout", 2*time.Minute, "maximum wait for background source indexing")
 	requireCompiler := fs.Bool("require-compiler-pass", true, "require every source language present in the workspace to complete an authoritative compiler pass")
+	realFiles := fs.Int("real", 0, "measure definition, hover and completion at real references in this many of the workspace's own Kotlin files instead of the synthetic fixture")
+	realPerFile := fs.Int("real-per-file", 8, "qualified references measured per file with -real")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -111,6 +113,10 @@ func RunBenchmarkCLI(ctx context.Context, args []string, out io.Writer) error {
 		if err := waitForBenchmarkCompilerPass(ctx, s, time.Now().Add(*wait)); err != nil {
 			return err
 		}
+	}
+	if *realFiles > 0 {
+		fmt.Fprintf(out, "index ready in %s\n", indexReadyDuration.Round(time.Millisecond))
+		return benchmarkRealWorkspace(ctx, s, *realFiles, *realPerFile, out)
 	}
 	fixture, cleanup, err := makeBenchmarkFixture(ctx, s, *workspace)
 	if err != nil {
@@ -281,6 +287,11 @@ func waitForBenchmarkCompilerPass(ctx context.Context, s *Server, deadline time.
 	for len(required) > 0 && time.Now().Before(deadline) {
 		for _, status := range s.index.CompilerStatus() {
 			if !required[status.Language] || status.Passes == 0 {
+				continue
+			}
+			if status.LastOutcome == "superseded" {
+				// A newer run replaced this one, which is what opening a
+				// document does; the replacement is already on its way.
 				continue
 			}
 			if status.LastOutcome != "succeeded" {
@@ -477,17 +488,6 @@ func benchmarkKotlinCompletionArgs(s *Server, completionParams json.RawMessage) 
 	return nil, fmt.Errorf("prepare Kotlin completion application: no applicable completion item")
 }
 
-func benchmarkSymbol(s *Server) (protocol.URI, analysis.Symbol, bool) {
-	for _, uri := range s.index.AllFiles() {
-		symbols := s.index.SymbolsInFile(uri)
-		for _, sym := range symbols {
-			if !sym.Library && analysis.IsTypeKind(sym.Kind) {
-				return uri, sym, true
-			}
-		}
-	}
-	return "", analysis.Symbol{}, false
-}
 func mustJSON(v any) json.RawMessage {
 	data, err := json.Marshal(v)
 	if err != nil {

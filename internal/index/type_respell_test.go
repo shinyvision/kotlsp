@@ -36,7 +36,7 @@ func TestMemberResultTypeSpelledForCallSiteFile(t *testing.T) {
 		{"substituted parameter", "saved", "demo.domain.User"},
 	} {
 		idx.mu.RLock()
-		typ := idx.inferExpressionResultLocked(idx.files[ctrlURI], expression.expression, strings.Index(ctrl, "return \"x\"")).Type
+		typ := idx.inferExpressionResultLocked(ctx, idx.files[ctrlURI], expression.expression, strings.Index(ctrl, "return \"x\"")).Type
 		idx.mu.RUnlock()
 		if typ != expression.want {
 			t.Errorf("%s: inferred %q, want %q", expression.name, typ, expression.want)
@@ -74,7 +74,7 @@ func TestRespellDeclaredTypeKeepsSharedAndUnprovenSpellings(t *testing.T) {
 		{"producer.both()", "Pair<Shared, Int>"},
 	} {
 		idx.mu.RLock()
-		typ := idx.inferExpressionResultLocked(idx.files[bURI], c.expression, at).Type
+		typ := idx.inferExpressionResultLocked(ctx, idx.files[bURI], c.expression, at).Type
 		idx.mu.RUnlock()
 		if typ != c.want {
 			t.Errorf("%s: inferred %q, want %q", c.expression, typ, c.want)

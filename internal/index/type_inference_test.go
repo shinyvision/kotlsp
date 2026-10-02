@@ -9,6 +9,7 @@ import (
 )
 
 func TestFastInferenceAbstainsWhenTargetIsNotUnique(t *testing.T) {
+	ctx := context.Background()
 	idx := New(nil)
 	defer idx.Close()
 	uri := protocol.URI("file:///workspace/Ambiguous.kt")
@@ -45,17 +46,17 @@ fun probe() = Unit
 		"mapOf(1)",
 		"1+",
 	} {
-		if got := idx.inferExpressionTypeLocked(file, expression, at); got != "" {
+		if got := idx.inferExpressionTypeLocked(ctx, file, expression, at); got != "" {
 			t.Errorf("inference for %q chose %q instead of abstaining", expression, got)
 		}
 	}
-	if got := idx.commonExpressionTypeLocked(file, "First", "Second"); got != "" {
+	if got := idx.commonExpressionTypeLocked(ctx, file, "First", "Second"); got != "" {
 		t.Errorf("equal-distance unrelated common owners produced arbitrary LUB %q", got)
 	}
-	if got := idx.inferExpressionTypeLocked(file, "listOf(1)", at); got != "String" {
+	if got := idx.inferExpressionTypeLocked(ctx, file, "listOf(1)", at); got != "String" {
 		t.Errorf("visible collection-factory shadow inferred as %q, want String", got)
 	}
-	if got := idx.inferExpressionTypeLocked(file, "runner { 1 }", at); got != "" {
+	if got := idx.inferExpressionTypeLocked(ctx, file, "runner { 1 }", at); got != "" {
 		t.Errorf("prefix lookalike for run inferred as %q", got)
 	}
 }

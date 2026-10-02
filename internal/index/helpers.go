@@ -1,7 +1,6 @@
 package index
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,23 +11,12 @@ import (
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
 	"github.com/shinyvision/kotlsp/internal/protocol"
-	uriutil "github.com/shinyvision/kotlsp/internal/uri"
 )
 
 func without(xs []string, x string) []string {
 	out := xs[:0]
 	for _, v := range xs {
 		if v != x {
-			out = append(out, v)
-		}
-	}
-	return out
-}
-
-func withoutRef(xs []analysis.Reference, x analysis.Reference) []analysis.Reference {
-	out := xs[:0]
-	for _, v := range xs {
-		if v.URI != x.URI || v.StartByte != x.StartByte {
 			out = append(out, v)
 		}
 	}
@@ -123,15 +111,6 @@ func itoa(v int) string {
 		b[n] = '-'
 	}
 	return string(b[n:])
-}
-
-func ReadFile(uri protocol.URI) (string, error) {
-	path, ok := uriutil.Path(uri)
-	if !ok {
-		return "", errors.New("not a file URI")
-	}
-	data, err := readFileBounded(path, 64<<20, "file")
-	return string(data), err
 }
 
 func readFileBounded(path string, limit int64, description string) ([]byte, error) {

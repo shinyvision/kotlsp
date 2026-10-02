@@ -32,6 +32,7 @@ func (i *Index) DocumentHighlightsContext(ctx context.Context, uri protocol.URI,
 	}
 	family := i.referenceFamilyLocked(target)
 	members := make(map[string]bool, len(family))
+	names := make(map[string]bool, len(family))
 	seen := make(map[protocol.Range]bool)
 	out := make([]protocol.DocumentHighlight, 0, len(family))
 	add := func(r protocol.Range, kind int) {
@@ -46,6 +47,7 @@ func (i *Index) DocumentHighlightsContext(ctx context.Context, uri protocol.URI,
 			return nil
 		}
 		members[member.ID] = true
+		names[member.Name] = true
 		// Only the declarations written in this file are occurrences in it; a
 		// family member declared elsewhere is reported by its own file.
 		if member.URI == uri {
@@ -57,6 +59,13 @@ func (i *Index) DocumentHighlightsContext(ctx context.Context, uri protocol.URI,
 			return nil
 		}
 		reference := &file.References[index]
+		// A reference can only be an occurrence of the symbol if it is spelled
+		// like one of its family. Resolving every other name in the file --
+		// hundreds, each by type inference -- is what made this exceed the
+		// request budget and answer with nothing.
+		if !names[reference.Name] {
+			continue
+		}
 		if !members[reference.ResolvedID] {
 			if reference.ResolvedID != "" {
 				continue

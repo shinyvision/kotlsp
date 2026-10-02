@@ -209,12 +209,3 @@ func isSpaceByte(value byte) bool {
 func isOperatorByte(value byte) bool {
 	return value == '+' || value == '-' || value == '*' || value == '/' || value == '%' || value == '=' || value == '!' || value == '<' || value == '>' || value == '&' || value == '|' || value == '^' || value == '~' || value == '?' || value == ':'
 }
-
-func sortTokens(tokens []Token) {
-	sort.SliceStable(tokens, func(i, j int) bool {
-		if tokens[i].StartByte == tokens[j].StartByte {
-			return tokens[i].EndByte < tokens[j].EndByte
-		}
-		return tokens[i].StartByte < tokens[j].StartByte
-	})
-}

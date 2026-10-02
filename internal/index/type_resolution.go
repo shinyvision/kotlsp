@@ -4,7 +4,10 @@ import (
 	"context"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"unicode"
 	"unicode/utf8"
 
@@ -61,7 +64,25 @@ func (i *Index) resolveTypeSymbolsForOwnerMemoLocked(file *analysis.ParsedFile, 
 		})
 	}
 	if strings.Contains(base, ".") {
-		return filter(i.byFQN[base])
+		if values := preferSourceDeclarations(filter(i.byFQN[base])); len(values) > 0 {
+			return values
+		}
+		// `CatalogRestriction.Restricted`: a type in scope, then nested types
+		// by name. Only a qualified name that is not itself a fully qualified
+		// one gets here.
+		segments := strings.Split(base, ".")
+		owners := i.resolveTypeSymbolsForOwnerMemoLocked(file, segments[0], lexicalOwner, access, positions...)
+		for _, segment := range segments[1:] {
+			var nested []analysis.Symbol
+			for _, owner := range owners {
+				nested = append(nested, filter(i.byContainerMember[memberKey(owner.ID, segment)])...)
+			}
+			owners = uniqueTypeResolution(nested)
+			if len(owners) == 0 {
+				return nil
+			}
+		}
+		return owners
 	}
 	if !i.prepareResolutionImportsLocked(file, access) {
 		i.recordHealth("type-resolution", base, "import inventory exceeded the query-wide type-resolution work limit and was withheld")
@@ -127,7 +148,7 @@ func (i *Index) resolveTypeSymbolsForOwnerMemoLocked(file *analysis.ParsedFile, 
 	// Every explicit star import has equal precedence. Preserve ambiguity across
 	// them instead of returning whichever import happened to occur first.
 	var wildcard []analysis.Symbol
-	if !access.consumeWork(len(access.wildcardImports)) {
+	if !access.consumeWork(len(access.wildcardImports) - access.implicitWildcards) {
 		return nil
 	}
 	for _, imported := range access.wildcardImports {
@@ -211,6 +232,7 @@ func uniqueTypeResolution(values []analysis.Symbol) []analysis.Symbol {
 	if len(values) == 0 {
 		return nil
 	}
+	values = preferSourceDeclarations(values)
 	var resolved analysis.Symbol
 	seen := make(map[string]bool, len(values))
 	for _, value := range values {
@@ -273,6 +295,36 @@ func splitInstantiatedType(value string) (string, []string) {
 	if open < 0 {
 		return value, nil
 	}
+	// Type spellings repeat endlessly (every extension's receiver pattern is
+	// matched against every supertype of the receiver), and splitting one runs
+	// the lexer. The split is a pure function of the string, so it is
+	// remembered; callers get their own copy of the arguments to edit.
+	if cached, ok := splitTypeCache.Load(value); ok {
+		split := cached.(splitTypeResult)
+		return split.base, append([]string(nil), split.arguments...)
+	}
+	base, arguments := splitInstantiatedTypeUncached(value, open)
+	if splitTypeCacheSize.Add(1) > splitTypeCacheLimit {
+		splitTypeCache.Clear()
+		splitTypeCacheSize.Store(0)
+	}
+	splitTypeCache.Store(value, splitTypeResult{base: base, arguments: arguments})
+	return base, append([]string(nil), arguments...)
+}
+
+type splitTypeResult struct {
+	base      string
+	arguments []string
+}
+
+const splitTypeCacheLimit = 1 << 16
+
+var (
+	splitTypeCache     sync.Map
+	splitTypeCacheSize atomic.Int64
+)
+
+func splitInstantiatedTypeUncached(value string, open int) (string, []string) {
 	close := matchingTypeArgumentEnd(value, open)
 	if close < 0 {
 		return strings.TrimSpace(value[:open]), nil
@@ -349,7 +401,7 @@ func (i *Index) directSupertypeMatchesLocked(candidate analysis.Symbol, targetID
 	return false
 }
 
-func (i *Index) contextualLambdaParameterTypeLocked(file *analysis.ParsedFile, parameter analysis.Symbol) string {
+func (i *Index) contextualLambdaParameterTypeLocked(ctx context.Context, file *analysis.ParsedFile, parameter analysis.Symbol) string {
 	if file.Language != analysis.LanguageKotlin || parameter.ScopeEndByte <= parameter.ScopeStartByte {
 		return ""
 	}
@@ -376,75 +428,197 @@ func (i *Index) contextualLambdaParameterTypeLocked(file *analysis.ParsedFile, p
 			}
 		}
 	}
-	for _, call := range file.References {
+	// The lambda the parameter belongs to is the innermost call argument
+	// around it. Taking the first one found answered `{ record -> }` inside
+	// `transactional { trx -> ... }` with the outer lambda's parameter type.
+	bestCall, bestArgument, bestSpan := -1, -1, int(^uint(0)>>1)
+	for callIndex, call := range file.References {
 		if call.Role != analysis.RoleCall {
 			continue
 		}
 		for argumentIndex, argumentRange := range call.Arguments {
 			start, end := document.Offset(argumentRange.Start), document.Offset(argumentRange.End)
-			if start > parameter.StartByte || parameter.EndByte > end {
+			if start > parameter.StartByte || parameter.EndByte > end || end-start >= bestSpan {
 				continue
 			}
-			for _, callable := range i.resolveLocked(file, call) {
-				if len(callable.Parameters) == 0 {
-					continue
-				}
-				callableParameter := argumentIndex
-				if callableParameter >= len(callable.Parameters) {
-					callableParameter = len(callable.Parameters) - 1
-				}
-				parameterType := i.contextualCallableParameterTypeLocked(file, call, callable, callableParameter, document)
-				types := kotlinFunctionParameterTypes(parameterType)
-				if parameterIndex < len(types) {
-					return types[parameterIndex]
-				}
+			bestCall, bestArgument, bestSpan = callIndex, argumentIndex, end-start
+		}
+	}
+	if bestCall >= 0 {
+		call, argumentIndex := file.References[bestCall], bestArgument
+		for _, callable := range i.resolveLocked(ctx, file, call) {
+			if len(callable.Parameters) == 0 {
+				continue
+			}
+			callableParameter := argumentIndex
+			if callableParameter >= len(callable.Parameters) {
+				callableParameter = len(callable.Parameters) - 1
+			}
+			parameterType := i.contextualCallableParameterTypeLocked(ctx, file, call, callable, callableParameter, document)
+			types := kotlinFunctionParameterTypes(parameterType)
+			if len(types) == 0 {
+				// A Java functional interface: the lambda's parameters
+				// are its single abstract method's.
+				types = kotlinFunctionParameterTypes(i.samFunctionTypeLocked(callable, parameterType))
+			}
+			if parameterIndex < len(types) {
+				// Spelled as the callee's file spelled it: `Configuration`
+				// there is an import the call site need not have.
+				return i.respellDeclaredTypeLocked(file, callable, withoutVariance(types[parameterIndex]))
 			}
 		}
 	}
 	return ""
 }
 
-func (i *Index) contextualLambdaReceiverTypeLocked(file *analysis.ParsedFile, at int) string {
+func (i *Index) contextualLambdaReceiverTypeLocked(ctx context.Context, file *analysis.ParsedFile, at int) string {
+	receiver, _ := i.contextualLambdaReceiverLocked(ctx, file, at)
+	return receiver
+}
+
+// contextualLambdaReceiverLocked is the receiver of the innermost lambda with
+// a receiver around at, and where that lambda's argument starts.
+func (i *Index) contextualLambdaReceiverLocked(ctx context.Context, file *analysis.ParsedFile, at int) (string, int) {
 	if file.Language != analysis.LanguageKotlin {
-		return ""
+		return "", -1
 	}
 	document := i.docs[file.URI]
 	if document == nil {
 		document = i.indexedDocs[file.URI]
 	}
 	if document == nil {
-		return ""
+		return "", -1
 	}
-	best, bestSpan := "", int(^uint(0)>>1)
-	for _, call := range file.References {
+	best, bestSpan, bestStart := "", int(^uint(0)>>1), -1
+	for _, span := range i.callArgumentSpans(file, document) {
+		start, end := span.start, span.end
+		if at < start || end < at || end-start >= bestSpan {
+			continue
+		}
+		// Only a lambda argument has a receiver. Resolving the call for any
+		// other argument around the position -- `batch(xs.map { ... })` --
+		// typed that whole argument for nothing.
+		if !lambdaArgumentAt(document.Text, start, end) {
+			continue
+		}
+		if receiver := i.lambdaReceiverOfArgumentLocked(ctx, file, document, span); receiver != "" {
+			best, bestSpan, bestStart = receiver, end-start, start
+		}
+	}
+	return best, bestStart
+}
+
+// lambdaReceiverOfArgumentLocked is the receiver type of the lambda written as
+// the span's argument -- `apply { }` runs its block on the receiver -- or "".
+// Every reference inside that argument asks the same question, and answering
+// it resolves the enclosing call and reads its parameter type from source, so
+// the answer is kept for the file's text and the current declarations.
+func (i *Index) lambdaReceiverOfArgumentLocked(ctx context.Context, file *analysis.ParsedFile, document *textdoc.Document, span callArgumentSpan) string {
+	key := lambdaReceiverKey{owner: i, uri: file.URI, textHash: file.TextHash, call: span.call, argument: span.argument, declarations: i.late.declarations.Load(), environment: i.semanticEnvironmentVersion}
+	lambdaReceiverCache.Lock()
+	cached, ok := lambdaReceiverCache.values[key]
+	lambdaReceiverCache.Unlock()
+	if ok {
+		return cached
+	}
+	ctx = withResolutionDepth(ctx, resolutionDepth(ctx))
+	call, argumentIndex := file.References[span.call], span.argument
+	receiver := ""
+	for _, callable := range i.resolveLocked(ctx, file, call) {
+		if len(callable.Parameters) == 0 {
+			continue
+		}
+		callableParameter := argumentIndex
+		if callableParameter >= len(callable.Parameters) {
+			callableParameter = len(callable.Parameters) - 1
+		}
+		parameterType := i.contextualCallableParameterTypeLocked(ctx, file, call, callable, callableParameter, document)
+		if found := kotlinFunctionReceiverType(parameterType); found != "" {
+			receiver = i.respellDeclaredTypeLocked(file, callable, found)
+			break
+		}
+	}
+	if ctx.Err() != nil || resolutionTruncated(ctx) {
+		return receiver
+	}
+	lambdaReceiverCache.Lock()
+	if lambdaReceiverCache.values == nil || len(lambdaReceiverCache.values) > 100_000 {
+		lambdaReceiverCache.values = make(map[lambdaReceiverKey]string)
+	}
+	lambdaReceiverCache.values[key] = receiver
+	lambdaReceiverCache.Unlock()
+	return receiver
+}
+
+type lambdaReceiverKey struct {
+	owner          *Index // the counters below are per index
+	uri            protocol.URI
+	textHash       uint64
+	call, argument int
+	declarations   uint64
+	environment    uint64
+}
+
+var lambdaReceiverCache struct {
+	sync.Mutex
+	values map[lambdaReceiverKey]string
+}
+
+// callArgumentSpan is one call argument as a byte range, with the call it
+// belongs to as an index into the file's references.
+type callArgumentSpan struct{ start, end, call, argument int }
+
+type callArgumentSpans struct {
+	textHash uint64
+	spans    []callArgumentSpan
+}
+
+var callArgumentSpanCache struct {
+	sync.Mutex
+	byURI map[protocol.URI]callArgumentSpans
+}
+
+// callArgumentSpans returns the byte span of every call argument in the file.
+// Finding the lambda an offset sits in used to convert every argument range of
+// every call in the file, once per reference being resolved: quadratic in the
+// file's size. The spans depend only on the file's text, so they are computed
+// once per version of it.
+func (i *Index) callArgumentSpans(file *analysis.ParsedFile, document *textdoc.Document) []callArgumentSpan {
+	callArgumentSpanCache.Lock()
+	cached, ok := callArgumentSpanCache.byURI[file.URI]
+	callArgumentSpanCache.Unlock()
+	if ok && cached.textHash == file.TextHash {
+		return cached.spans
+	}
+	var spans []callArgumentSpan
+	for callIndex, call := range file.References {
 		if call.Role != analysis.RoleCall {
 			continue
 		}
 		for argumentIndex, argumentRange := range call.Arguments {
-			start, end := document.Offset(argumentRange.Start), document.Offset(argumentRange.End)
-			if at < start || end < at || end-start >= bestSpan {
-				continue
-			}
-			for _, callable := range i.resolveLocked(file, call) {
-				if len(callable.Parameters) == 0 {
-					continue
-				}
-				callableParameter := argumentIndex
-				if callableParameter >= len(callable.Parameters) {
-					callableParameter = len(callable.Parameters) - 1
-				}
-				parameterType := i.contextualCallableParameterTypeLocked(file, call, callable, callableParameter, document)
-				if receiver := kotlinFunctionReceiverType(parameterType); receiver != "" {
-					best, bestSpan = receiver, end-start
-					break
-				}
-			}
+			spans = append(spans, callArgumentSpan{
+				start: document.Offset(argumentRange.Start), end: document.Offset(argumentRange.End),
+				call: callIndex, argument: argumentIndex,
+			})
 		}
 	}
-	return best
+	callArgumentSpanCache.Lock()
+	if callArgumentSpanCache.byURI == nil || len(callArgumentSpanCache.byURI) > 4096 {
+		callArgumentSpanCache.byURI = make(map[protocol.URI]callArgumentSpans)
+	}
+	callArgumentSpanCache.byURI[file.URI] = callArgumentSpans{textHash: file.TextHash, spans: spans}
+	callArgumentSpanCache.Unlock()
+	return spans
 }
 
 func (i *Index) enclosingExtensionReceiverTypeLocked(file *analysis.ParsedFile, at int) string {
+	receiver, _ := i.enclosingExtensionReceiverLocked(file, at)
+	return receiver
+}
+
+// enclosingExtensionReceiverLocked is the receiver of the innermost extension
+// function around at, and where that function starts.
+func (i *Index) enclosingExtensionReceiverLocked(file *analysis.ParsedFile, at int) (string, int) {
 	bestStart, bestEnd, receiver := -1, len(i.documentTextLocked(file.URI))+1, ""
 	for _, symbol := range file.Symbols {
 		if !analysis.IsCallableKind(symbol.Kind) || symbol.ReceiverType == "" || symbol.StartByte > at || at > symbol.EndByte {
@@ -454,7 +628,7 @@ func (i *Index) enclosingExtensionReceiverTypeLocked(file *analysis.ParsedFile, 
 			bestStart, bestEnd, receiver = symbol.StartByte, symbol.EndByte, symbol.ReceiverType
 		}
 	}
-	return receiver
+	return receiver, bestStart
 }
 
 func (i *Index) enclosingContextReceiverTypesLocked(file *analysis.ParsedFile, at int) []string {
@@ -526,7 +700,7 @@ func (i *Index) enclosingContextReceiverTypesLocked(file *analysis.ParsedFile, a
 	return out
 }
 
-func (i *Index) contextualCallableParameterTypeLocked(file *analysis.ParsedFile, call analysis.Reference, callable analysis.Symbol, parameterIndex int, document *textdoc.Document) string {
+func (i *Index) contextualCallableParameterTypeLocked(ctx context.Context, file *analysis.ParsedFile, call analysis.Reference, callable analysis.Symbol, parameterIndex int, document *textdoc.Document) string {
 	if parameterIndex < 0 || parameterIndex >= len(callable.Parameters) {
 		return ""
 	}
@@ -535,6 +709,40 @@ func (i *Index) contextualCallableParameterTypeLocked(file *analysis.ParsedFile,
 		return parameterType
 	}
 	inferred := make(map[string]string, len(callable.TypeParameters))
+	// `tasks.withType<Jar> { archiveBaseName }`: type arguments written at the
+	// call bind the callee's type parameters in order, before anything is
+	// inferred.
+	if explicit := explicitTypeArgumentsAfter(document.Text, call.EndByte); len(explicit) == len(callable.TypeParameters) {
+		for index, parameter := range callable.TypeParameters {
+			inferred[parameter] = explicit[index]
+		}
+	}
+	// An extension's type parameters are bound by its receiver, not only by its
+	// value arguments. `h.name?.let { it.length }` passes exactly one argument
+	// -- the lambda whose parameter type is being asked about -- and the loop
+	// below skips that one, so nothing ever bound T and `it` read as the bare
+	// type parameter in every scope function.
+	if typeMentionsParameter(callable.ReceiverType, callable.TypeParameters) {
+		receiver := call.Qualifier
+		text := i.documentTextLocked(file.URI)
+		if receiver == "" && !call.Synthetic {
+			// A synthetic reference carries the position of the expression being
+			// analysed, never its own spelling, so its qualifier must not be
+			// re-derived from the text at that position.
+			receiver = expressionQualifierBefore(text, call.StartByte)
+		}
+		if receiver != "" {
+			if actual := i.inferExpressionTypeLocked(ctx, file, receiver, call.StartByte); actual != "" {
+				if isSafeCallBefore(text, call.StartByte) {
+					// `?.` unwraps: `String?` receiver binds T to String, or the
+					// lambda's `it` is nullable and every member access on it
+					// looks unresolved.
+					actual = strings.TrimSuffix(strings.TrimSpace(actual), "?")
+				}
+				i.inferTypeParameterBindingsLocked(ctx, file, callable.ReceiverType, actual, callable.TypeParameters, inferred)
+			}
+		}
+	}
 	for argumentIndex, argumentRange := range call.Arguments {
 		callableIndex := argumentIndex
 		if callableIndex >= len(callable.Parameters) {
@@ -551,9 +759,9 @@ func (i *Index) contextualCallableParameterTypeLocked(file *analysis.ParsedFile,
 		if equals := topLevelNamedArgumentEquals(expression); equals >= 0 {
 			expression = strings.TrimSpace(expression[equals+1:])
 		}
-		actual := i.inferExpressionTypeLocked(file, expression, call.StartByte)
+		actual := i.inferExpressionTypeLocked(ctx, file, expression, call.StartByte)
 		if actual != "" {
-			i.inferTypeParameterBindingsLocked(file, callable.Parameters[callableIndex].Type, actual, callable.TypeParameters, inferred)
+			i.inferTypeParameterBindingsLocked(ctx, file, callable.Parameters[callableIndex].Type, actual, callable.TypeParameters, inferred)
 		}
 	}
 	arguments := make([]string, len(callable.TypeParameters))
@@ -561,6 +769,59 @@ func (i *Index) contextualCallableParameterTypeLocked(file *analysis.ParsedFile,
 		arguments[index] = inferred[parameter]
 	}
 	return substituteTypeParameters(parameterType, callable.TypeParameters, arguments)
+}
+
+// typeMentionsParameter reports whether a declared type names one of the
+// callable's own type parameters, so a receiver that can never bind one --
+// `fun String.trim()` and every other ordinary extension -- skips the receiver
+// inference entirely instead of typing an expression whose result is discarded.
+// Matching is on identifier boundaries: a receiver spelled `Transformer` does
+// not mention the parameter `T`.
+func typeMentionsParameter(value string, parameters []string) bool {
+	if value == "" || len(parameters) == 0 {
+		return false
+	}
+	for index := 0; index < len(value); {
+		r, size := utf8.DecodeRuneInString(value[index:])
+		if !isIdentRune(r) {
+			index += size
+			continue
+		}
+		end := index + size
+		for end < len(value) {
+			r, size = utf8.DecodeRuneInString(value[end:])
+			if !isIdentRune(r) {
+				break
+			}
+			end += size
+		}
+		word := value[index:end]
+		for _, parameter := range parameters {
+			if word == parameter {
+				return true
+			}
+		}
+		index = end
+	}
+	return false
+}
+
+// isSafeCallBefore reports whether the call at start is reached through `?.`
+// rather than `.`, which decides whether the receiver's nullability carries
+// into the callee's type parameters.
+func isSafeCallBefore(text string, start int) bool {
+	at := start - 1
+	for at >= 0 && (text[at] == ' ' || text[at] == '\t' || text[at] == '\n' || text[at] == '\r') {
+		at--
+	}
+	if at < 0 || text[at] != '.' {
+		return false
+	}
+	at--
+	for at >= 0 && (text[at] == ' ' || text[at] == '\t' || text[at] == '\n' || text[at] == '\r') {
+		at--
+	}
+	return at >= 0 && text[at] == '?'
 }
 
 func topLevelNamedArgumentEquals(expression string) int {
@@ -604,39 +865,121 @@ func topLevelNamedArgumentEquals(expression string) int {
 }
 
 func kotlinFunctionParameterTypes(functionType string) []string {
-	functionType = strings.TrimSpace(strings.TrimSuffix(functionType, "?"))
-	arrow := strings.LastIndex(functionType, "->")
-	if arrow < 0 {
-		return nil
-	}
-	parameters := strings.TrimSpace(functionType[:arrow])
-	if dot := strings.LastIndex(parameters, ".("); dot >= 0 {
-		parameters = parameters[dot+1:]
-	}
-	if len(parameters) < 2 || parameters[0] != '(' || parameters[len(parameters)-1] != ')' {
-		return nil
-	}
-	parameters = strings.TrimSpace(parameters[1 : len(parameters)-1])
-	if parameters == "" {
-		return nil
-	}
-	return splitTopLevelCallArguments(parameters)
+	_, parameters, _, _ := parseKotlinFunctionType(functionType)
+	return parameters
 }
 
 func kotlinFunctionReceiverType(functionType string) string {
-	functionType = strings.TrimSpace(strings.TrimSuffix(functionType, "?"))
-	arrow := strings.LastIndex(functionType, "->")
-	if arrow < 0 {
-		return ""
-	}
-	parameters := strings.TrimSpace(functionType[:arrow])
-	dot := strings.LastIndex(parameters, ".(")
-	if dot <= 0 {
-		return ""
-	}
-	receiver := strings.TrimSpace(parameters[:dot])
-	receiver = strings.TrimSpace(strings.TrimPrefix(receiver, "suspend "))
+	receiver, _, _, _ := parseKotlinFunctionType(functionType)
 	return receiver
+}
+
+// parseKotlinFunctionType reads a Kotlin function type -- `(A, B) -> R`,
+// `suspend (configuration: Configuration) -> T`, `Receiver.(A) -> R`,
+// `(suspend () -> Unit)?`, or the binary spelling `Function2<A, B, R>` with
+// `@ExtensionFunctionType` -- into its receiver, parameter types and result.
+// ok is false for anything that is not a function type.
+func parseKotlinFunctionType(functionType string) (receiver string, parameters []string, result string, ok bool) {
+	text := strings.TrimSpace(functionType)
+	// `(suspend () -> Unit)?`: a function type parenthesised whole (to make
+	// it nullable) is that function type.
+	for {
+		trimmed := strings.TrimSpace(strings.TrimSuffix(text, "?"))
+		if len(trimmed) < 2 || trimmed[0] != '(' || lexical.MatchingDelimiter(trimmed, 0, "(", ")", true) != len(trimmed)-1 {
+			break
+		}
+		text = strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+	}
+	extensionAnnotated := false
+	for strings.HasPrefix(text, "@") {
+		end := 1
+		for end < len(text) && (isIdentifierByteFast(text[end]) || text[end] == '.') {
+			end++
+		}
+		if strings.HasSuffix(text[1:end], "ExtensionFunctionType") {
+			extensionAnnotated = true
+		}
+		text = strings.TrimSpace(text[end:])
+	}
+	text = strings.TrimSpace(strings.TrimPrefix(text, "suspend "))
+	if base, arguments := splitInstantiatedType(text); len(arguments) > 0 && !strings.Contains(text, "->") {
+		simple := base[strings.LastIndexByte(base, '.')+1:]
+		if strings.HasPrefix(simple, "Function") || strings.HasPrefix(simple, "SuspendFunction") {
+			if _, err := strconv.Atoi(strings.TrimPrefix(strings.TrimPrefix(simple, "Suspend"), "Function")); err == nil {
+				parameters, result = arguments[:len(arguments)-1], arguments[len(arguments)-1]
+				if extensionAnnotated && len(parameters) > 0 {
+					receiver, parameters = parameters[0], parameters[1:]
+				}
+				return receiver, parameters, result, true
+			}
+		}
+		return "", nil, "", false
+	}
+	// Find the parameter list: the first top-level `(`, preceded by
+	// `Receiver.` when there is a receiver.
+	open := -1
+	depth := 0
+	for index := 0; index < len(text); index++ {
+		switch text[index] {
+		case '<':
+			depth++
+		case '>':
+			if index == 0 || text[index-1] != '-' {
+				depth--
+			}
+		case '(':
+			if depth == 0 {
+				open = index
+			}
+		}
+		if open >= 0 {
+			break
+		}
+	}
+	if open < 0 {
+		return "", nil, "", false
+	}
+	close := lexical.MatchingDelimiter(text, open, "(", ")", true)
+	if close < 0 || !arrowFollows(text, close) {
+		return "", nil, "", false
+	}
+	if head := strings.TrimSpace(text[:open]); head != "" {
+		if !strings.HasSuffix(head, ".") {
+			return "", nil, "", false
+		}
+		receiver = strings.TrimSpace(strings.TrimPrefix(strings.TrimSuffix(head, "."), "suspend "))
+	}
+	for _, parameter := range splitTopLevelCallArguments(text[open+1 : close]) {
+		parameter = strings.TrimSpace(parameter)
+		// `configuration: Configuration` names the parameter; the type follows.
+		if colon := topLevelNameColon(parameter); colon >= 0 {
+			parameter = strings.TrimSpace(parameter[colon+1:])
+		}
+		if parameter != "" {
+			parameters = append(parameters, parameter)
+		}
+	}
+	rest := strings.TrimSpace(text[close+1:])
+	result = strings.TrimSpace(strings.TrimPrefix(rest, "->"))
+	return receiver, parameters, result, true
+}
+
+func arrowFollows(text string, close int) bool {
+	return strings.HasPrefix(strings.TrimSpace(text[close+1:]), "->")
+}
+
+// topLevelNameColon finds the colon of `name: Type` in a function type's
+// parameter, or -1 when the parameter is a bare type.
+func topLevelNameColon(parameter string) int {
+	end := 0
+	for end < len(parameter) && isIdentifierByteFast(parameter[end]) {
+		end++
+	}
+	rest := strings.TrimLeft(parameter[end:], " \t")
+	if end == 0 || !strings.HasPrefix(rest, ":") || strings.HasPrefix(rest, "::") {
+		return -1
+	}
+	return len(parameter) - len(rest)
 }
 
 type typeInferenceConstraint struct {
@@ -654,7 +997,7 @@ type typeInferenceConstraints struct {
 // through the structured type graph's LUB, and reports false for projections,
 // captures, intersections, or incompatible shapes. Callers must treat false as
 // unknown rather than selecting an overload from a fabricated binding.
-func (i *Index) inferTypeParameterBindingsLocked(file *analysis.ParsedFile, pattern, actual string, parameters []string, inferred map[string]string) bool {
+func (i *Index) inferTypeParameterBindingsLocked(ctx context.Context, file *analysis.ParsedFile, pattern, actual string, parameters []string, inferred map[string]string) bool {
 	if pattern == "" || actual == "" {
 		return false
 	}
@@ -669,7 +1012,7 @@ func (i *Index) inferTypeParameterBindingsLocked(file *analysis.ParsedFile, patt
 	// raw spellings at the call site.
 	if !matched {
 		patternBase, _ := splitInstantiatedType(pattern)
-		for _, owner := range i.instantiatedTypeHierarchyLocked(file, actual) {
+		for _, owner := range i.instantiatedTypeHierarchyLocked(ctx, file, actual) {
 			if !sameJvmType(owner.symbol.Name, patternBase) && !sameJvmType(owner.symbol.FQN, patternBase) {
 				continue
 			}
@@ -691,7 +1034,7 @@ func (i *Index) inferTypeParameterBindingsLocked(file *analysis.ParsedFile, patt
 			solved[constraint.parameter] = constraint.lowerBound
 			continue
 		}
-		merged := i.commonExpressionTypeLocked(file, previous, constraint.lowerBound)
+		merged := i.commonExpressionTypeLocked(ctx, file, previous, constraint.lowerBound)
 		if merged == "" {
 			return false
 		}
@@ -712,6 +1055,13 @@ func collectTypeParameterConstraints(pattern, actual string, parameters []string
 	if strings.ContainsAny(pattern, "*&") || strings.ContainsAny(actual, "*&") || strings.Contains(pattern, "? extends ") || strings.Contains(pattern, "? super ") || strings.Contains(actual, "? extends ") || strings.Contains(actual, "? super ") || strings.Contains(pattern, "->") || strings.Contains(actual, "->") {
 		constraints.unsupported = true
 		return false
+	}
+	// `Array<out T>` accepts an Array<Color> and binds T to Color: a covariant
+	// projection constrains the parameter the same way the bare type does. The
+	// stdlib spells most of its extension receivers this way (first, map,
+	// toList, ...), and treating it as unsupported made them not apply.
+	if strings.HasPrefix(pattern, "out ") {
+		return collectTypeParameterConstraints(strings.TrimPrefix(pattern, "out "), strings.TrimPrefix(actual, "out "), parameters, constraints, depth+1)
 	}
 	patternBase, patternArguments := splitInstantiatedType(pattern)
 	actualBase, actualArguments := splitInstantiatedType(actual)
@@ -746,8 +1096,13 @@ func matchTypePatternDepth(pattern, actual string, parameters map[string]bool, i
 	if depth > 256 {
 		return false
 	}
-	pattern = strings.TrimSpace(pattern)
-	actual = strings.TrimSpace(actual)
+	pattern = withoutVariance(strings.TrimSpace(pattern))
+	actual = withoutVariance(strings.TrimSpace(actual))
+	// A star projection accepts any argument: `Iterable<*>.filterIsInstance`
+	// applies to a List of anything.
+	if pattern == "*" {
+		return true
+	}
 	if strings.HasSuffix(actual, "?") && !strings.HasSuffix(pattern, "?") {
 		return false
 	}
@@ -828,7 +1183,7 @@ func substituteTypeBindings(value string, bindings map[string]string) string {
 	return result.String()
 }
 
-func (i *Index) extensionReceiverBindingsLocked(file *analysis.ParsedFile, extension analysis.Symbol, actualType string) (map[string]string, bool) {
+func (i *Index) extensionReceiverBindingsLocked(ctx context.Context, file *analysis.ParsedFile, extension analysis.Symbol, actualType string) (map[string]string, bool) {
 	if extension.ReceiverType == "" || actualType == "" {
 		return nil, false
 	}
@@ -836,21 +1191,14 @@ func (i *Index) extensionReceiverBindingsLocked(file *analysis.ParsedFile, exten
 	for _, parameter := range extension.TypeParameters {
 		parameters[parameter] = true
 	}
-	actualTypes := []string{actualType}
-	for _, instantiated := range i.instantiatedTypeHierarchyLocked(file, actualType) {
-		actualTypes = append(actualTypes, instantiatedTypeName(instantiated.symbol.Name, instantiated.arguments))
-		if instantiated.symbol.FQN != "" && instantiated.symbol.FQN != instantiated.symbol.Name {
-			actualTypes = append(actualTypes, instantiatedTypeName(instantiated.symbol.FQN, instantiated.arguments))
-		}
-	}
-	for _, actual := range actualTypes {
+	for _, actual := range i.receiverTypeSpellingsLocked(ctx, file, actualType) {
 		bindings := make(map[string]string, len(parameters))
 		if !matchTypePattern(extension.ReceiverType, actual, parameters, bindings) {
 			continue
 		}
 		valid := true
 		for parameter, actualType := range bindings {
-			if !i.typeArgumentSatisfiesBoundsLocked(file, actualType, extension.TypeParameterBounds[parameter]) {
+			if !i.typeArgumentSatisfiesBoundsLocked(ctx, file, actualType, extension.TypeParameterBounds[parameter]) {
 				valid = false
 				break
 			}
@@ -860,6 +1208,62 @@ func (i *Index) extensionReceiverBindingsLocked(file *analysis.ParsedFile, exten
 		}
 	}
 	return nil, false
+}
+
+// receiverTypeSpellingsLocked is actualType followed by each of its
+// supertypes, instantiated, by simple and by qualified name: everything an
+// extension receiver pattern may match. One completion tests hundreds of
+// extensions against the same receiver, and each used to walk the whole
+// hierarchy again -- for a jOOQ table, past the request deadline.
+func (i *Index) receiverTypeSpellingsLocked(ctx context.Context, file *analysis.ParsedFile, actualType string) []string {
+	memo, _ := ctx.Value(receiverSpellingsKey{}).(*receiverSpellingsMemo)
+	key := string(file.URI) + "\x00" + actualType
+	if memo != nil {
+		memo.mu.Lock()
+		cached, ok := memo.values[key]
+		memo.mu.Unlock()
+		if ok {
+			return cached
+		}
+	}
+	spellings := []string{actualType}
+	for _, instantiated := range i.instantiatedTypeHierarchyLocked(ctx, file, actualType) {
+		spellings = append(spellings, instantiatedTypeName(instantiated.symbol.Name, instantiated.arguments))
+		if instantiated.symbol.FQN != "" && instantiated.symbol.FQN != instantiated.symbol.Name {
+			spellings = append(spellings, instantiatedTypeName(instantiated.symbol.FQN, instantiated.arguments))
+		}
+	}
+	if memo != nil && ctx.Err() == nil {
+		memo.mu.Lock()
+		if len(memo.values) < 4096 {
+			memo.values[key] = spellings
+		}
+		memo.mu.Unlock()
+	}
+	return spellings
+}
+
+type receiverSpellingsKey struct{}
+
+// receiverSpellingsMemo holds what one request learns about types and may
+// ask again: a receiver's supertype spellings and bound checks.
+type receiverSpellingsMemo struct {
+	mu       sync.Mutex
+	values   map[string][]string
+	subtypes map[string]bool
+}
+
+// withReceiverSpellingsMemo scopes receiverTypeSpellingsLocked's memo to one
+// request, which holds the index lock throughout, so the hierarchy it
+// remembers cannot change underneath it.
+func withReceiverSpellingsMemo(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Value(receiverSpellingsKey{}).(*receiverSpellingsMemo); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, receiverSpellingsKey{}, &receiverSpellingsMemo{values: make(map[string][]string), subtypes: make(map[string]bool)})
 }
 
 // spellingReceiverOwners names the extension buckets a receiver type can reach
@@ -879,8 +1283,8 @@ func spellingReceiverOwners(typeName string) []analysis.Symbol {
 	return owners
 }
 
-func (i *Index) extensionReceiverApplicableLocked(file *analysis.ParsedFile, extension analysis.Symbol, actualType string) bool {
-	_, applicable := i.extensionReceiverBindingsLocked(file, extension, actualType)
+func (i *Index) extensionReceiverApplicableLocked(ctx context.Context, file *analysis.ParsedFile, extension analysis.Symbol, actualType string) bool {
+	_, applicable := i.extensionReceiverBindingsLocked(ctx, file, extension, actualType)
 	return applicable
 }
 
@@ -890,16 +1294,12 @@ type instantiatedTypeOwner struct {
 	distance  int
 }
 
-func (i *Index) instantiatedTypeHierarchyLocked(file *analysis.ParsedFile, typeName string) []instantiatedTypeOwner {
-	result, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(context.Background(), file, typeName, 4096, newAccessibilityMemoLocked(i, file))
+func (i *Index) instantiatedTypeHierarchyLocked(ctx context.Context, file *analysis.ParsedFile, typeName string) []instantiatedTypeOwner {
+	result, complete := i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, typeName, 4096, newAccessibilityMemoLocked(i, file))
 	if !complete {
 		return nil
 	}
 	return result
-}
-
-func (i *Index) instantiatedTypeHierarchyBoundedLocked(ctx context.Context, file *analysis.ParsedFile, typeName string, limit int) ([]instantiatedTypeOwner, bool) {
-	return i.instantiatedTypeHierarchyBoundedWithMemoLocked(ctx, file, typeName, limit, newAccessibilityMemoLocked(i, file))
 }
 
 func (i *Index) instantiatedTypeHierarchyBoundedWithMemoLocked(ctx context.Context, file *analysis.ParsedFile, typeName string, limit int, access *accessibilityMemo) ([]instantiatedTypeOwner, bool) {
@@ -984,6 +1384,13 @@ func (i *Index) instantiatedTypeHierarchyBoundedWithMemoLocked(ctx context.Conte
 					// are read later from the call site; spell them for it.
 					next = append(next, pendingOwner{name: substituteTypeParameters(i.respellDeclaredTypeLocked(file, symbol, supertype), symbol.TypeParameters, arguments), distance: pending.distance + 1, resolutionFile: declarationFile, lexicalOwner: symbol})
 				}
+				// Every class has supertypes nobody writes: `toString`, `equals`
+				// and `hashCode` come from Any/Object, and an enum's `name` and
+				// `ordinal` from Enum. Without them they were absent from
+				// completion and could not be resolved or typed.
+				for _, implicit := range implicitSupertypes(symbol) {
+					next = append(next, pendingOwner{name: implicit, distance: pending.distance + 1, resolutionFile: declarationFile, lexicalOwner: symbol})
+				}
 			}
 		}
 		current = next
@@ -994,6 +1401,13 @@ func (i *Index) instantiatedTypeHierarchyBoundedWithMemoLocked(ctx context.Conte
 func (i *Index) enclosingTypeLocked(file *analysis.ParsedFile, at int) analysis.Symbol {
 	var found analysis.Symbol
 	for _, symbol := range file.Symbols {
+		// A Kotlin file's JVM facade (`URIExtKt`) is Java's view of its
+		// top-level declarations; code in the file is never inside it, and
+		// taking it for the enclosing class made `this` in a top-level
+		// extension function the facade.
+		if symbol.Synthetic && symbol.InteropLanguage == analysis.LanguageJava && file.Language == analysis.LanguageKotlin {
+			continue
+		}
 		if analysis.IsTypeKind(symbol.Kind) && symbol.StartByte <= at && at <= symbol.EndByte && (found.ID == "" || symbol.StartByte >= found.StartByte && symbol.EndByte <= found.EndByte) {
 			found = symbol
 		}
@@ -1004,47 +1418,6 @@ func (i *Index) enclosingTypeLocked(file *analysis.ParsedFile, at int) analysis.
 func (i *Index) symbolWithinCallableScopeLocked(file *analysis.ParsedFile, symbol analysis.Symbol, at int) bool {
 	container, ok := i.symbols[symbol.ContainerID]
 	return ok && analysis.IsCallableKind(container.Kind) && container.URI == file.URI && container.StartByte <= at && at <= container.EndByte
-}
-
-func (i *Index) typeAndSupertypesLocked(file *analysis.ParsedFile, typeName string) []string {
-	queue := splitIntersectionTypes(typeName)
-	seenTypes := map[string]bool{}
-	seenSymbols := map[string]bool{}
-	var out []string
-	for len(queue) > 0 {
-		if len(seenTypes) >= 4096 || len(queue) > 8192 || len(out) > 8192 {
-			return nil
-		}
-		instantiated := queue[0]
-		queue = queue[1:]
-		if instantiated == "" || seenTypes[instantiated] {
-			continue
-		}
-		seenTypes[instantiated] = true
-		base, arguments := splitInstantiatedType(instantiated)
-		symbols := i.resolveTypeSymbolsLocked(file, base)
-		if len(symbols) == 0 {
-			out = append(out, simpleType(base))
-			continue
-		}
-		for _, symbol := range symbols {
-			if seenSymbols[symbol.ID] {
-				continue
-			}
-			seenSymbols[symbol.ID] = true
-			out = append(out, symbol.Name)
-			if symbol.FQN != "" && symbol.FQN != symbol.Name {
-				out = append(out, symbol.FQN)
-			}
-			if symbol.Kind == analysis.KindTypeAlias && symbol.Type != "" {
-				queue = append(queue, substituteTypeParameters(symbol.Type, symbol.TypeParameters, arguments))
-			}
-			for _, supertype := range symbol.Supertypes {
-				queue = append(queue, substituteTypeParameters(supertype, symbol.TypeParameters, arguments))
-			}
-		}
-	}
-	return out
 }
 
 func splitIntersectionTypes(typeName string) []string {
@@ -1102,6 +1475,10 @@ type accessibilityMemo struct {
 	importsComplete   bool
 	importsByLocal    map[string][]analysis.Import
 	wildcardImports   []analysis.Import
+	// implicitWildcards counts the wildcard imports a file has without writing
+	// them (a Gradle script's two hundred defaults). They are a fixed table,
+	// not work the file asks for, so they are not charged to its budget.
+	implicitWildcards int
 }
 
 // A non-module key keeps a newly indexed archive inaccessible until the build
@@ -1128,17 +1505,70 @@ func (i *Index) prepareResolutionImportsLocked(file *analysis.ParsedFile, memo *
 	if !memo.consumeWork(len(file.Imports)) {
 		return false
 	}
-	memo.importsByLocal = make(map[string][]analysis.Import)
-	for _, imported := range file.Imports {
+	// The tables depend only on the file's imports, so they are built once per
+	// version of its text rather than for every reference resolved in it.
+	importTableCache.Lock()
+	cached, known := importTableCache.values[file.URI]
+	importTableCache.Unlock()
+	if known && cached.textHash == file.TextHash {
+		memo.importsByLocal, memo.wildcardImports, memo.implicitWildcards = cached.byLocal, cached.wildcard, cached.implicitWildcards
+		memo.importsComplete = true
+		return true
+	}
+	byLocal := make(map[string][]analysis.Import)
+	var wildcard []analysis.Import
+	effective := i.effectiveImportsLocked(file)
+	implicitWildcards := 0
+	for index, imported := range effective {
+		if index >= len(file.Imports) && imported.Wildcard {
+			implicitWildcards++
+		}
+	}
+	for _, imported := range effective {
 		if imported.Wildcard {
-			memo.wildcardImports = append(memo.wildcardImports, imported)
+			wildcard = append(wildcard, imported)
 			continue
 		}
 		name := imported.LocalName()
-		memo.importsByLocal[name] = append(memo.importsByLocal[name], imported)
+		byLocal[name] = append(byLocal[name], imported)
 	}
+	importTableCache.Lock()
+	if importTableCache.values == nil || len(importTableCache.values) > 4096 {
+		importTableCache.values = make(map[protocol.URI]importTables)
+	}
+	importTableCache.values[file.URI] = importTables{textHash: file.TextHash, byLocal: byLocal, wildcard: wildcard, implicitWildcards: implicitWildcards}
+	importTableCache.Unlock()
+	memo.importsByLocal, memo.wildcardImports, memo.implicitWildcards = byLocal, wildcard, implicitWildcards
 	memo.importsComplete = true
 	return true
+}
+
+type moduleAccessKey struct {
+	owner                      *Index // the environment version is per index
+	root, name, dir, sourceSet string
+	environment                uint64
+}
+
+type moduleAccessResult struct {
+	access   map[string]bool
+	complete bool
+}
+
+var moduleAccessCache struct {
+	sync.Mutex
+	values map[moduleAccessKey]moduleAccessResult
+}
+
+type importTables struct {
+	textHash          uint64
+	byLocal           map[string][]analysis.Import
+	wildcard          []analysis.Import
+	implicitWildcards int
+}
+
+var importTableCache struct {
+	sync.Mutex
+	values map[protocol.URI]importTables
 }
 
 func (i *Index) javaReadableWithMemoLocked(memo *accessibilityMemo, moduleName string) bool {
@@ -1226,13 +1656,31 @@ func (i *Index) moduleCanAccessWithMemoLocked(memo *accessibilityMemo, target *M
 		return false
 	}
 	if !memo.moduleReady {
-		byName := make(map[string][]*ModuleInfo, len(i.modules))
-		for index := range i.modules {
-			module := &i.modules[index]
-			key := module.Root + "\x00" + module.Name
-			byName[key] = append(byName[key], module)
+		// The set of modules a module can see changes only with the build
+		// model, whose every mutation moves the environment version, yet it was
+		// rebuilt -- walking the dependency graph -- for every single reference
+		// resolved.
+		key := moduleAccessKey{owner: i, root: from.Root, name: from.Name, dir: from.Dir, sourceSet: memo.fromSourceSet, environment: i.semanticEnvironmentVersion}
+		moduleAccessCache.Lock()
+		cached, known := moduleAccessCache.values[key]
+		moduleAccessCache.Unlock()
+		if known {
+			memo.moduleAccess, memo.moduleComplete = cached.access, cached.complete
+		} else {
+			byName := make(map[string][]*ModuleInfo, len(i.modules))
+			for index := range i.modules {
+				module := &i.modules[index]
+				name := module.Root + "\x00" + module.Name
+				byName[name] = append(byName[name], module)
+			}
+			memo.moduleAccess, memo.moduleComplete = moduleAccessSet(from, memo.fromSourceSet, byName)
+			moduleAccessCache.Lock()
+			if moduleAccessCache.values == nil || len(moduleAccessCache.values) > 1024 {
+				moduleAccessCache.values = make(map[moduleAccessKey]moduleAccessResult)
+			}
+			moduleAccessCache.values[key] = moduleAccessResult{access: memo.moduleAccess, complete: memo.moduleComplete}
+			moduleAccessCache.Unlock()
 		}
-		memo.moduleAccess, memo.moduleComplete = moduleAccessSet(from, memo.fromSourceSet, byName)
 		memo.moduleReady = true
 	}
 	return memo.moduleComplete && memo.moduleAccess[moduleAccessIdentity(target)]
@@ -1308,11 +1756,11 @@ func (i *Index) accessibleWithMemoLocked(file *analysis.ParsedFile, symbol analy
 	if symbol.ContainerID != "" {
 		if owner, ok := i.symbols[symbol.ContainerID]; ok {
 			if IsLocalDeclarationOwner(*owner) {
-				if owner.URI != file.URI || len(positions) == 0 || symbol.ScopeStartByte > 0 && positions[0] < symbol.ScopeStartByte || symbol.ScopeEndByte > 0 && positions[0] > symbol.ScopeEndByte {
+				if owner.URI != file.URI || len(positions) == 0 || !symbol.InScopeAt(positions[0]) {
 					return false
 				}
 			}
-			if analysis.IsTypeKind(owner.Kind) && !i.accessibleWithMemoLocked(file, *owner, memo, positions...) {
+			if analysis.IsTypeKind(owner.Kind) && !i.accessibleWithMemoLocked(file, *i.realBinaryContainerLocked(owner), memo, positions...) {
 				return false
 			}
 		}
@@ -1335,7 +1783,11 @@ func (i *Index) accessibleWithMemoLocked(file *analysis.ParsedFile, symbol analy
 			return true
 		}
 		if len(positions) == 0 {
-			return false
+			// No position to check against: the name came from code in this
+			// file (an inferred type, a hierarchy root), which is where a
+			// private declaration is visible. Refusing it emptied the member
+			// list of every private nested class, `copy` included.
+			return true
 		}
 		owner, ok := i.symbols[symbol.ContainerID]
 		if !ok {
@@ -1348,6 +1800,13 @@ func (i *Index) accessibleWithMemoLocked(file *analysis.ParsedFile, symbol analy
 					break
 				}
 				owner = parent
+			}
+		} else if owner.Kind == analysis.KindObject && containsString(owner.Modifiers, "companion") {
+			// A companion's private members are visible throughout the class
+			// that contains it: `private val logger` in the companion is the
+			// class's logger.
+			if outer, exists := i.symbols[owner.ContainerID]; exists && analysis.IsTypeKind(outer.Kind) {
+				owner = outer
 			}
 		}
 		return owner.StartByte <= positions[0] && positions[0] <= owner.EndByte
@@ -1382,14 +1841,6 @@ func (i *Index) accessibleWithMemoLocked(file *analysis.ParsedFile, symbol analy
 
 func IsLocalDeclarationOwner(symbol analysis.Symbol) bool {
 	return analysis.IsCallableKind(symbol.Kind)
-}
-
-func (i *Index) kotlinObjectInstanceMemberLocked(symbol analysis.Symbol) bool {
-	if symbol.Language != analysis.LanguageKotlin || symbol.Synthetic || symbol.ContainerID == "" {
-		return false
-	}
-	owner, ok := i.symbols[symbol.ContainerID]
-	return ok && owner.Kind == analysis.KindObject
 }
 
 func (i *Index) typeQualifierActsAsValueLocked(file *analysis.ParsedFile, types []analysis.Symbol) bool {
@@ -1444,7 +1895,7 @@ func nestedTypeCapturesOuter(nested, outer analysis.Symbol) bool {
 func (i *Index) extensionVisibleLocked(file *analysis.ParsedFile, symbol analysis.Symbol, positions ...int) bool {
 	if symbol.ContainerID != "" {
 		if owner, ok := i.symbols[symbol.ContainerID]; ok && analysis.IsCallableKind(owner.Kind) {
-			if symbol.URI != file.URI || len(positions) == 0 || symbol.ScopeStartByte > 0 && positions[0] < symbol.ScopeStartByte || symbol.ScopeEndByte > 0 && positions[0] > symbol.ScopeEndByte {
+			if symbol.URI != file.URI || len(positions) == 0 || !symbol.InScopeAt(positions[0]) {
 				return false
 			}
 		}
@@ -1460,7 +1911,7 @@ func (i *Index) extensionVisibleLocked(file *analysis.ParsedFile, symbol analysi
 	if symbol.ContainerID == "" {
 		return i.topLevelVisibleLocked(file, symbol)
 	}
-	for _, imp := range file.Imports {
+	for _, imp := range i.effectiveImportsLocked(file) {
 		if imp.Path == symbol.FQN || imp.Wildcard && imp.Path == symbol.Package {
 			return true
 		}
@@ -1516,4 +1967,151 @@ func (i *Index) symbolsForIDsLocked(ids []string, accept func(analysis.Symbol) b
 		}
 	}
 	return out
+}
+
+// implicitSupertypes lists the supertypes a declaration has without spelling
+// them, fully qualified so they resolve from any file.
+func implicitSupertypes(symbol analysis.Symbol) []string {
+	switch symbol.Kind {
+	case analysis.KindClass, analysis.KindInterface, analysis.KindObject, analysis.KindEnum, analysis.KindRecord, analysis.KindAnnotation:
+	default:
+		return nil
+	}
+	switch symbol.Language {
+	case analysis.LanguageKotlin:
+		if symbol.FQN == "kotlin.Any" {
+			return nil
+		}
+		out := []string{"kotlin.Any"}
+		if symbol.Kind == analysis.KindEnum {
+			out = append(out, "kotlin.Enum<"+symbol.Name+">")
+		}
+		return out
+	case analysis.LanguageJava:
+		if symbol.FQN == "java.lang.Object" {
+			return nil
+		}
+		out := []string{"java.lang.Object"}
+		switch symbol.Kind {
+		case analysis.KindEnum:
+			out = append(out, "java.lang.Enum<"+symbol.Name+">")
+		case analysis.KindRecord:
+			out = append(out, "java.lang.Record")
+		}
+		return out
+	}
+	return nil
+}
+
+// preferSourceDeclarations drops a library copy of a type whose source
+// declaration is also indexed. The same class reaches the index twice when a
+// module's build output is on a classpath next to its sources; the source is
+// the one to navigate to and the copy only makes the name ambiguous.
+func preferSourceDeclarations(values []analysis.Symbol) []analysis.Symbol {
+	if len(values) < 2 {
+		return values
+	}
+	source := make(map[string]bool, len(values))
+	for _, value := range values {
+		if !value.Library && value.FQN != "" {
+			source[value.FQN] = true
+		}
+	}
+	if len(source) == 0 {
+		return values
+	}
+	kept := make([]analysis.Symbol, 0, len(values))
+	for _, value := range values {
+		if value.Library && source[value.FQN] {
+			continue
+		}
+		kept = append(kept, value)
+	}
+	return kept
+}
+
+// withoutVariance drops a use-site variance projection: a lambda for a
+// `Consumer<in T>` parameter receives a T, not an `in T`.
+func withoutVariance(typ string) string {
+	typ = strings.TrimSpace(typ)
+	for _, projection := range []string{"in ", "out ", "? extends ", "? super "} {
+		if strings.HasPrefix(typ, projection) {
+			return strings.TrimSpace(typ[len(projection):])
+		}
+	}
+	return typ
+}
+
+// realBinaryContainerLocked is the declaration a nested class file's outer
+// stub stands for. `JsonSubTypes$Type.class` renders a bare `JsonSubTypes`
+// around its class only to nest it; the stub has no modifiers of its own, so
+// judging access by it made every nested library type package-private.
+func (i *Index) realBinaryContainerLocked(owner *analysis.Symbol) *analysis.Symbol {
+	if owner == nil || !owner.Synthetic || !owner.Library || owner.FQN == "" || !analysis.IsTypeKind(owner.Kind) {
+		return owner
+	}
+	for _, id := range i.byFQN[owner.FQN] {
+		if real := i.symbols[id]; real != nil && !real.Synthetic && analysis.IsTypeKind(real.Kind) {
+			return real
+		}
+	}
+	return owner
+}
+
+// binaryNestedTypeIDsLocked lists the nested types of owner that were read
+// from class files of their own, whose container is that file's outer stub
+// rather than owner itself, so owner's member buckets never list them.
+func (i *Index) binaryNestedTypeIDsLocked(owner analysis.Symbol, name string) []string {
+	if owner.FQN == "" || owner.Name == "" {
+		return nil
+	}
+	bucket := i.byContainerName[owner.Name]
+	if name != "" {
+		bucket = i.byContainerMember[memberKey(owner.Name, name)]
+	}
+	var ids []string
+	for _, id := range bucket {
+		nested := i.symbols[id]
+		if nested == nil || nested.ContainerID == owner.ID || !analysis.IsTypeKind(nested.Kind) || nested.Synthetic || nested.FQN != owner.FQN+"."+nested.Name {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// lambdaArgumentAt reports whether the argument spanning [start, end) is a
+// lambda literal, possibly labelled (`loop@{ ... }`) or named (`block = { }`).
+func lambdaArgumentAt(text string, start, end int) bool {
+	if start < 0 || end > len(text) || start >= end {
+		return false
+	}
+	argument := strings.TrimSpace(text[start:end])
+	if name, value, named := namedArgument(argument); named && name != "" {
+		argument = strings.TrimSpace(value)
+	}
+	if at := strings.IndexByte(argument, '@'); at > 0 && at+1 < len(argument) && argument[at+1] == '{' && isSimpleIdentifier(argument[:at]) {
+		argument = argument[at+1:]
+	}
+	return strings.HasPrefix(argument, "{")
+}
+
+// explicitTypeArgumentsAfter reads the type argument list written right after
+// a callee's name (`withType<Jar>`, `mockk<Repo>`), or nil when there is none.
+func explicitTypeArgumentsAfter(text string, end int) []string {
+	if end < 0 || end >= len(text) || text[end] != '<' {
+		return nil
+	}
+	close := matchingTypeArgumentEnd(text, end)
+	if close < 0 || close-end > 512 {
+		return nil
+	}
+	arguments := splitTopLevelTypeArguments(text[end+1 : close])
+	for index := range arguments {
+		arguments[index] = strings.TrimSpace(arguments[index])
+		if arguments[index] == "" {
+			return nil
+		}
+	}
+	return arguments
 }

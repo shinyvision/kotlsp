@@ -56,6 +56,10 @@ type ResponseError struct {
 type recoverableReadError struct {
 	code    int
 	message string
+	// id carries the request this frame claimed to be, so a malformed request
+	// is answered rather than leaving the peer waiting for a response that can
+	// never arrive.
+	id json.RawMessage
 }
 
 func (e *recoverableReadError) Error() string { return e.message }
@@ -276,7 +280,9 @@ func (c *Conn) Run(ctx context.Context) error {
 		if err != nil {
 			var recoverable *recoverableReadError
 			if errors.As(err, &recoverable) {
-				_ = c.respond(nil, nil, &ResponseError{Code: recoverable.code, Message: recoverable.message})
+				// Answering with the frame's own id lets the peer fail that one
+				// request; a nil id leaves it waiting for a response forever.
+				_ = c.respond(recoverable.id, nil, &ResponseError{Code: recoverable.code, Message: recoverable.message})
 				continue
 			}
 			select {
@@ -520,17 +526,22 @@ func (c *Conn) read() (Message, error) {
 		return Message{}, &recoverableReadError{code: InvalidRequest, message: "invalid JSON-RPC message shape"}
 	}
 	if msg.JSONRPC != "2.0" {
-		return Message{}, &recoverableReadError{code: InvalidRequest, message: "unsupported JSON-RPC version"}
+		return Message{}, &recoverableReadError{code: InvalidRequest, message: "unsupported JSON-RPC version", id: msg.ID}
 	}
 	if msg.Method != "" {
 		if len(msg.Method) > 4096 || strings.IndexByte(msg.Method, 0) >= 0 {
-			return Message{}, &recoverableReadError{code: InvalidRequest, message: "JSON-RPC method exceeds its size or NUL-safety limit"}
+			return Message{}, &recoverableReadError{code: InvalidRequest, message: "JSON-RPC method exceeds its size or NUL-safety limit", id: msg.ID}
 		}
 		if len(msg.Result) != 0 || msg.Error != nil {
-			return Message{}, &recoverableReadError{code: InvalidRequest, message: "JSON-RPC request contains response fields"}
+			return Message{}, &recoverableReadError{code: InvalidRequest, message: "JSON-RPC request contains response fields", id: msg.ID}
 		}
 		if !validParamsShape(msg.Params) {
-			return Message{}, &recoverableReadError{code: InvalidRequest, message: "JSON-RPC params must be an object or array"}
+			return Message{}, &recoverableReadError{code: InvalidRequest, message: "JSON-RPC params must be an object or array", id: msg.ID}
+		}
+		if strings.TrimSpace(string(msg.Params)) == "null" {
+			// Absent and explicitly null mean the same thing to every handler,
+			// and treating them differently dropped whole requests.
+			msg.Params = nil
 		}
 	} else if len(msg.ID) != 0 {
 		if len(msg.Result) == 0 && msg.Error == nil || len(msg.Result) != 0 && msg.Error != nil {
@@ -545,12 +556,11 @@ func (c *Conn) read() (Message, error) {
 
 func validParamsShape(params json.RawMessage) bool {
 	trimmed := strings.TrimSpace(string(params))
-	return trimmed == "" || trimmed[0] == '{' || trimmed[0] == '['
-}
-
-func validRequestID(id json.RawMessage) bool {
-	_, valid := requestIDKey(id)
-	return valid
+	// JSON-RPC 2.0 allows params to be omitted, and clients spell that absence
+	// either way. Rejecting the null spelling silently discarded `shutdown`
+	// and `exit` from any client that sends it, so the server never replied
+	// and never exited.
+	return trimmed == "" || trimmed == "null" || trimmed[0] == '{' || trimmed[0] == '['
 }
 
 func requestIDKey(id json.RawMessage) (string, bool) {

@@ -4,8 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
@@ -148,6 +152,9 @@ func (i *Index) DefinitionsContext(ctx context.Context, uri protocol.URI, pos pr
 	// during cold semantic warm-up. Eight seconds covers central-directory
 	// inventory plus the workspace's directly imported archives without tying a
 	// request to the complete classpath scan.
+	if project, ok := i.gradleProjectDefinition(uri, pos); ok {
+		return []analysis.Symbol{project}
+	}
 	warmup := time.NewTimer(8 * time.Second)
 	defer warmup.Stop()
 	for {
@@ -190,7 +197,7 @@ func (i *Index) definitionsOnceContext(ctx context.Context, uri protocol.URI, po
 	if file == nil {
 		return nil
 	}
-	if resolved, handled := i.springDataDefinitionLocked(file, offset); handled {
+	if resolved, handled := i.springDataDefinitionLocked(ctx, file, offset); handled {
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -314,7 +321,7 @@ func (i *Index) CallSignaturesContext(ctx context.Context, uri protocol.URI, pos
 		if ctx.Err() != nil {
 			return nil, 0
 		}
-		score, hasTypes := i.callCompatibilityLocked(file, *reference, candidate)
+		score, hasTypes := i.callCompatibilityLocked(ctx, file, *reference, candidate)
 		scores[index] = score
 		if hasTypes && score > -1<<19 {
 			if !typed || score > best {
@@ -408,6 +415,8 @@ func (i *Index) PackageDefinitions(uri protocol.URI, pos protocol.Position) []pr
 }
 
 func (i *Index) PackageDefinitionsContext(ctx context.Context, uri protocol.URI, pos protocol.Position) []protocol.Location {
+	guard := i.lockGuard()
+	defer guard.release()
 	doc, ok := i.DocumentContext(ctx, uri)
 	if !ok {
 		return nil
@@ -452,14 +461,14 @@ func (i *Index) PackageDefinitionsContext(ctx context.Context, uri protocol.URI,
 		tokenEnd++
 	}
 	qualified := strings.ReplaceAll(strings.Trim(line[qualifiedStart:tokenEnd], "."), "`", "")
-	i.mu.RLock()
+	guard.RLock()
 	if len(i.packages[qualified]) > maxResolutionCandidates {
-		i.mu.RUnlock()
+		guard.RUnlock()
 		i.recordHealth("package-definition", qualified, "package directory inventory exceeded its 512-location safety limit and was withheld")
 		return nil
 	}
 	directories := append([]protocol.URI(nil), i.packages[qualified]...)
-	i.mu.RUnlock()
+	guard.RUnlock()
 	locations := make([]protocol.Location, 0, len(directories))
 	for index, directory := range directories {
 		if index&31 == 0 && ctx.Err() != nil {
@@ -496,7 +505,7 @@ func (i *Index) TypeDefinitionsContext(ctx context.Context, uri protocol.URI, po
 	}
 	typ := s.Type
 	if typ == "" || typ == "var" || typ == "val" {
-		typ = i.inferExpressionTypeLocked(file, s.Initializer, s.StartByte)
+		typ = i.inferExpressionTypeLocked(ctx, file, s.Initializer, s.StartByte)
 	}
 	if typ == "" {
 		return nil
@@ -598,9 +607,11 @@ func (i *Index) References(uri protocol.URI, pos protocol.Position, includeDecla
 }
 
 func (i *Index) ReferencesContext(ctx context.Context, uri protocol.URI, pos protocol.Position, includeDeclaration bool) []protocol.Location {
+	guard := i.lockGuard()
+	defer guard.release()
 	const (
-		maxUnresolvedReferenceFallback = 4096
-		maxReferenceCandidates         = 50_000
+		maxUnresolvedReferenceFallback = 20_000
+		maxReferenceCandidates         = 100_000
 	)
 	if ctx.Err() != nil {
 		return nil
@@ -609,10 +620,10 @@ func (i *Index) ReferencesContext(ctx context.Context, uri protocol.URI, pos pro
 	if !ok {
 		return nil
 	}
-	i.mu.RLock()
+	guard.RLock()
 	family := i.referenceFamilyLocked(target)
 	if len(family) == 0 {
-		i.mu.RUnlock()
+		guard.RUnlock()
 		i.recordHealth("references", target.Name, "reference identity family exceeded its safety limit and was withheld")
 		return nil
 	}
@@ -627,18 +638,34 @@ func (i *Index) ReferencesContext(ctx context.Context, uri protocol.URI, pos pro
 	referenceFiles := make(map[protocol.URI]*analysis.ParsedFile)
 	totalCandidates := 0
 	for _, member := range family {
-		unresolved := append([]analysis.Reference(nil), i.unresolvedRefsByName[member.Name]...)
-		if len(unresolved) > maxUnresolvedReferenceFallback {
-			i.mu.RUnlock()
-			i.recordHealth("references", member.Name, "unresolved reference fallback exceeded 4096 candidates and was withheld")
-			return nil
+		// References resolved before -- by an earlier request or by diagnostics
+		// and highlighting -- are answered from the shared memory; only the rest
+		// is resolved here.
+		unresolved := make([]analysis.Reference, 0)
+		direct := i.refsByTarget.get(member.ID)
+		for _, reference := range i.unresolvedRefsByName.get(member.Name) {
+			if cached, known := i.cachedResolutionLocked(i.files[reference.URI], reference); known {
+				for _, symbol := range cached {
+					if symbol.ID == member.ID {
+						direct = append(direct, reference)
+						break
+					}
+				}
+				continue
+			}
+			unresolved = append(unresolved, reference)
 		}
-		direct := append([]analysis.Reference(nil), i.refsByTarget[member.ID]...)
-		totalCandidates += len(direct) + len(unresolved)
-		if totalCandidates > maxReferenceCandidates {
-			i.mu.RUnlock()
-			i.recordHealth("references", target.Name, "reference set exceeded its 50000-candidate safety limit and was withheld")
-			return nil
+		// A name used this widely is resolved a slice at a time. What is
+		// resolved is remembered, so asking again continues from there; the
+		// answer is partial meanwhile rather than nothing -- an empty list is
+		// indistinguishable from "no references" and drops even the declaration.
+		if len(unresolved) > maxUnresolvedReferenceFallback {
+			i.recordHealth("references", member.Name, "unresolved references exceed 20000 candidates; resolved in slices across requests")
+			unresolved = unresolved[:maxUnresolvedReferenceFallback]
+		}
+		if totalCandidates += len(direct) + len(unresolved); totalCandidates > maxReferenceCandidates {
+			i.recordHealth("references", target.Name, "reference set exceeded 100000 candidates; remaining members were skipped")
+			unresolved = nil
 		}
 		work = append(work, referenceWork{
 			member: member, direct: direct,
@@ -648,7 +675,7 @@ func (i *Index) ReferencesContext(ctx context.Context, uri protocol.URI, pos pro
 			referenceFiles[reference.URI] = i.files[reference.URI]
 		}
 	}
-	i.mu.RUnlock()
+	guard.RUnlock()
 	out := make([]protocol.Location, 0)
 	if includeDeclaration {
 		for _, member := range family {
@@ -663,35 +690,15 @@ func (i *Index) ReferencesContext(ctx context.Context, uri protocol.URI, pos pro
 		for _, r := range item.direct {
 			out = append(out, protocol.Location{URI: r.URI, Range: r.Range})
 		}
-		unresolved := item.unresolved
-		for start := 0; start < len(unresolved); start += 128 {
-			if ctx.Err() != nil {
-				return nil
-			}
-			end := min(start+128, len(unresolved))
-			i.mu.RLock()
-			if i.semanticVersion != semanticVersion || i.semanticEnvironmentVersion != environmentVersion {
-				i.mu.RUnlock()
-				return nil
-			}
-			for _, r := range unresolved[start:end] {
-				file := referenceFiles[r.URI]
-				if i.files[r.URI] != file {
-					i.mu.RUnlock()
-					return nil
-				}
-				if file == nil {
-					continue
-				}
-				resolved := i.resolveContextLocked(ctx, file, r)
-				for _, s := range resolved {
-					if s.ID == member.ID {
-						out = append(out, protocol.Location{URI: r.URI, Range: r.Range})
-						break
-					}
-				}
-			}
-			i.mu.RUnlock()
+		found, outcome := i.resolveReferenceChunks(ctx, item.unresolved, member.ID, referenceFiles, semanticVersion, environmentVersion)
+		out = append(out, found...)
+		switch outcome {
+		case resolutionStale:
+			return nil
+		case resolutionOutOfBudget:
+			// What was resolved is remembered, so asking again finishes the rest;
+			// the partial list is better than none.
+			return uniqueLocations(out)
 		}
 	}
 	return uniqueLocations(out)
@@ -1039,6 +1046,7 @@ func (i *Index) SymbolsInFile(uri protocol.URI) []analysis.Symbol {
 // InferredType resolves a declaration initializer using the same constructor,
 // factory, literal, and collection inference used by member completion.
 func (i *Index) InferredType(uri protocol.URI, symbolID string) string {
+	ctx := context.Background()
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	file := i.files[uri]
@@ -1047,9 +1055,53 @@ func (i *Index) InferredType(uri protocol.URI, symbolID string) string {
 		return ""
 	}
 	if symbol.Type != "" && symbol.Type != "var" {
-		return simpleType(symbol.Type)
+		return displayTypeName(symbol.Type)
 	}
-	return simpleType(i.inferExpressionTypeLocked(file, symbol.Initializer, symbol.StartByte))
+	return displayTypeName(i.inferExpressionTypeLocked(ctx, file, symbol.Initializer, symbol.StartByte))
+}
+
+// displayTypeName spells a type for reading: every qualified name by its
+// simple name, type arguments kept -- `Set<UUID>`, not
+// `kotlin.collections.Set<java.util.UUID>` and not a bare `Set`.
+func displayTypeName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if ref, ok := parseTypeRef(value); ok {
+		return ref.transform(func(t typeRef) typeRef {
+			if t.Name != "" {
+				t.Name = simpleClassName(t.Name)
+			}
+			return t
+		}).String()
+	}
+	var out strings.Builder
+	for index := 0; index < len(value); {
+		c := value[index]
+		if !(c == '_' || c == '$' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+			out.WriteByte(c)
+			index++
+			continue
+		}
+		end := index
+		for end < len(value) && (value[end] == '_' || value[end] == '$' || value[end] == '.' || value[end] >= 'a' && value[end] <= 'z' || value[end] >= 'A' && value[end] <= 'Z' || value[end] >= '0' && value[end] <= '9') {
+			end++
+		}
+		name := strings.TrimRight(value[index:end], ".")
+		// A dotted name is a package path and a class, possibly nested:
+		// `Outer.Inner` keeps its outer class, `java.util.UUID` drops its
+		// package.
+		segments := strings.Split(name, ".")
+		first := 0
+		for first < len(segments)-1 && segments[first] != "" && segments[first][0] >= 'a' && segments[first][0] <= 'z' {
+			first++
+		}
+		out.WriteString(strings.Join(segments[first:], "."))
+		out.WriteString(value[index+len(name) : end])
+		index = end
+	}
+	return out.String()
 }
 
 func (i *Index) FunctionalParameterTypes(uri protocol.URI, typeName string) []string {
@@ -1135,6 +1187,8 @@ func (i *Index) CallsFrom(item analysis.Symbol) map[string][]analysis.Reference 
 }
 
 func (i *Index) CallsFromContext(ctx context.Context, item analysis.Symbol) map[string][]analysis.Reference {
+	guard := i.lockGuard()
+	defer guard.release()
 	const maxCallHierarchyCandidates = 50_000
 	if document, ok := i.DocumentContext(ctx, item.URI); ok {
 		i.ensureLibraryReferencesContext(ctx, item.URI, document)
@@ -1143,10 +1197,10 @@ func (i *Index) CallsFromContext(ctx context.Context, item analysis.Symbol) map[
 	if ctx.Err() != nil {
 		return empty
 	}
-	i.mu.RLock()
+	guard.RLock()
 	f := i.files[item.URI]
 	if f == nil {
-		i.mu.RUnlock()
+		guard.RUnlock()
 		return empty
 	}
 	semanticVersion := i.semanticVersion
@@ -1160,7 +1214,7 @@ func (i *Index) CallsFromContext(ctx context.Context, item analysis.Symbol) map[
 			}
 		}
 	}
-	i.mu.RUnlock()
+	guard.RUnlock()
 	if len(candidates) > maxCallHierarchyCandidates {
 		i.recordHealth("call-hierarchy", item.Name, "outgoing call set exceeded its 50000-candidate safety limit and was withheld")
 		return empty
@@ -1171,9 +1225,9 @@ func (i *Index) CallsFromContext(ctx context.Context, item analysis.Symbol) map[
 			return empty
 		}
 		end := min(start+128, len(candidates))
-		i.mu.RLock()
+		guard.RLock()
 		if i.semanticVersion != semanticVersion || i.semanticEnvironmentVersion != environmentVersion || i.files[item.URI] != f {
-			i.mu.RUnlock()
+			guard.RUnlock()
 			return empty
 		}
 		for _, reference := range candidates[start:end] {
@@ -1181,7 +1235,7 @@ func (i *Index) CallsFromContext(ctx context.Context, item analysis.Symbol) map[
 				out[symbol.ID] = append(out[symbol.ID], reference)
 			}
 		}
-		i.mu.RUnlock()
+		guard.RUnlock()
 	}
 	return out
 }
@@ -1191,6 +1245,8 @@ func (i *Index) CallsTo(item analysis.Symbol) map[string][]analysis.Reference {
 }
 
 func (i *Index) CallsToContext(ctx context.Context, item analysis.Symbol) map[string][]analysis.Reference {
+	guard := i.lockGuard()
+	defer guard.release()
 	const (
 		maxUnresolvedCallFallback  = 4096
 		maxCallHierarchyCandidates = 50_000
@@ -1199,7 +1255,7 @@ func (i *Index) CallsToContext(ctx context.Context, item analysis.Symbol) map[st
 	if ctx.Err() != nil {
 		return empty
 	}
-	i.mu.RLock()
+	guard.RLock()
 	semanticVersion := i.semanticVersion
 	environmentVersion := i.semanticEnvironmentVersion
 	type callWork struct {
@@ -1211,8 +1267,20 @@ func (i *Index) CallsToContext(ctx context.Context, item analysis.Symbol) map[st
 	referenceFiles := make(map[protocol.URI]*analysis.ParsedFile)
 	totalCandidates := 0
 	for _, member := range i.referenceFamilyLocked(item) {
-		direct := append([]analysis.Reference(nil), i.refsByTarget[member.ID]...)
-		unresolved := append([]analysis.Reference(nil), i.unresolvedRefsByName[member.Name]...)
+		direct := i.refsByTarget.get(member.ID)
+		unresolved := make([]analysis.Reference, 0)
+		for _, reference := range i.unresolvedRefsByName.get(member.Name) {
+			if cached, known := i.cachedResolutionLocked(i.files[reference.URI], reference); known {
+				for _, symbol := range cached {
+					if symbol.ID == member.ID {
+						direct = append(direct, reference)
+						break
+					}
+				}
+				continue
+			}
+			unresolved = append(unresolved, reference)
+		}
 		if len(unresolved) > maxUnresolvedCallFallback {
 			i.recordHealth("call-hierarchy", member.Name, "unresolved call fallback exceeded 4096 candidates and was withheld")
 			unresolved = nil
@@ -1223,7 +1291,7 @@ func (i *Index) CallsToContext(ctx context.Context, item analysis.Symbol) map[st
 			referenceFiles[reference.URI] = i.files[reference.URI]
 		}
 	}
-	i.mu.RUnlock()
+	guard.RUnlock()
 	if totalCandidates > maxCallHierarchyCandidates {
 		i.recordHealth("call-hierarchy", item.Name, "incoming call set exceeded its 50000-candidate safety limit and was withheld")
 		return empty
@@ -1235,33 +1303,23 @@ func (i *Index) CallsToContext(ctx context.Context, item analysis.Symbol) map[st
 				out[reference.ContainerID] = append(out[reference.ContainerID], reference)
 			}
 		}
-		for start := 0; start < len(entry.unresolved); start += 128 {
-			if ctx.Err() != nil {
-				return empty
-			}
-			end := min(start+128, len(entry.unresolved))
-			i.mu.RLock()
-			if i.semanticVersion != semanticVersion || i.semanticEnvironmentVersion != environmentVersion {
-				i.mu.RUnlock()
-				return empty
-			}
-			for _, reference := range entry.unresolved[start:end] {
-				file := referenceFiles[reference.URI]
-				if i.files[reference.URI] != file {
-					i.mu.RUnlock()
-					return empty
-				}
-				if file == nil || reference.Role != analysis.RoleCall {
-					continue
-				}
-				for _, resolved := range i.resolveContextLocked(ctx, file, reference) {
-					if resolved.ID == entry.member.ID {
+		outcome := i.resolveInParallel(ctx, entry.unresolved, referenceFiles, semanticVersion, environmentVersion,
+			func(reference analysis.Reference) bool { return reference.Role != analysis.RoleCall },
+			func(reference analysis.Reference, resolved []analysis.Symbol) {
+				for _, candidate := range resolved {
+					if candidate.ID == entry.member.ID {
 						out[reference.ContainerID] = append(out[reference.ContainerID], reference)
 						break
 					}
 				}
-			}
-			i.mu.RUnlock()
+			})
+		switch outcome {
+		case resolutionStale:
+			return empty
+		case resolutionOutOfBudget:
+			// Out of budget: what was resolved is remembered, so asking again
+			// finishes the rest, and a partial answer beats none.
+			return out
 		}
 	}
 	return out
@@ -1302,7 +1360,7 @@ func (i *Index) renameAnalysisSnapshotLocked(target analysis.Symbol, limit int) 
 		if member.Library {
 			return renameAnalysisSnapshot{origin: origin, failure: "rename family crosses a read-only library declaration"}, false
 		}
-		candidateCount += len(i.refsByName[member.Name])
+		candidateCount += i.refsByName.count(member.Name)
 		if candidateCount > limit {
 			return renameAnalysisSnapshot{origin: origin, failure: "rename candidate set exceeded its 10000-reference safety limit"}, false
 		}
@@ -1313,7 +1371,7 @@ func (i *Index) renameAnalysisSnapshotLocked(target analysis.Symbol, limit int) 
 		semanticVersion: i.semanticVersion, environmentVersion: i.semanticEnvironmentVersion,
 	}
 	for _, member := range family {
-		references := append([]analysis.Reference(nil), i.refsByName[member.Name]...)
+		references := i.refsByName.get(member.Name)
 		snapshot.work = append(snapshot.work, renameReferenceWork{member: member, references: references})
 		snapshot.files[member.URI] = i.files[member.URI]
 		for _, reference := range references {
@@ -1339,21 +1397,23 @@ func (i *Index) renameSnapshotCurrentLocked(snapshot renameAnalysisSnapshot) boo
 }
 
 func (i *Index) resolveRenameReferencesContext(ctx context.Context, snapshot renameAnalysisSnapshot, work renameReferenceWork) ([]bool, bool) {
+	guard := i.lockGuard()
+	defer guard.release()
 	matches := make([]bool, len(work.references))
 	for start := 0; start < len(work.references); start += 128 {
 		if ctx.Err() != nil {
 			return nil, false
 		}
 		end := min(start+128, len(work.references))
-		i.mu.RLock()
+		guard.RLock()
 		if i.semanticVersion != snapshot.semanticVersion || i.semanticEnvironmentVersion != snapshot.environmentVersion {
-			i.mu.RUnlock()
+			guard.RUnlock()
 			return nil, false
 		}
 		for offset, reference := range work.references[start:end] {
 			file := snapshot.files[reference.URI]
 			if i.files[reference.URI] != file {
-				i.mu.RUnlock()
+				guard.RUnlock()
 				return nil, false
 			}
 			if file == nil {
@@ -1366,12 +1426,14 @@ func (i *Index) resolveRenameReferencesContext(ctx context.Context, snapshot ren
 				}
 			}
 		}
-		i.mu.RUnlock()
+		guard.RUnlock()
 	}
 	return matches, true
 }
 
 func (i *Index) RenameContext(ctx context.Context, uri protocol.URI, pos protocol.Position, newName string) protocol.WorkspaceEdit {
+	guard := i.lockGuard()
+	defer guard.release()
 	const maxRenameCandidates = 10000
 	if ctx == nil {
 		ctx = context.Background()
@@ -1385,9 +1447,9 @@ func (i *Index) RenameContext(ctx context.Context, uri protocol.URI, pos protoco
 		return empty
 	}
 	changes := make(map[protocol.URI][]protocol.TextEdit)
-	i.mu.RLock()
+	guard.RLock()
 	snapshot, complete := i.renameAnalysisSnapshotLocked(target, maxRenameCandidates)
-	i.mu.RUnlock()
+	guard.RUnlock()
 	if !complete {
 		i.recordHealth("rename", snapshot.origin.Name, snapshot.failure)
 		return empty
@@ -1429,9 +1491,9 @@ func (i *Index) RenameContext(ctx context.Context, uri protocol.URI, pos protoco
 			add(protocol.Location{URI: reference.URI, Range: reference.Range}, replacement)
 		}
 	}
-	i.mu.RLock()
+	guard.RLock()
 	snapshotCurrent := i.renameSnapshotCurrentLocked(snapshot)
-	i.mu.RUnlock()
+	guard.RUnlock()
 	if !snapshotCurrent {
 		return empty
 	}
@@ -1450,6 +1512,8 @@ func (i *Index) Renameable(uri protocol.URI, pos protocol.Position) bool {
 }
 
 func (i *Index) RenameableContext(ctx context.Context, uri protocol.URI, pos protocol.Position) bool {
+	guard := i.lockGuard()
+	defer guard.release()
 	const maxRenameCandidates = 10000
 	if ctx == nil {
 		ctx = context.Background()
@@ -1461,9 +1525,9 @@ func (i *Index) RenameableContext(ctx context.Context, uri protocol.URI, pos pro
 	if !ok || target.Library {
 		return false
 	}
-	i.mu.RLock()
+	guard.RLock()
 	snapshot, complete := i.renameAnalysisSnapshotLocked(target, maxRenameCandidates)
-	i.mu.RUnlock()
+	guard.RUnlock()
 	if !complete {
 		i.recordHealth("rename", snapshot.origin.Name, snapshot.failure)
 		return false
@@ -1486,9 +1550,9 @@ func (i *Index) RenameableContext(ctx context.Context, uri protocol.URI, pos pro
 			}
 		}
 	}
-	i.mu.RLock()
+	guard.RLock()
 	current := i.renameSnapshotCurrentLocked(snapshot)
-	i.mu.RUnlock()
+	guard.RUnlock()
 	return current
 }
 
@@ -1552,6 +1616,8 @@ func (i *Index) SemanticTokens(uri protocol.URI) ([]analysis.Token, uint64, bool
 }
 
 func (i *Index) SemanticTokensContext(ctx context.Context, uri protocol.URI) ([]analysis.Token, uint64, bool) {
+	guard := i.lockGuard()
+	defer guard.release()
 	if ctx.Err() != nil {
 		return nil, 0, false
 	}
@@ -1559,7 +1625,7 @@ func (i *Index) SemanticTokensContext(ctx context.Context, uri protocol.URI) ([]
 	cached, cachedOK := i.semanticTokenCache[uri]
 	i.semanticCacheMu.RUnlock()
 	if cachedOK {
-		i.mu.RLock()
+		guard.RLock()
 		file := i.files[uri]
 		valid := file != nil && file.TextHash == cached.textHash && i.semanticEnvironmentVersion == cached.environmentVersion
 		checked := 0
@@ -1570,11 +1636,11 @@ func (i *Index) SemanticTokensContext(ctx context.Context, uri protocol.URI) ([]
 			checked++
 			valid = valid && i.semanticSymbolVersion[id] == version
 			if checked&1023 == 0 {
-				i.mu.RUnlock()
+				guard.RUnlock()
 				if ctx.Err() != nil {
 					return nil, 0, false
 				}
-				i.mu.RLock()
+				guard.RLock()
 				valid = valid && i.files[uri] == file && i.semanticEnvironmentVersion == cached.environmentVersion
 			}
 		}
@@ -1583,11 +1649,11 @@ func (i *Index) SemanticTokensContext(ctx context.Context, uri protocol.URI) ([]
 				checked++
 				valid = valid && i.semanticNameVersion[name] == version
 				if checked&1023 == 0 {
-					i.mu.RUnlock()
+					guard.RUnlock()
 					if ctx.Err() != nil {
 						return nil, 0, false
 					}
-					i.mu.RLock()
+					guard.RLock()
 					valid = valid && i.files[uri] == file && i.semanticEnvironmentVersion == cached.environmentVersion
 				}
 				if !valid {
@@ -1595,29 +1661,30 @@ func (i *Index) SemanticTokensContext(ctx context.Context, uri protocol.URI) ([]
 				}
 			}
 		}
-		i.mu.RUnlock()
+		guard.RUnlock()
 		if valid {
 			return append([]analysis.Token(nil), cached.tokens...), cached.resultID, true
 		}
 	}
-	i.mu.RLock()
+	guard.RLock()
 	file := i.files[uri]
 	if file == nil {
-		i.mu.RUnlock()
+		guard.RUnlock()
 		return nil, 0, false
 	}
 	if len(file.Tokens) > 250_000 || len(file.Symbols) > 250_000 || len(file.References) > 250_000 {
-		i.mu.RUnlock()
+		guard.RUnlock()
 		i.recordHealth("semantic-tokens", string(uri), "document semantic inventory exceeds its 250000-item-per-kind safety limit")
 		return nil, 0, false
 	}
 	tokens := append([]analysis.Token(nil), file.Tokens...)
 	symbols := append([]analysis.Symbol(nil), file.Symbols...)
 	references := append([]analysis.Reference(nil), file.References...)
+	documentText := i.documentTextLocked(uri)
 	textHash := file.TextHash
 	semanticVersion := i.semanticVersion
 	environmentVersion := i.semanticEnvironmentVersion
-	i.mu.RUnlock()
+	guard.RUnlock()
 	type semanticClassification struct {
 		typ       uint32
 		modifiers uint32
@@ -1630,6 +1697,11 @@ func (i *Index) SemanticTokensContext(ctx context.Context, uri protocol.URI) ([]
 	for _, symbol := range symbols {
 		if ctx.Err() != nil {
 			return nil, 0, false
+		}
+		// The implicit `it` is declared at its lambda's brace, which is no
+		// parameter to colour.
+		if documentText != "" && (symbol.NameStartByte < 0 || symbol.NameEndByte > len(documentText) || symbol.NameStartByte >= symbol.NameEndByte || strings.Trim(documentText[symbol.NameStartByte:symbol.NameEndByte], "`") != symbol.Name) {
+			continue
 		}
 		key := [2]int{symbol.NameStartByte, symbol.NameEndByte}
 		declarationSpans[key] = true
@@ -1645,32 +1717,34 @@ func (i *Index) SemanticTokensContext(ctx context.Context, uri protocol.URI) ([]
 	// Resolution remains a coherent generation but yields the read lock after
 	// bounded batches. A writer can proceed between batches; if it changes any
 	// semantic input, this result is discarded instead of mixing generations.
-	const semanticResolutionBatch = 128
-	for start := 0; start < len(references); start += semanticResolutionBatch {
-		if ctx.Err() != nil {
-			return nil, 0, false
-		}
-		end := min(start+semanticResolutionBatch, len(references))
-		i.mu.RLock()
-		if i.files[uri] != file || i.semanticVersion != semanticVersion || i.semanticEnvironmentVersion != environmentVersion {
-			i.mu.RUnlock()
-			return nil, 0, false
-		}
-		for _, reference := range references[start:end] {
-			key := [2]int{reference.StartByte, reference.EndByte}
-			nameVersions[reference.Name] = i.semanticNameVersion[reference.Name]
-			if declarationSpans[key] {
-				continue
-			}
-			resolved := i.resolveContextLocked(ctx, file, reference)
+	guard.RLock()
+	if i.files[uri] != file || i.semanticVersion != semanticVersion || i.semanticEnvironmentVersion != environmentVersion {
+		guard.RUnlock()
+		return nil, 0, false
+	}
+	for _, reference := range references {
+		nameVersions[reference.Name] = i.semanticNameVersion[reference.Name]
+	}
+	guard.RUnlock()
+	outcome := i.resolveInParallel(ctx, references, map[protocol.URI]*analysis.ParsedFile{uri: file}, semanticVersion, environmentVersion,
+		func(reference analysis.Reference) bool {
+			// Operator conventions (`!=` is `equals`) and the `invoke` at a
+			// call's parenthesis are not spelled where they stand; colouring
+			// them painted `(` as a method.
+			return declarationSpans[[2]int{reference.StartByte, reference.EndByte}] || documentText != "" && !referenceSpelledAt(documentText, reference) && !strings.HasPrefix(documentText[min(reference.StartByte, len(documentText)):], "`"+reference.Name+"`")
+		},
+		func(reference analysis.Reference, resolved []analysis.Symbol) {
 			for _, symbol := range resolved {
 				symbolVersions[symbol.ID] = i.semanticSymbolVersion[symbol.ID]
 			}
 			if typ, modifiers, unambiguous := semanticClassificationForResolution(resolved, reference.Role); unambiguous {
-				classifications[key] = semanticClassification{typ: typ, modifiers: modifiers}
+				classifications[[2]int{reference.StartByte, reference.EndByte}] = semanticClassification{typ: typ, modifiers: modifiers}
 			}
-		}
-		i.mu.RUnlock()
+		})
+	if outcome != resolutionComplete {
+		// Out of budget or the document moved on: a result mixing generations
+		// or missing classifications is discarded rather than served.
+		return nil, 0, false
 	}
 	for n := range tokens {
 		if n&1023 == 0 && ctx.Err() != nil {
@@ -1681,9 +1755,9 @@ func (i *Index) SemanticTokensContext(ctx context.Context, uri protocol.URI) ([]
 			tokens[n].Modifiers = classification.modifiers
 		}
 	}
-	i.mu.RLock()
+	guard.RLock()
 	coherent := i.files[uri] == file && i.semanticVersion == semanticVersion && i.semanticEnvironmentVersion == environmentVersion
-	i.mu.RUnlock()
+	guard.RUnlock()
 	if !coherent {
 		return nil, 0, false
 	}
@@ -1809,20 +1883,21 @@ func (i *Index) FilesImportingPrefixContext(ctx context.Context, prefix string, 
 // reference. Comments, strings, and fully-qualified expressions never enter
 // the parser's reference stream and therefore cannot keep an import alive.
 func (i *Index) UsedImports(uri protocol.URI) map[string]bool {
+	ctx := context.Background()
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	file := i.files[uri]
 	if file == nil {
 		return map[string]bool{}
 	}
-	return i.usedImportsLocked(file)
+	return i.usedImportsLocked(ctx, file)
 }
 
 // usedImportsLocked is the single confidence policy for both unused-import
 // diagnostics and organize-import edits. A warning that offers removal is
 // already destructive in practice, so it must obey the same abstention rules
 // as the explicit source action.
-func (i *Index) usedImportsLocked(file *analysis.ParsedFile) map[string]bool {
+func (i *Index) usedImportsLocked(ctx context.Context, file *analysis.ParsedFile) map[string]bool {
 	used := make(map[string]bool)
 	// Import removal is destructive. Broken syntax or an unbound reference
 	// means the fast semantic model is incomplete, so preserve every import and
@@ -1833,14 +1908,22 @@ func (i *Index) usedImportsLocked(file *analysis.ParsedFile) map[string]bool {
 			if languageIntrinsicReference(reference, file.Language) {
 				continue
 			}
-			if reference.Role != analysis.RoleImport && reference.Qualifier == "" && len(i.resolveLocked(file, reference)) == 0 {
+			if reference.Role != analysis.RoleImport && reference.Qualifier == "" && len(i.resolveLocked(ctx, file, reference)) == 0 {
 				incomplete = true
 				break
 			}
 		}
 	}
+	documented := kdocReferencedNames(i.documentTextLocked(file.URI))
 	for _, imported := range file.Imports {
 		if incomplete || imported.Wildcard {
+			used[imported.Path] = true
+			continue
+		}
+		// An import a doc comment links to (`[Authorities]`, `@throws
+		// NotFoundException`) is used: ktlint keeps it, and removing it breaks
+		// the link.
+		if documented[imported.LocalName()] {
 			used[imported.Path] = true
 			continue
 		}
@@ -1848,7 +1931,9 @@ func (i *Index) usedImportsLocked(file *analysis.ParsedFile) map[string]bool {
 		// callable's source name (operators are the common case). Keep callable
 		// imports unless an authoritative compiler-use model becomes available.
 		for _, id := range i.byFQN[imported.Path] {
-			if symbol := i.symbols[id]; symbol != nil && analysis.IsCallableKind(symbol.Kind) {
+			// An extension property (`group.memberProperties`) is reached
+			// through a receiver just like an extension function.
+			if symbol := i.symbols[id]; symbol != nil && (analysis.IsCallableKind(symbol.Kind) || symbol.ReceiverType != "") {
 				used[imported.Path] = true
 				break
 			}
@@ -1862,7 +1947,7 @@ func (i *Index) usedImportsLocked(file *analysis.ParsedFile) map[string]bool {
 				break
 			}
 			if imported.Wildcard {
-				for _, symbol := range i.resolveLocked(file, reference) {
+				for _, symbol := range i.resolveLocked(ctx, file, reference) {
 					if symbol.Package == imported.Path || strings.HasPrefix(symbol.FQN, imported.Path+".") {
 						used[imported.Path] = true
 						break
@@ -1887,4 +1972,138 @@ func importPrefixes(path string) []string {
 		out = append(out, strings.Join(parts[:n+1], "."))
 	}
 	return out
+}
+
+type resolutionOutcome int
+
+const (
+	resolutionComplete resolutionOutcome = iota
+	resolutionOutOfBudget
+	resolutionStale
+)
+
+// resolveInParallel resolves references by type inference, spreading batches
+// over the available cores. Resolution only reads the index and each batch
+// takes the read lock for itself, so batches run side by side. What each
+// reference resolves to is remembered, and found for a reference already
+// remembered comes straight from that memory. handle is called for every
+// reference that is not skipped, one call at a time, with what it resolved to.
+// A reference in skip is not resolved and not passed to handle.
+func (i *Index) resolveInParallel(ctx context.Context, references []analysis.Reference, files map[protocol.URI]*analysis.ParsedFile, semanticVersion, environmentVersion uint64, skip func(analysis.Reference) bool, handle func(reference analysis.Reference, resolved []analysis.Symbol)) resolutionOutcome {
+	const batch = 64
+	batches := (len(references) + batch - 1) / batch
+	if batches == 0 {
+		return resolutionComplete
+	}
+	workers := min(runtime.GOMAXPROCS(0), 8, batches)
+	jobs := make(chan int, batches)
+	for start := 0; start < len(references); start += batch {
+		jobs <- start
+	}
+	close(jobs)
+	var (
+		handleMu  sync.Mutex
+		stale     atomic.Bool
+		outOfTime atomic.Bool
+		wg        sync.WaitGroup
+	)
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer i.recoverBackground("resolveInParallel")
+			defer wg.Done()
+			for start := range jobs {
+				if stale.Load() {
+					continue
+				}
+				if ctx.Err() != nil {
+					outOfTime.Store(true)
+					continue
+				}
+				end := min(start+batch, len(references))
+				i.mu.RLock()
+				if i.semanticVersion != semanticVersion || i.semanticEnvironmentVersion != environmentVersion {
+					i.mu.RUnlock()
+					stale.Store(true)
+					continue
+				}
+				for _, reference := range references[start:end] {
+					file := files[reference.URI]
+					if i.files[reference.URI] != file {
+						stale.Store(true)
+						break
+					}
+					if file == nil || skip != nil && skip(reference) {
+						continue
+					}
+					resolved := i.resolveContextLocked(ctx, file, reference)
+					handleMu.Lock()
+					handle(reference, resolved)
+					handleMu.Unlock()
+				}
+				i.mu.RUnlock()
+			}
+		}()
+	}
+	wg.Wait()
+	switch {
+	case stale.Load():
+		return resolutionStale
+	case outOfTime.Load() || ctx.Err() != nil:
+		return resolutionOutOfBudget
+	}
+	return resolutionComplete
+}
+
+// resolveReferenceChunks returns the locations among the references that
+// resolve to target.
+func (i *Index) resolveReferenceChunks(ctx context.Context, references []analysis.Reference, target string, files map[protocol.URI]*analysis.ParsedFile, semanticVersion, environmentVersion uint64) ([]protocol.Location, resolutionOutcome) {
+	var found []protocol.Location
+	outcome := i.resolveInParallel(ctx, references, files, semanticVersion, environmentVersion, nil, func(reference analysis.Reference, resolved []analysis.Symbol) {
+		for _, symbol := range resolved {
+			if symbol.ID == target {
+				found = append(found, protocol.Location{URI: reference.URI, Range: reference.Range})
+				break
+			}
+		}
+	})
+	return found, outcome
+}
+
+var (
+	kdocBlock     = regexp.MustCompile(`(?s)/\*\*.*?\*/`)
+	kdocLink      = regexp.MustCompile(`\[([A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z0-9_.]*)?\]`)
+	kdocTagTarget = regexp.MustCompile(`@(?:throws|exception|see|sample|property|param)\s+([A-Za-z_][A-Za-z0-9_]*)`)
+)
+
+// KDocReferencedNames lists the leading names that doc comments link to.
+func KDocReferencedNames(text string) map[string]bool {
+	return kdocReferencedNames(text)
+}
+
+func kdocReferencedNames(text string) map[string]bool {
+	names := make(map[string]bool)
+	if !strings.Contains(text, "/**") {
+		return names
+	}
+	for _, block := range kdocBlock.FindAllString(text, -1) {
+		for _, match := range kdocLink.FindAllStringSubmatch(block, -1) {
+			names[match[1]] = true
+		}
+		for _, match := range kdocTagTarget.FindAllStringSubmatch(block, -1) {
+			names[match[1]] = true
+		}
+	}
+	return names
+}
+
+// simpleClassName drops a qualified name's package and keeps its outer
+// classes: `java.util.UUID` is UUID, `kotlin.collections.Map.Entry` Map.Entry.
+func simpleClassName(name string) string {
+	segments := strings.Split(name, ".")
+	first := 0
+	for first < len(segments)-1 && segments[first] != "" && segments[first][0] >= 'a' && segments[first][0] <= 'z' {
+		first++
+	}
+	return strings.Join(segments[first:], ".")
 }

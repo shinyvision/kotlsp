@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/shinyvision/kotlsp/internal/formathost"
+	uriutil "github.com/shinyvision/kotlsp/internal/uri"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -18,7 +20,6 @@ import (
 	"github.com/shinyvision/kotlsp/internal/lexical"
 	"github.com/shinyvision/kotlsp/internal/protocol"
 	textdoc "github.com/shinyvision/kotlsp/internal/text"
-	uriutil "github.com/shinyvision/kotlsp/internal/uri"
 )
 
 func (s *Server) formatting(ctx context.Context, raw json.RawMessage) (any, *jsonrpc.ResponseError) {
@@ -33,14 +34,53 @@ func (s *Server) formatting(ctx context.Context, raw json.RawMessage) (any, *jso
 	if !ok {
 		return []protocol.TextEdit{}, nil
 	}
-	formatted, completed := formatSourceContext(ctx, doc.Text, p.Options, strings.HasSuffix(strings.ToLower(string(p.TextDocument.URI)), ".kt") || strings.HasSuffix(strings.ToLower(string(p.TextDocument.URI)), ".kts"))
+	if formatted, handled, err := s.buildFormatted(ctx, p.TextDocument.URI, doc.Text); handled {
+		if err != nil {
+			return nil, &jsonrpc.ResponseError{Code: jsonrpc.InternalError, Message: "the build's formatter failed: " + err.Error()}
+		}
+		return lineEdits(doc, formatted), nil
+	}
+	kotlin := strings.HasSuffix(strings.ToLower(string(p.TextDocument.URI)), ".kt") || strings.HasSuffix(strings.ToLower(string(p.TextDocument.URI)), ".kts")
+	formatted, completed := formatSourceContext(ctx, doc.Text, p.Options, kotlin)
 	if !completed {
 		return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestCanceled, Message: "request cancelled"}
 	}
-	if formatted == doc.Text {
+	if formatted == doc.Text || !syntaxPreserved(ctx, doc.Text, formatted, kotlin) {
+		// The built-in formatter only moves whitespace. A result that parses
+		// differently changed what the code means -- `withType<T>` spaced
+		// into a comparison -- and is withheld rather than applied.
 		return []protocol.TextEdit{}, nil
 	}
-	return []protocol.TextEdit{{Range: doc.Range(0, len(doc.Text)), NewText: formatted}}, nil
+	return lineEdits(doc, formatted), nil
+}
+
+// buildFormatted formats text with the build's own formatter when the build
+// declares one for the document (Spotless running ktlint). handled is false
+// when it declares none.
+func (s *Server) buildFormatted(ctx context.Context, uri protocol.URI, text string) (string, bool, error) {
+	spec, ok := s.index.FormatterFor(uri)
+	if !ok {
+		return "", false, nil
+	}
+	path, ok := uriutil.Path(uri)
+	if !ok {
+		return "", false, nil
+	}
+	s.formatPool.JavaHome = s.index.DefaultJavaHome()
+	formatted, err := s.formatPool.Format(ctx, formathost.Spec{Classpath: spec.Classpath, EditorConfig: spec.EditorConfig, Overrides: spec.Overrides}, path, text)
+	return formatted, true, err
+}
+
+// syntaxPreserved reports whether two texts parse to the same syntax, i.e.
+// whether only layout differs between them.
+func syntaxPreserved(ctx context.Context, before, after string, kotlin bool) bool {
+	language := analysis.LanguageJava
+	if kotlin {
+		language = analysis.LanguageKotlin
+	}
+	beforePrint, beforeOK := analysis.SyntaxFingerprint(ctx, before, language)
+	afterPrint, afterOK := analysis.SyntaxFingerprint(ctx, after, language)
+	return beforeOK && afterOK && beforePrint == afterPrint
 }
 
 func (s *Server) rangeFormatting(ctx context.Context, raw json.RawMessage) (any, *jsonrpc.ResponseError) {
@@ -55,6 +95,22 @@ func (s *Server) rangeFormatting(ctx context.Context, raw json.RawMessage) (any,
 	doc, ok := s.index.DocumentContext(ctx, p.TextDocument.URI)
 	if !ok {
 		return []protocol.TextEdit{}, nil
+	}
+	if formatted, handled, err := s.buildFormatted(ctx, p.TextDocument.URI, doc.Text); handled {
+		if err != nil {
+			return nil, &jsonrpc.ResponseError{Code: jsonrpc.InternalError, Message: "the build's formatter failed: " + err.Error()}
+		}
+		// ktlint formats whole files; keep the changes that touch the range.
+		var kept []protocol.TextEdit
+		for _, edit := range lineEdits(doc, formatted) {
+			if edit.Range.End.Line >= p.Range.Start.Line && edit.Range.Start.Line <= p.Range.End.Line {
+				kept = append(kept, edit)
+			}
+		}
+		if kept == nil {
+			kept = []protocol.TextEdit{}
+		}
+		return kept, nil
 	}
 	originalStarts := sourceLineStarts(doc.Text)
 	startLine := p.Range.Start.Line
@@ -130,16 +186,6 @@ func rangeTouchesProtectedLexicalRegion(source string, start, end int, kotlin bo
 	return !complete || touches
 }
 
-func formatterDepthBefore(source string) int {
-	depth, _ := formatterDepthBeforeContext(context.Background(), source)
-	return depth
-}
-
-func formatterDepthBeforeContext(ctx context.Context, source string) (int, bool) {
-	depth, _, completed := formatterContextBeforeContext(ctx, source, true)
-	return depth, completed
-}
-
 func formatterContextBeforeContext(ctx context.Context, source string, kotlin bool) (int, formatLexState, bool) {
 	depth := 0
 	state := formatLexState{}
@@ -208,7 +254,23 @@ func (s *Server) codeActions(raw json.RawMessage, contexts ...context.Context) (
 		return nil, responseErr
 	}
 	actions := make([]protocol.CodeAction, 0, 8)
-	if edit, ok := organizeImports(doc.Text, doc.Range(0, len(doc.Text)), p.TextDocument.URI, s.index.UsedImports(p.TextDocument.URI)); ok {
+	// What the client asked for decides what is worth computing. Organizing
+	// imports resolves every reference in the file, and an editor asking for
+	// quick fixes on cursor hold does not want it.
+	wanted := func(kind string) bool {
+		if len(p.Context.Only) == 0 {
+			return true
+		}
+		for _, only := range p.Context.Only {
+			if kind == only || strings.HasPrefix(kind, only+".") {
+				return true
+			}
+		}
+		return false
+	}
+	if !wanted("source.organizeImports") {
+		// not requested
+	} else if edit, ok := organizeImports(doc.Text, doc.Range(0, len(doc.Text)), p.TextDocument.URI, s.index.UsedImports(p.TextDocument.URI)); ok {
 		actions = append(actions, protocol.CodeAction{Title: "Organize imports", Kind: "source.organizeImports", Edit: &protocol.WorkspaceEdit{Changes: map[protocol.URI][]protocol.TextEdit{p.TextDocument.URI: {edit}}}})
 	}
 	selected := doc.Slice(p.Range)
@@ -609,7 +671,7 @@ func javaSymbolType(name string, at int, symbols []analysis.Symbol, idx *index.I
 	var best analysis.Symbol
 	found := false
 	for _, symbol := range symbols {
-		if symbol.Name != name || symbol.NameStartByte >= at || symbol.ScopeStartByte > at || symbol.ScopeEndByte < at {
+		if symbol.Name != name || symbol.NameStartByte >= at || !symbol.InScopeAt(at) {
 			continue
 		}
 		if !found || symbol.NameStartByte > best.NameStartByte {
@@ -905,7 +967,7 @@ func (s *Server) inlayHints(raw json.RawMessage, contexts ...context.Context) (a
 			continue
 		}
 		value := s.index.InferredType(p.TextDocument.URI, sym.ID)
-		if value != "" {
+		if value != "" && !(file.Language == analysis.LanguageKotlin && obviousInitializerType(sym.Initializer, value)) {
 			out = append(out, protocol.InlayHint{Position: sym.SelectionRange.End, Label: ": " + value, Kind: 1, PaddingLeft: false, PaddingRight: true, Data: map[string]string{"symbolId": sym.ID}})
 		}
 	}
@@ -935,10 +997,6 @@ func (s *Server) inlayHints(raw json.RawMessage, contexts ...context.Context) (a
 	}
 	sort.SliceStable(out, func(a, b int) bool { return before(out[a].Position, out[b].Position) })
 	return out, nil
-}
-
-func splitCommaTypes(value string) []string {
-	return lexical.SplitTopLevelTypes(value, ",", true)
 }
 
 func (s *Server) resolveInlayHint(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
@@ -1797,6 +1855,10 @@ func organizeImports(text string, full protocol.Range, uri protocol.URI, semanti
 		body = strings.Join(lines[last+1:], "\n")
 	}
 	used := codeIdentifierSet(body)
+	// A doc comment's link to an import uses it; ktlint keeps such imports.
+	for name := range index.KDocReferencedNames(body) {
+		used[name] = true
+	}
 	var usedPaths map[string]bool
 	if len(semanticUsage) > 0 {
 		usedPaths = semanticUsage[0]
@@ -1854,6 +1916,16 @@ func organizeImports(text string, full protocol.Range, uri protocol.URI, semanti
 			if filtered[a].static != filtered[b].static {
 				return !filtered[a].static
 			}
+			if !java {
+				// ktlint's import-ordering rule, IntelliJ's layout
+				// `*,java.**,javax.**,kotlin.**,^`: everything else, then the
+				// JDK and Kotlin packages, then alias imports. Spotless rejects
+				// any other order.
+				if groupA, groupB := kotlinImportGroup(filtered[a].text), kotlinImportGroup(filtered[b].text); groupA != groupB {
+					return groupA < groupB
+				}
+				return strings.ReplaceAll(filtered[a].text, "`", "") < strings.ReplaceAll(filtered[b].text, "`", "")
+			}
 			return filtered[a].text < filtered[b].text
 		})
 		for n, entry := range filtered {
@@ -1888,6 +1960,22 @@ func organizeImports(text string, full protocol.Range, uri protocol.URI, semanti
 		return protocol.TextEdit{}, false
 	}
 	return protocol.TextEdit{Range: protocol.Range{Start: start, End: end}, NewText: newText}, true
+}
+
+// kotlinImportGroup is an import's group in ktlint's default layout.
+func kotlinImportGroup(line string) int {
+	path := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "import "))
+	switch {
+	case strings.Contains(path, " as "):
+		return 4
+	case strings.HasPrefix(path, "java."):
+		return 1
+	case strings.HasPrefix(path, "javax."):
+		return 2
+	case strings.HasPrefix(path, "kotlin."):
+		return 3
+	}
+	return 0
 }
 
 func codeIdentifierSet(text string) map[string]bool {
@@ -1972,14 +2060,25 @@ func formatSourceContext(ctx context.Context, source string, opts protocol.Forma
 		lineSeparator = "\r\n"
 	}
 	var completed bool
-	source, completed = expandFormatterBlocksContext(ctx, strings.ReplaceAll(source, "\r\n", "\n"), kotlin)
-	if !completed {
-		return "", false
+	source = strings.ReplaceAll(source, "\r\n", "\n")
+	// Kotlin keeps one-line blocks and lambdas (`list.map { it.id }`) on one
+	// line; only Java's convention expands them.
+	if !kotlin {
+		source, completed = expandFormatterBlocksContext(ctx, source, kotlin)
+		if !completed {
+			return "", false
+		}
 	}
 	lines := strings.Split(source, "\n")
 	depth := 0
 	continuation := 0
 	state := formatLexState{}
+	var previousCodeEnd byte
+	inSupertypeList := false
+	var openLines bracketLines
+	chainBase := -1
+	previousCode := ""
+	previousOpened := false
 	for n, line := range lines {
 		if n&127 == 0 && ctx.Err() != nil {
 			return "", false
@@ -2020,7 +2119,85 @@ func formatSourceContext(ctx context.Context, source string, opts protocol.Forma
 		if continuation > 0 && leadingClose == 0 && !startsContinuationCloser(trim) {
 			continuationIndent = 1
 		}
+		if kotlin {
+			// One level per line that left a bracket of any kind open, as
+			// ktlint indents: `Outer(\n    inner = Inner(\n        x = 1,`.
+			leading := leadingBracketCloseCount(trim)
+			closed := openLines.pop(leading)
+			lineDepth, continuationIndent = openLines.depth(), 0
+			if closed.indent >= 0 {
+				// `)` or `}` lines up with the line that opened it.
+				lineDepth = closed.indent
+			}
+			chainLine := false
+			switch {
+			case leading > 0:
+				if closed.chain {
+					// `)` of a chained call's arguments: the chain goes on,
+					// and the next `.call()` lines up with the one it closed.
+					chainBase = closed.indent - 1
+				} else {
+					// `): Type = start()` begins the expression a chain hangs
+					// off.
+					chainBase = lineDepth
+				}
+			case leadingContinuation(trim):
+				chainLine = true
+				// A chain hangs off the line its expression started on:
+				// `=\n    value\n        .call()`.
+				if chainBase >= lineDepth {
+					continuationIndent = chainBase + 1 - lineDepth
+				} else {
+					continuationIndent = 1
+				}
+			case previousCodeEnd == '=' || binaryOperatorEnd(previousCode) || inSupertypeList || strings.HasSuffix(previousCode, "->") && !previousOpened:
+				continuationIndent = 1
+				chainBase = lineDepth + 1
+			default:
+				chainBase = lineDepth
+			}
+			pushIndent := lineDepth + continuationIndent
+			if inSupertypeList && strings.HasSuffix(strings.TrimSpace(stripLineComment(trim)), "{") {
+				// The class body belongs to the declaration, not to the
+				// supertype entry that happens to end with its brace.
+				pushIndent = lineDepth
+			}
+			remaining := opens - closes + parenDelta + leading
+			if commentOnly := strings.HasPrefix(trim, "//") || strings.HasPrefix(trim, "/*") || strings.HasPrefix(trim, "*"); !commentOnly {
+				previousOpened = remaining > 0
+			}
+			if remaining > 0 {
+				openLines.push(remaining, pushIndent, chainLine)
+			} else {
+				openLines.pop(-remaining)
+			}
+		}
+		// Kotlin's other continuations (above), indented one level as ktlint
+		// does: a call chain or elvis continued on the next line, the
+		// expression after a line-ending `=`, and a supertype list's entries.
 		lines[n] = strings.Repeat(unit, lineDepth+continuationIndent) + trim
+		if kotlin {
+			code := strings.TrimSpace(stripLineComment(trim))
+			if strings.HasPrefix(code, "/*") || strings.HasPrefix(code, "*") {
+				// A comment line says nothing about how code continues.
+				code = ""
+			}
+			if code != "" {
+				previousCode = code
+				previousCodeEnd = code[len(code)-1]
+				switch {
+				case strings.HasSuffix(code, "{") || strings.HasSuffix(code, "}"):
+					inSupertypeList = false
+				case previousCodeEnd == ':' && declarationHeaderLine(code):
+					inSupertypeList = true
+				case previousCodeEnd == ',' && declarationHeaderLine(code) && strings.Contains(code, " : "):
+					// `) : InternalUsersService,` -- the list began mid-line.
+					inSupertypeList = true
+				case inSupertypeList && previousCodeEnd != ',':
+					inSupertypeList = false
+				}
+			}
+		}
 		depth += opens - closes
 		if depth < 0 {
 			depth = 0
@@ -2050,11 +2227,6 @@ func formatSourceContext(ctx context.Context, source string, opts protocol.Forma
 		return original, ctx.Err() == nil
 	}
 	return result, ctx.Err() == nil
-}
-
-func normalizeLineSpacing(line string, kotlin bool) string {
-	formatted, _ := normalizeLineSpacingContext(context.Background(), line, kotlin)
-	return formatted
 }
 
 func normalizeLineSpacingContext(ctx context.Context, line string, kotlin bool) (string, bool) {
@@ -2130,7 +2302,9 @@ func normalizeLineSpacingContext(ctx context.Context, line string, kotlin bool) 
 		if line[at] == ';' {
 			trimOutputSpace()
 			out.WriteByte(';')
-			spacePending = false
+			// `A, B; fun x()`: whatever follows a semicolon on the line is a
+			// new statement and takes a space.
+			spacePending = at+1 < len(line)
 			at++
 			continue
 		}
@@ -2185,12 +2359,33 @@ func normalizeLineSpacingContext(ctx context.Context, line string, kotlin bool) 
 				}
 			}
 			out.WriteByte('}')
-			spacePending = at+1 < len(line) && line[at+1] != ')' && line[at+1] != ';' && line[at+1] != ',' && line[at+1] != '}'
+			// `list.map { it }.toSet()` and `}?.let`: a call chained on a
+			// block stays attached to it.
+			spacePending = at+1 < len(line) && !strings.ContainsRune(");,}.?![:", rune(line[at+1]))
 			at++
 			continue
 		}
 		if kotlin && line[at] == ':' && (at == 0 || line[at-1] != ':' && line[at-1] != '?') && (at+1 >= len(line) || line[at+1] != ':' && line[at+1] != '=') {
-			trimOutputSpace()
+			// A Kotlin colon has several meanings whose conventions disagree:
+			// `@field:NotBlank` is tight on both sides, `val x: Int` takes a
+			// space only after, and `class Account : UserDetails` takes one on
+			// each side. Imposing the type-annotation spelling on all of them
+			// rewrote 31 of 55 files of an ordinary Spring project, on every
+			// save through the editor's format-on-save. An annotation target is
+			// recognised and kept tight; otherwise a space the author put before
+			// the colon is kept, and exactly one space follows it.
+			if annotationTargetColon(line, at) {
+				trimOutputSpace()
+				out.WriteByte(':')
+				spacePending = false
+				at++
+				continue
+			}
+			if spacePending {
+				writePending(':')
+			} else {
+				trimOutputSpace()
+			}
 			out.WriteByte(':')
 			spacePending = at+1 < len(line)
 			at++
@@ -2223,6 +2418,25 @@ func normalizeLineSpacingContext(ctx context.Context, line string, kotlin bool) 
 	return strings.TrimSpace(out.String()), ctx.Err() == nil
 }
 
+// annotationTargetColon reports whether the colon separates a Kotlin
+// annotation use-site target from its annotation, as in `@field:NotBlank`,
+// where neither side takes a space.
+func annotationTargetColon(line string, at int) bool {
+	start := at
+	for start > 0 && (line[start-1] == '_' || line[start-1] >= 'a' && line[start-1] <= 'z' || line[start-1] >= 'A' && line[start-1] <= 'Z') {
+		start--
+	}
+	if start == at || start == 0 || line[start-1] != '@' {
+		return false
+	}
+	switch line[start:at] {
+	case "file", "property", "field", "get", "set", "receiver", "param", "setparam", "delegate", "all":
+		return true
+	default:
+		return false
+	}
+}
+
 func javaEnhancedForColon(line string, at int) bool {
 	open := strings.LastIndexByte(line[:at], '(')
 	if open < 0 || strings.TrimSpace(line[open+1:at]) == "" || strings.Contains(line[open+1:at], "?") {
@@ -2230,11 +2444,6 @@ func javaEnhancedForColon(line string, at int) bool {
 	}
 	before := strings.TrimSpace(line[:open])
 	return strings.HasSuffix(before, "for")
-}
-
-func expandFormatterBlocks(source string, kotlin bool) string {
-	formatted, _ := expandFormatterBlocksContext(context.Background(), source, kotlin)
-	return formatted
 }
 
 func expandFormatterBlocksContext(ctx context.Context, source string, kotlin bool) (string, bool) {
@@ -2494,6 +2703,26 @@ func controlKeywordBefore(line string, open int) bool {
 }
 
 func genericAngleAt(line string, at int) bool {
+	if line[at] == '<' && (at > 0 && isIdentifierChar(line[at-1]) || strings.HasSuffix(strings.TrimRight(line[:at], " \t"), "fun")) {
+		// `withType<JavaCompile> { }`, `listOf<Int>()`: a `<` written tight
+		// against a name, closed by a `>` with nothing but a type between,
+		// is a type-argument list. Spacing it turns it into a comparison.
+		depth := 0
+		for index := at; index < len(line); index++ {
+			value := line[index]
+			switch {
+			case value == '<':
+				depth++
+			case value == '>':
+				depth--
+				if depth == 0 {
+					return true
+				}
+			case !isIdentifierChar(value) && !strings.ContainsRune(" .,?*:@()", rune(value)):
+				index = len(line)
+			}
+		}
+	}
 	if line[at] == '<' {
 		start := at
 		for start > 0 && (line[start-1] == '_' || line[start-1] == '$' || line[start-1] >= 'a' && line[start-1] <= 'z' || line[start-1] >= 'A' && line[start-1] <= 'Z' || line[start-1] >= '0' && line[start-1] <= '9') {
@@ -2530,6 +2759,105 @@ func genericAngleAt(line string, at int) bool {
 		}
 	}
 	return false
+}
+
+// bracketLines is the stack of lines that opened brackets still open: how
+// many each left open and the indentation it was written at. A line inside
+// is indented one level past the innermost such line.
+type bracketLines []bracketLine
+
+type bracketLine struct {
+	open, indent int
+	// chain marks an opener line that was itself a call-chain continuation
+	// (`.select(`): after its closer the chain goes on at that indentation.
+	chain bool
+}
+
+func (b *bracketLines) push(count, indent int, chain bool) {
+	*b = append(*b, bracketLine{count, indent, chain})
+}
+
+// pop closes count brackets and returns the line that opened the last of
+// them, which a closing line aligns with; its indent is -1 if none.
+func (b *bracketLines) pop(count int) bracketLine {
+	closed := bracketLine{indent: -1}
+	for count > 0 && len(*b) > 0 {
+		top := len(*b) - 1
+		closed = (*b)[top]
+		if (*b)[top].open > count {
+			(*b)[top].open -= count
+			return closed
+		}
+		count -= (*b)[top].open
+		*b = (*b)[:top]
+	}
+	return closed
+}
+
+func (b bracketLines) depth() int {
+	if len(b) == 0 {
+		return 0
+	}
+	return b[len(b)-1].indent + 1
+}
+
+// leadingBracketCloseCount counts the closing brackets a line starts with.
+func leadingBracketCloseCount(trim string) int {
+	count := 0
+	for _, value := range []byte(trim) {
+		switch value {
+		case ')', ']', '}':
+			count++
+		case ' ', '\t':
+		default:
+			return count
+		}
+	}
+	return count
+}
+
+// binaryOperatorEnd reports whether a line ends with a binary operator, so
+// the expression continues on the next line: `a +`, `ok &&`, `x ?:`.
+func binaryOperatorEnd(code string) bool {
+	for _, operator := range []string{"&&", "||", "?:", "+", "-", "*", "/", "%"} {
+		if strings.HasSuffix(code, operator) && !strings.HasSuffix(code, "->") && !strings.HasSuffix(code, "++") && !strings.HasSuffix(code, "--") && !strings.HasSuffix(code, "*/") {
+			return true
+		}
+	}
+	return false
+}
+
+// leadingContinuation reports whether a line continues the expression above:
+// it starts with a member access, an elvis or a boolean operator.
+func leadingContinuation(trim string) bool {
+	for _, prefix := range []string{"?.", "?:", "!!.", "&&", "||", "."} {
+		if strings.HasPrefix(trim, prefix) && !strings.HasPrefix(trim, "..") {
+			return true
+		}
+	}
+	return false
+}
+
+// declarationHeaderLine reports whether a line ending in `:` is a class or
+// object header whose supertype list follows on the next lines.
+func declarationHeaderLine(code string) bool {
+	for _, keyword := range []string{"class ", "object ", "interface "} {
+		if strings.Contains(code, keyword) {
+			return true
+		}
+	}
+	return strings.HasPrefix(code, ")")
+}
+
+func stripLineComment(line string) string {
+	if at := strings.Index(line, "//"); at >= 0 && !strings.Contains(line[:at], "\"") {
+		return line[:at]
+	}
+	return line
+}
+
+func isIdentifierChar(value byte) bool {
+	return value == '_' || value == '$' || value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
 }
 
 func previousNonSpace(line string, before int) byte {
@@ -2775,4 +3103,46 @@ func namedArgumentNameAt(text string, callNameEnd, offset int) string {
 		return name
 	}
 	return ""
+}
+
+// obviousInitializerType reports whether the initializer already states the
+// type a hint would show -- `Foo(...)`, `"x"`, `value as Foo`, `Color.RED` --
+// which IntelliJ leaves unhinted.
+func obviousInitializerType(initializer, inferred string) bool {
+	initializer = strings.TrimSpace(initializer)
+	if initializer == "" {
+		return false
+	}
+	base := strings.TrimSuffix(strings.TrimSpace(inferred), "?")
+	if open := strings.IndexByte(base, '<'); open >= 0 {
+		base = base[:open]
+	}
+	simple := base[strings.LastIndexByte(base, '.')+1:]
+	switch {
+	case initializer == "true" || initializer == "false" || initializer == "null":
+		return true
+	case initializer[0] == '"' || initializer[0] == '\'' || initializer[0] >= '0' && initializer[0] <= '9':
+		return true
+	}
+	if at := strings.LastIndex(initializer, " as "); at >= 0 {
+		return true
+	}
+	if at := strings.LastIndex(initializer, " as? "); at >= 0 {
+		return true
+	}
+	// A constructor call: the type's own name, then its arguments.
+	head := initializer
+	if open := strings.IndexAny(head, "(<{"); open > 0 {
+		head = head[:open]
+	}
+	head = strings.TrimSpace(head)
+	if simple != "" && (head == simple || strings.HasSuffix(head, "."+simple)) {
+		return true
+	}
+	// An enum entry or object member spelled through its type: `Color.RED`.
+	if dot := strings.LastIndexByte(head, '.'); dot > 0 && !strings.ContainsAny(initializer, "()") {
+		qualifier := head[:dot]
+		return qualifier == simple || strings.HasSuffix(qualifier, "."+simple)
+	}
+	return false
 }

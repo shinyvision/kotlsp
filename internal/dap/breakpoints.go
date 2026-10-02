@@ -319,10 +319,6 @@ func breakpointLocations(raw json.RawMessage, classPaths ...string) (any, bool, 
 	return (&session{breakpointCache: make(map[string]breakpointClassCacheEntry)}).breakpointLocationsContext(context.Background(), raw, classPaths...)
 }
 
-func (s *session) breakpointLocations(raw json.RawMessage, classPaths ...string) (any, bool, string) {
-	return s.breakpointLocationsContext(context.Background(), raw, classPaths...)
-}
-
 func (s *session) breakpointLocationsContext(ctx context.Context, raw json.RawMessage, classPaths ...string) (any, bool, string) {
 	var args struct {
 		Source struct {
@@ -411,15 +407,6 @@ func (s *session) cachedExecutableBytecodeClasses(ctx context.Context, sourcePat
 	s.breakpointCache[cacheKey] = breakpointClassCacheEntry{lines: lines, available: available}
 	s.breakpointMu.Unlock()
 	return lines, available, nil
-}
-
-func executableBytecodeLines(sourcePath string, classPaths []string) (map[int]bool, bool) {
-	classes, available := executableBytecodeClasses(sourcePath, classPaths)
-	lines := make(map[int]bool)
-	for line := range classes {
-		lines[line] = true
-	}
-	return lines, available
 }
 
 func executableBytecodeClasses(sourcePath string, classPaths []string) (map[int][]string, bool) {
@@ -667,11 +654,6 @@ func appendUniqueString(values []string, value string) []string {
 		}
 	}
 	return append(values, value)
-}
-
-func executableSourceLines(path string) map[int]bool {
-	lines, _ := executableSourceLinesContext(context.Background(), path)
-	return lines
 }
 
 func executableSourceLinesContext(ctx context.Context, path string) (map[int]bool, error) {

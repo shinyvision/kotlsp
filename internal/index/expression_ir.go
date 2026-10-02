@@ -1,7 +1,9 @@
 package index
 
 import (
+	"context"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -61,13 +63,14 @@ type ExpressionEvidence struct {
 }
 
 func (i *Index) ExpressionEvidence(uri protocol.URI, source string, at int) ExpressionEvidence {
+	ctx := context.Background()
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	file := i.files[uri]
 	if file == nil {
 		return ExpressionEvidence{}
 	}
-	result := i.inferExpressionResultLocked(file, source, at)
+	result := i.inferExpressionResultLocked(ctx, file, source, at)
 	return ExpressionEvidence{
 		Type: result.Type, Shape: result.Expression.Kind.String(),
 		Exact: result.Confidence == inferenceExact, Constant: expressionIRConstant(result.Expression, file.Language),
@@ -152,7 +155,54 @@ func expressionIRRefactoringSafe(expression expressionIR) bool {
 }
 
 func parseExpressionIR(source string, language analysis.Language) expressionIR {
-	return parseExpressionIRDepth(source, language, 0)
+	// Resolving a project parses the same short expressions -- argument texts,
+	// initialisers -- over and over; the result is a pure function of the text
+	// and is only read afterwards, so it is kept (bounded).
+	if len(source) > 1024 {
+		return parseExpressionIRDepth(source, language, 0)
+	}
+	key := expressionIRKey{source: source, language: language}
+	expressionIRCache.RLock()
+	cached, ok := expressionIRCache.values[key]
+	expressionIRCache.RUnlock()
+	if ok {
+		return cached
+	}
+	parsed := parseExpressionIRDepth(source, language, 0)
+	// The key and the parsed text are slices of a document. Retained in a
+	// global cache they would keep every document version they came from alive.
+	retained := cloneExpressionIR(parsed)
+	key.source = strings.Clone(key.source)
+	expressionIRCache.Lock()
+	if expressionIRCache.values == nil || len(expressionIRCache.values) >= 50_000 {
+		expressionIRCache.values = make(map[expressionIRKey]expressionIR)
+	}
+	expressionIRCache.values[key] = retained
+	expressionIRCache.Unlock()
+	return parsed
+}
+
+func cloneExpressionIR(expression expressionIR) expressionIR {
+	expression.Text = strings.Clone(expression.Text)
+	expression.Operator = strings.Clone(expression.Operator)
+	if len(expression.Children) > 0 {
+		children := make([]expressionIR, len(expression.Children))
+		for index, child := range expression.Children {
+			children[index] = cloneExpressionIR(child)
+		}
+		expression.Children = children
+	}
+	return expression
+}
+
+type expressionIRKey struct {
+	source   string
+	language analysis.Language
+}
+
+var expressionIRCache struct {
+	sync.RWMutex
+	values map[expressionIRKey]expressionIR
 }
 
 func parseExpressionIRDepth(source string, language analysis.Language, depth int) expressionIR {

@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"strings"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
@@ -25,7 +26,7 @@ func init() {
 	})
 }
 
-func kotlinBodyShapes(i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
+func kotlinBodyShapes(ctx context.Context, i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
 	document := i.documentLocked(file.URI)
 	if document == nil || document.Text == "" {
 		return nil
@@ -49,7 +50,7 @@ func kotlinBodyShapes(i *Index, file *analysis.ParsedFile) []protocol.Diagnostic
 	out = append(out, i.unsafeCalls(c, document)...)
 	out = append(out, i.conditionMismatches(c, document)...)
 	out = append(out, i.jumpsOutsideLoops(c, document)...)
-	out = append(out, i.impossibleInstantiations(c, document)...)
+	out = append(out, i.impossibleInstantiations(ctx, c, document)...)
 	return out
 }
 
@@ -400,7 +401,7 @@ func (i *Index) jumpsOutsideLoops(c *unresolvedNameContext, document interface {
 // impossibleInstantiations reports `Name(...)` where Name is an abstract
 // class, an enum class, or a plain interface of the workspace and nothing
 // else -- no function, no companion invoke -- could be what the call means.
-func (i *Index) impossibleInstantiations(c *unresolvedNameContext, document interface {
+func (i *Index) impossibleInstantiations(ctx context.Context, c *unresolvedNameContext, document interface {
 	Range(start, end int) protocol.Range
 }) []protocol.Diagnostic {
 	var out []protocol.Diagnostic
@@ -428,7 +429,7 @@ func (i *Index) impossibleInstantiations(c *unresolvedNameContext, document inte
 		if target == nil || hasAnyModifier(target, "expect", "actual", "external", "sealed") {
 			continue
 		}
-		scope := i.scopeAtLocked(c, ref)
+		scope := i.scopeAtLocked(ctx, c, ref)
 		if scope == nil || !scope.complete {
 			continue
 		}

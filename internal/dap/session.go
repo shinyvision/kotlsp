@@ -1348,19 +1348,6 @@ func (s *session) variableValues(raw json.RawMessage, contexts ...context.Contex
 	return map[string]any{"variables": variables}, true, ""
 }
 
-func allDigits(value string) bool {
-	value = strings.TrimSuffix(strings.TrimSuffix(value, "L"), "l")
-	if value == "" {
-		return false
-	}
-	for _, r := range value {
-		if (r < '0' || r > '9') && r != '.' && r != '-' {
-			return false
-		}
-	}
-	return true
-}
-
 func (s *session) selectFrame(frameID int, contexts ...context.Context) (debugFrame, bool) {
 	s.stateMu.Lock()
 	frame, ok := s.frames[frameID]

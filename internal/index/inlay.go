@@ -38,7 +38,9 @@ func (i *Index) ParameterHintsContext(ctx context.Context, uri protocol.URI, req
 		if ctx.Err() != nil {
 			return nil
 		}
-		if ref.Role != analysis.RoleCall || len(ref.Arguments) == 0 {
+		// An operator's convention call (`a <= 0` is `compareTo`) has no
+		// argument list to label.
+		if ref.Role != analysis.RoleCall || len(ref.Arguments) == 0 || !referenceSpelledAt(doc.Text, ref) {
 			continue
 		}
 		resolved := i.resolveContextLocked(ctx, file, ref)
@@ -52,7 +54,7 @@ func (i *Index) ParameterHintsContext(ctx context.Context, uri protocol.URI, req
 			if !analysis.IsCallableKind(candidate.Kind) || !matchesArityForLanguage(candidate, len(ref.Arguments), file.Language) {
 				continue
 			}
-			score, typed := i.callCompatibilityLocked(file, ref, candidate)
+			score, typed := i.callCompatibilityLocked(ctx, file, ref, candidate)
 			if typed && score <= -1<<19 {
 				continue
 			}
@@ -75,6 +77,7 @@ func (i *Index) ParameterHintsContext(ctx context.Context, uri protocol.URI, req
 			continue
 		}
 		positional := 0
+		varargHinted := map[int]bool{}
 		for _, argumentRange := range ref.Arguments {
 			argument := strings.TrimSpace(doc.Slice(argumentRange))
 			parameterIndex := -1
@@ -90,6 +93,9 @@ func (i *Index) ParameterHintsContext(ctx context.Context, uri protocol.URI, req
 				parameterIndex = positional
 				if !callable.Parameters[positional].Variadic {
 					positional++
+				} else if varargHinted[positional] {
+					// One hint per vararg, before its first element.
+					continue
 				}
 			}
 			if parameterIndex < 0 || parameterIndex >= len(callable.Parameters) {
@@ -99,7 +105,10 @@ func (i *Index) ParameterHintsContext(ctx context.Context, uri protocol.URI, req
 				continue
 			}
 			parameter := callable.Parameters[parameterIndex]
-			if argument == parameter.Name || isNamed {
+			if parameter.Variadic {
+				varargHinted[parameterIndex] = true
+			}
+			if isNamed || !parameterHintAdds(argument, parameter) {
 				continue
 			}
 			out = append(out, ParameterHint{Position: argumentRange.Start, Label: parameter.Name + ":", Callable: callable, ParameterIndex: parameterIndex})
@@ -159,7 +168,7 @@ func (i *Index) JavaLambdaParameterHintsContext(ctx context.Context, uri protoco
 			if parameterIndex < 0 {
 				continue
 			}
-			target := i.contextualCallableParameterTypeLocked(file, ref, callable, parameterIndex, doc)
+			target := i.contextualCallableParameterTypeLocked(ctx, file, ref, callable, parameterIndex, doc)
 			out = i.appendLambdaParameterHintsLocked(out, file, doc, requested, expressionStart, expression, arrow, target, callable)
 		}
 	}
@@ -243,7 +252,7 @@ func (i *Index) uniqueApplicableCallableContextLocked(ctx context.Context, file 
 		if !analysis.IsCallableKind(candidate.Kind) || !matchesArityForLanguage(candidate, len(ref.Arguments), file.Language) {
 			continue
 		}
-		score, typed := i.callCompatibilityLocked(file, ref, candidate)
+		score, typed := i.callCompatibilityLocked(ctx, file, ref, candidate)
 		if typed && score <= -1<<19 {
 			continue
 		}
@@ -258,4 +267,73 @@ func (i *Index) uniqueApplicableCallableContextLocked(ctx context.Context, file 
 
 func beforeRange(a, b protocol.Position) bool {
 	return a.Line < b.Line || a.Line == b.Line && a.Character < b.Character
+}
+
+// parameterHintAdds reports whether a parameter-name hint tells the reader
+// something, by the rules IntelliJ applies. A literal says nothing about its
+// role (`find(1, true)`), so it gets one; a lambda, a vararg element or an
+// argument already spelled like the parameter (`user.roleId` for `roleId`) do
+// not. Hinting every argument put 164 hints in a 328-line file, `block:`
+// before every trailing lambda among them.
+func parameterHintAdds(argument string, parameter analysis.Parameter) bool {
+	argument = strings.TrimSpace(argument)
+	if argument == "" || parameter.Name == "" {
+		return false
+	}
+	if strings.HasPrefix(argument, "{") || strings.HasPrefix(argument, "fun ") || strings.Contains(argument, "->") || strings.HasPrefix(argument, "::") {
+		return false
+	}
+	if last := lastIdentifier(argument); last != "" && strings.EqualFold(last, parameter.Name) {
+		return false
+	}
+	return isLiteralArgument(argument)
+}
+
+func isLiteralArgument(argument string) bool {
+	switch argument {
+	case "true", "false", "null":
+		return true
+	}
+	value := strings.TrimPrefix(argument, "-")
+	if value == "" {
+		return false
+	}
+	switch value[0] {
+	case '"', '\'':
+		return true
+	}
+	if value[0] < '0' || value[0] > '9' {
+		return false
+	}
+	for _, c := range value {
+		if !(c >= '0' && c <= '9' || c == '.' || c == '_' || c == 'x' || c == 'X' || c == 'b' || c == 'B' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F' || c == 'L' || c == 'u' || c == 'U') {
+			return false
+		}
+	}
+	return true
+}
+
+func lastIdentifier(expression string) string {
+	end := len(expression)
+	for end > 0 && (expression[end-1] == ')' || expression[end-1] == '!' || expression[end-1] == ' ') {
+		if expression[end-1] == ')' {
+			// `user.id()` names id; anything with arguments is not a name.
+			if end < 2 || expression[end-2] != '(' {
+				return ""
+			}
+			end -= 2
+			continue
+		}
+		end--
+	}
+	start := end
+	for start > 0 {
+		c := expression[start-1]
+		if c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+			start--
+			continue
+		}
+		break
+	}
+	return expression[start:end]
 }

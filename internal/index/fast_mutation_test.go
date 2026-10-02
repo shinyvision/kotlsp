@@ -11,50 +11,17 @@ import (
 	"github.com/shinyvision/kotlsp/internal/protocol"
 )
 
-// copyTree duplicates a project so a test can damage it safely.
-func copyTree(t *testing.T, source, destination string) {
-	t.Helper()
-	err := filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		name := info.Name()
-		if info.IsDir() && (name == ".git" || name == "build" || name == "bin" || name == ".gradle") {
-			return filepath.SkipDir
-		}
-		relative, relErr := filepath.Rel(source, path)
-		if relErr != nil {
-			return relErr
-		}
-		target := filepath.Join(destination, relative)
-		if info.IsDir() {
-			return os.MkdirAll(target, 0o755)
-		}
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return nil
-		}
-		return os.WriteFile(target, data, info.Mode().Perm())
-	})
-	if err != nil {
-		t.Fatalf("copying the corpus: %v", err)
-	}
-}
-
 // TestFastDiagnosticsSurviveImportRemoval is the soundness gate with teeth. A
 // corpus where every import is already correct proves nothing: the rule never
 // fires, and the assertion passes vacuously.
 //
-// So the corpus is damaged on purpose. Imports are stripped from a sample of
-// files, which is exactly the error the rule predicts, and then every
-// prediction must be confirmed by the compiler on the same line. A prediction
-// the compiler does not share is a soundness bug.
-//
-//	KOTLSP_CORPUS=~/Projects/some-project go test ./internal/index/ -run ImportRemoval -v
+// So the fixture is damaged on purpose. Its imports are stripped, which is
+// exactly the error the rule predicts, and then every prediction must be
+// confirmed by the compiler on the same line. A prediction the compiler does
+// not share is a soundness bug.
 func TestFastDiagnosticsSurviveImportRemoval(t *testing.T) {
-	corpus := requireCorpusTest(t)
-	root := t.TempDir()
-	copyTree(t, corpus, root)
+	requireCompilerBackedTest(t)
+	root := fixtureProjectFrom(t, filepath.Join("testdata", "project"))
 
 	// Strip imports from a sample, leaving the rest of the project intact so
 	// the damage stays comprehensible.
@@ -87,19 +54,19 @@ func TestFastDiagnosticsSurviveImportRemoval(t *testing.T) {
 		damaged = append(damaged, path)
 	}
 	if len(damaged) == 0 {
-		t.Skip("no Kotlin file in the corpus has imports to remove")
+		t.Fatal("no Kotlin file in the fixture has imports to remove")
 	}
 	t.Logf("stripped imports from %d files", len(damaged))
 
 	idx := New(nil)
 	defer idx.Close()
 	idx.Start(context.Background(), []protocol.URI{fileURI(root)})
-	deadline := time.Now().Add(5 * time.Minute)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) && !idx.Progress().Ready {
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	if !idx.Progress().Ready {
-		t.Fatal("the corpus index never became ready")
+		t.Fatal("the fixture index never became ready")
 	}
 
 	predictions := 0
@@ -115,8 +82,8 @@ func TestFastDiagnosticsSurviveImportRemoval(t *testing.T) {
 	// merge hides predictions the compiler has confirmed, so soundness is
 	// checked against the raw rule output rather than the merged result.
 	idx.ScheduleCompilerDiagnostics(context.Background())
-	if !waitForCompilerPass(t, idx, 3*time.Minute) {
-		t.Fatal("the compiler never finished a pass over the damaged corpus, so there is no oracle")
+	if !waitForCompilerPass(t, idx, 90*time.Second) {
+		t.Fatal("the compiler never finished a pass over the damaged fixture, so there is no oracle")
 	}
 
 	// The same exact-match assertion the fixture gate uses, so every source

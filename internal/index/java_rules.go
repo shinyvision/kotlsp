@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"path"
 	"strconv"
 	"strings"
@@ -53,7 +54,7 @@ func javaDiagnostic(r protocol.Range, message string) protocol.Diagnostic {
 	return protocol.Diagnostic{Range: r, Severity: 1, Source: "kotlsp", Code: "compiler", Message: message}
 }
 
-func javaShapes(i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
+func javaShapes(ctx context.Context, i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
 	document := i.documentLocked(file.URI)
 	if document == nil || document.Text == "" {
 		return nil
@@ -79,8 +80,8 @@ func javaShapes(i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
 			out = append(out, i.javaLiteralInitializers(c, document, symbol)...)
 		}
 	}
-	out = append(out, i.javaFinalAssignments(c, document)...)
-	out = append(out, i.javaStaticContext(c, document)...)
+	out = append(out, i.javaFinalAssignments(ctx, c, document)...)
+	out = append(out, i.javaStaticContext(ctx, c, document)...)
 	out = append(out, i.javaAbstractInstantiations(c, document)...)
 	out = append(out, javaUnreachableStatements(c, document)...)
 	out = append(out, i.javaPrimitiveDereferences(c, document)...)
@@ -530,7 +531,7 @@ func (i *Index) javaLiteralInitializers(c *unresolvedNameContext, document inter
 
 // javaFinalAssignments covers a plain write to a final that already has its
 // value: a final field or local with an initialiser, or a final parameter.
-func (i *Index) javaFinalAssignments(c *unresolvedNameContext, document interface {
+func (i *Index) javaFinalAssignments(ctx context.Context, c *unresolvedNameContext, document interface {
 	Range(start, end int) protocol.Range
 }) []protocol.Diagnostic {
 	var out []protocol.Diagnostic
@@ -542,7 +543,7 @@ func (i *Index) javaFinalAssignments(c *unresolvedNameContext, document interfac
 		if !javaWriteFollows(c, ref.EndByte) {
 			continue
 		}
-		resolved := i.resolveLocked(c.file, ref)
+		resolved := i.resolveLocked(ctx, c.file, ref)
 		if len(resolved) != 1 || resolved[0].URI != c.file.URI {
 			continue
 		}
@@ -571,7 +572,7 @@ func (i *Index) javaFinalAssignments(c *unresolvedNameContext, document interfac
 	return out
 }
 
-func (i *Index) javaStaticContext(c *unresolvedNameContext, document interface {
+func (i *Index) javaStaticContext(ctx context.Context, c *unresolvedNameContext, document interface {
 	Range(start, end int) protocol.Range
 }) []protocol.Diagnostic {
 	var out []protocol.Diagnostic
@@ -590,7 +591,7 @@ func (i *Index) javaStaticContext(c *unresolvedNameContext, document interface {
 		if !i.staticLikeContextLocked(c.file, ref.StartByte) || inAnonymous(ref.StartByte) {
 			continue
 		}
-		if len(i.resolveLocked(c.file, ref)) > 0 {
+		if len(i.resolveLocked(ctx, c.file, ref)) > 0 {
 			continue
 		}
 		before := skipBackCode(c.text, c.mask, ref.StartByte-1)

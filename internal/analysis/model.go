@@ -273,6 +273,14 @@ type Reference struct {
 	// It lets conservative fast diagnostics delegate contextual enum/sealed
 	// binding without scanning unrelated source text.
 	ContextualBranch bool
+	// Synthetic marks a reference the index built while analysing another
+	// expression rather than one the parser read from source. Such a reference
+	// names a callee that is spelled somewhere else (or nowhere) while carrying
+	// the position of the expression being analysed, so nothing may re-derive
+	// its qualifier from the text at that position: the name found there can
+	// coincide with this one (`x.param(a).param(b)`) and resolution would then
+	// analyse the same expression forever.
+	Synthetic bool
 }
 
 type Import struct {
@@ -358,4 +366,20 @@ func IsCallableKind(k SymbolKind) bool {
 	default:
 		return false
 	}
+}
+
+// InScopeAt reports whether a lexical declaration is visible at offset: inside
+// its scope range or one of its additional, disconnected ranges (a Kotlin
+// constructor parameter is visible in the supertype list, property
+// initializers and init blocks, but not in member functions).
+func (s Symbol) InScopeAt(at int) bool {
+	if !(s.ScopeStartByte > 0 && at < s.ScopeStartByte || s.ScopeEndByte > 0 && at > s.ScopeEndByte) {
+		return true
+	}
+	for _, scope := range s.AdditionalScopes {
+		if scope.StartByte <= at && at <= scope.EndByte {
+			return true
+		}
+	}
+	return false
 }

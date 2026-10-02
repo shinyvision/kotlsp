@@ -406,3 +406,14 @@ type DocumentHighlight struct {
 	Range Range `json:"range"`
 	Kind  int   `json:"kind,omitempty"`
 }
+
+type SelectionRangeParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Positions    []Position             `json:"positions"`
+}
+
+// SelectionRange is one step of "expand selection"; Parent is the next larger one.
+type SelectionRange struct {
+	Range  Range           `json:"range"`
+	Parent *SelectionRange `json:"parent,omitempty"`
+}

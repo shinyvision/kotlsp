@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"strings"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
@@ -22,7 +23,7 @@ func init() {
 	})
 }
 
-func literalTypeMismatches(i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
+func literalTypeMismatches(ctx context.Context, i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
 	document := i.documentLocked(file.URI)
 	if document == nil {
 		return nil
@@ -97,7 +98,7 @@ func literalTypeMismatches(i *Index, file *analysis.ParsedFile) []protocol.Diagn
 			out = append(out, returnMismatches(document, text, symbol, expected, nonNull)...)
 		}
 	}
-	out = append(out, i.assignmentMismatches(file, document)...)
+	out = append(out, i.assignmentMismatches(ctx, file, document)...)
 	return out
 }
 
@@ -196,7 +197,7 @@ func isIdentifierByteFast(value byte) bool {
 
 // assignmentMismatches checks `name = literal` where name binds to exactly one
 // declaration in this file with a declared builtin type.
-func (i *Index) assignmentMismatches(file *analysis.ParsedFile, document interface {
+func (i *Index) assignmentMismatches(ctx context.Context, file *analysis.ParsedFile, document interface {
 	Range(start, end int) protocol.Range
 }) []protocol.Diagnostic {
 	text := i.documentTextLocked(file.URI)
@@ -206,7 +207,7 @@ func (i *Index) assignmentMismatches(file *analysis.ParsedFile, document interfa
 		if reference.Role != analysis.RoleWrite || reference.Qualifier != "" || reference.ArgumentLabel {
 			continue
 		}
-		resolved := i.resolveLocked(file, *reference)
+		resolved := i.resolveLocked(ctx, file, *reference)
 		if len(resolved) != 1 || resolved[0].URI != file.URI {
 			continue
 		}

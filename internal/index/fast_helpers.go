@@ -123,7 +123,11 @@ func (i *Index) documentLocked(uri protocol.URI) *textdoc.Document {
 	if document := i.indexedDocs[uri]; document != nil {
 		return document
 	}
-	return i.libraryDocs[uri]
+	if document := i.libraryDocs[uri]; document != nil {
+		i.noteLibraryCacheUse(uri)
+		return document
+	}
+	return nil
 }
 
 func declarationText(text string, symbol *analysis.Symbol) string {

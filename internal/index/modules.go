@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/shinyvision/kotlsp/internal/protocol"
 	uriutil "github.com/shinyvision/kotlsp/internal/uri"
@@ -48,6 +50,11 @@ type ModuleInfo struct {
 	BuildModelSelfContained     bool
 	BuildModelFailure           string
 	CompilerSettingsBySourceSet map[string]CompilerSettings
+	// Formatters is the build's formatter configuration for this module.
+	Formatters []FormatterSpec
+	// GradleHome is the Gradle distribution that builds the module; its
+	// default imports are every build script's.
+	GradleHome string
 }
 
 type JavaModuleRequirement struct {
@@ -95,6 +102,8 @@ type BuildModelStatus struct {
 	Authoritative    bool
 	Failure          string
 	CompilerSettings map[string]CompilerSettings
+	// Formatters names the build's formatters: "kotlin: ktlint 1.5.0".
+	Formatters []string
 }
 
 var gradleProjectDependencyPattern = regexp.MustCompile(`project\s*\(\s*(?:path\s*[:=]\s*)?["'](:[^"']+)["']`)
@@ -829,10 +838,6 @@ type parsedJavaModuleDescriptor struct {
 	Opens    map[string][]string
 }
 
-func javaModuleName(directory string, sourceSets map[string][]string) string {
-	return javaModuleDescriptor(directory, sourceSets).Name
-}
-
 func javaModuleDescriptor(directory string, sourceSets map[string][]string) parsedJavaModuleDescriptor {
 	candidates := []string{filepath.Join(directory, "module-info.java")}
 	for _, roots := range sourceSets {
@@ -1148,10 +1153,12 @@ func conventionalSourceSetDependencies(sets map[string][]string) map[string][]st
 }
 
 func (i *Index) setModules(modules []ModuleInfo) {
-	i.mu.Lock()
+	guard := i.lockGuard()
+	defer guard.release()
+	guard.Lock()
 	i.modules = append([]ModuleInfo(nil), modules...)
 	i.semanticEnvironmentVersion++
-	i.mu.Unlock()
+	guard.Unlock()
 }
 
 func (i *Index) mergeModuleBuildResolution(root string, resolution classpathResolution) {
@@ -1197,6 +1204,10 @@ func applyModuleBuildResolution(modules []ModuleInfo, root string, resolution cl
 			module.RuntimeClasspathBySourceSet = make(map[string][]string)
 			module.ModulePathBySourceSet = make(map[string][]string)
 			module.CompilerSettingsBySourceSet = make(map[string]CompilerSettings)
+		}
+		module.Formatters = resolution.Formatters[module.Name]
+		if resolution.GradleHome != "" {
+			module.GradleHome = resolution.GradleHome
 		}
 		if settings := resolution.CompilerSettings[module.Name]; len(settings) > 0 {
 			module.CompilerSettingsBySourceSet = make(map[string]CompilerSettings, len(settings))
@@ -1323,12 +1334,16 @@ func applyModuleBuildResolution(modules []ModuleInfo, root string, resolution cl
 			}
 		}
 		module.SourceRoots = flattenSourceSets(module.SourceSets)
-		if !resolution.Authoritative {
+		// A model that states no source-set visibility at all -- one imported
+		// before it was recorded, or a build tool that does not report it -- is
+		// read with the conventions every JVM build follows: test sees main.
+		if !resolution.Authoritative || len(resolution.SourceSetDependsOn[module.Name]) == 0 {
 			for sourceSet, dependencies := range conventionalSourceSetDependencies(module.SourceSets) {
 				module.SourceSetDependsOn[sourceSet] = uniqueSortedStrings(append(module.SourceSetDependsOn[sourceSet], dependencies...))
 			}
 		}
 	}
+	flattenSourcelessProjectDependencies(modules, root, resolution)
 }
 
 func (i *Index) copyLibraryAccess(binary, source string) {
@@ -1380,19 +1395,6 @@ func sourceSetFromConfiguration(configuration string) string {
 	return "main"
 }
 
-func sourceSetFromDependencyConfiguration(configuration string) string {
-	for _, suffix := range []string{"Implementation", "Api", "CompileOnly", "RuntimeOnly", "Compile", "Runtime"} {
-		if strings.HasSuffix(configuration, suffix) {
-			set := strings.TrimSuffix(configuration, suffix)
-			if set == "" {
-				return "main"
-			}
-			return set
-		}
-	}
-	return "main"
-}
-
 func (i *Index) moduleForURILocked(uri protocol.URI) *ModuleInfo {
 	module, unique := moduleForURIInModules(uri, i.modules)
 	if !unique {
@@ -1423,25 +1425,81 @@ func anyModuleClaimsURI(uri protocol.URI, modules []ModuleInfo) bool {
 	return false
 }
 
+// moduleLocator holds each module's cleaned directory and source roots so the
+// per-file "which module owns this" question costs a few prefix tests instead
+// of re-cleaning every module path on every call. Resolving a single
+// completion or reload asks it hundreds of times, and cleaning strings was
+// close to half of the CPU spent reloading files after a build.
+type moduleLocator struct {
+	first *ModuleInfo
+	// raw[n] is module n's Dir followed by its SourceRoots exactly as given.
+	// It is compared on every lookup, so a module list edited in place can
+	// never be answered from a stale locator.
+	raw [][]string
+	// roots[n] is raw[n] after filepath.Clean.
+	roots [][]string
+}
+
+var moduleLocatorCache atomic.Pointer[moduleLocator]
+
+func (l *moduleLocator) matches(modules []ModuleInfo) bool {
+	if l.first != &modules[0] || len(l.raw) != len(modules) {
+		return false
+	}
+	for index := range modules {
+		module, raw := &modules[index], l.raw[index]
+		if len(raw) != len(module.SourceRoots)+1 || raw[0] != module.Dir {
+			return false
+		}
+		for n, root := range module.SourceRoots {
+			if raw[n+1] != root {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func locatorForModules(modules []ModuleInfo) *moduleLocator {
+	if len(modules) == 0 {
+		return nil
+	}
+	if cached := moduleLocatorCache.Load(); cached != nil && cached.matches(modules) {
+		return cached
+	}
+	built := &moduleLocator{first: &modules[0], raw: make([][]string, len(modules)), roots: make([][]string, len(modules))}
+	for index := range modules {
+		module := &modules[index]
+		raw := make([]string, 0, len(module.SourceRoots)+1)
+		raw = append(raw, module.Dir)
+		raw = append(raw, module.SourceRoots...)
+		clean := make([]string, len(raw))
+		for n, root := range raw {
+			clean[n] = filepath.Clean(root)
+		}
+		built.raw[index], built.roots[index] = raw, clean
+	}
+	moduleLocatorCache.Store(built)
+	return built
+}
+
 func moduleForURIInModules(uri protocol.URI, modules []ModuleInfo) (*ModuleInfo, bool) {
 	path, ok := uriutil.Path(uri)
 	if !ok {
 		return nil, false
 	}
+	locator := locatorForModules(modules)
+	if locator == nil {
+		return nil, false
+	}
 	path = filepath.Clean(path)
 	best, bestSpecificity, ambiguous := -1, -1, false
-	for index := range modules {
-		module := &modules[index]
+	for index, roots := range locator.roots {
 		specificity := -1
-		for _, sourceRoot := range module.SourceRoots {
-			cleanRoot := filepath.Clean(sourceRoot)
-			if pathWithin(path, cleanRoot) && len(cleanRoot) > specificity {
-				specificity = len(cleanRoot)
+		for _, root := range roots {
+			if len(root) > specificity && cleanPathWithin(path, root) {
+				specificity = len(root)
 			}
-		}
-		cleanDir := filepath.Clean(module.Dir)
-		if pathWithin(path, cleanDir) && len(cleanDir) > specificity {
-			specificity = len(cleanDir)
 		}
 		if specificity < 0 {
 			continue
@@ -1474,6 +1532,11 @@ func sourceSetForURIInModule(uri protocol.URI, module *ModuleInfo) (string, bool
 	if !ok {
 		return "", false
 	}
+	// A build script compiles against the build's script classpath, not
+	// against the module it configures.
+	if isGradleScriptPath(path) {
+		return gradleScriptSourceSet, true
+	}
 	bestSet, bestLength, ambiguous := "main", -1, false
 	for set, roots := range module.SourceSets {
 		for _, root := range roots {
@@ -1495,28 +1558,16 @@ func sourceSetForURIInModule(uri protocol.URI, module *ModuleInfo) (string, bool
 }
 
 func pathWithin(path, directory string) bool {
-	path, directory = filepath.Clean(path), filepath.Clean(directory)
-	return path == directory || strings.HasPrefix(path, directory+string(filepath.Separator))
+	return cleanPathWithin(filepath.Clean(path), filepath.Clean(directory))
 }
 
-func (i *Index) moduleCanAccessLocked(from, target *ModuleInfo, sourceSet, targetSourceSet string) bool {
-	if from == nil || target == nil {
-		return true
-	}
-	if from.Name == target.Name && from.Dir == target.Dir {
-		return sourceSetCanAccess(from, sourceSet, targetSourceSet)
-	}
-	if targetSourceSet != "main" && targetSourceSet != "commonMain" {
+// cleanPathWithin is pathWithin for operands that are already
+// filepath.Clean'd. It allocates nothing.
+func cleanPathWithin(path, directory string) bool {
+	if !strings.HasPrefix(path, directory) {
 		return false
 	}
-	byName := make(map[string][]*ModuleInfo, len(i.modules))
-	for index := range i.modules {
-		module := &i.modules[index]
-		key := module.Root + "\x00" + module.Name
-		byName[key] = append(byName[key], module)
-	}
-	accessible, complete := moduleAccessSet(from, sourceSet, byName)
-	return complete && accessible[moduleAccessIdentity(target)]
+	return len(path) == len(directory) || path[len(directory)] == filepath.Separator
 }
 
 func moduleAccessIdentity(module *ModuleInfo) string {
@@ -1527,10 +1578,17 @@ func moduleAccessIdentity(module *ModuleInfo) string {
 }
 
 func moduleAccessSet(from *ModuleInfo, sourceSet string, byName map[string][]*ModuleInfo) (map[string]bool, bool) {
+	accessible, incomplete := moduleAccessSetExplained(from, sourceSet, byName)
+	return accessible, incomplete == ""
+}
+
+// moduleAccessSetExplained is moduleAccessSet with the reason a closure could
+// not be proved ("" when it was), so a withheld compiler pass says why.
+func moduleAccessSetExplained(from *ModuleInfo, sourceSet string, byName map[string][]*ModuleInfo) (map[string]bool, string) {
 	const maxDependencyStates = 100_000
 	accessible := make(map[string]bool)
 	if from == nil {
-		return accessible, true
+		return accessible, ""
 	}
 	type dependencyPath struct {
 		name     string
@@ -1538,7 +1596,7 @@ func moduleAccessSet(from *ModuleInfo, sourceSet string, byName map[string][]*Mo
 	}
 	dependencies, dependenciesComplete := moduleDependenciesForSourceSetBounded(from, sourceSet)
 	if !dependenciesComplete || len(dependencies) > maxDependencyStates {
-		return accessible, false
+		return accessible, "its source-set dependency list exceeds the 100000-entry safety limit"
 	}
 	queue := make([]dependencyPath, 0, len(dependencies))
 	for _, dependency := range dependencies {
@@ -1553,7 +1611,7 @@ func moduleAccessSet(from *ModuleInfo, sourceSet string, byName map[string][]*Mo
 			continue
 		}
 		if len(seen) >= maxDependencyStates {
-			return accessible, false
+			return accessible, "it exceeds its 100000-state safety limit"
 		}
 		seen[stateKey] = true
 		candidates := byName[from.Root+"\x00"+path.name]
@@ -1562,7 +1620,10 @@ func moduleAccessSet(from *ModuleInfo, sourceSet string, byName map[string][]*Mo
 			// cannot prove a closure. Returning an incomplete result makes compiler
 			// planning fall back to a clean unit instead of compiling an arbitrary
 			// prefix which merely happened to have resolvable names.
-			return accessible, false
+			if len(candidates) == 0 {
+				return accessible, "dependency " + path.name + " is not a module of the build model"
+			}
+			return accessible, "dependency " + path.name + " names " + strconv.Itoa(len(candidates)) + " modules"
 		}
 		candidate := candidates[0]
 		accessible[moduleAccessIdentity(candidate)] = true
@@ -1571,156 +1632,19 @@ func moduleAccessSet(from *ModuleInfo, sourceSet string, byName map[string][]*Mo
 		// on a consumer's compile classpath; implementation and compileOnly do not.
 		next, nextComplete := moduleExportedDependenciesForSourceSetBounded(candidate, "main")
 		if !nextComplete {
-			return accessible, false
+			return accessible, "the exported dependencies of " + path.name + " exceed their safety limit"
 		}
 		for _, dependency := range next {
 			if path.excluded[dependency] {
 				continue
 			}
 			if len(queue)+len(seen) >= maxDependencyStates {
-				return accessible, false
+				return accessible, "it exceeds its 100000-state safety limit"
 			}
 			queue = append(queue, dependencyPath{name: dependency, excluded: dependencyPathExclusions(path.excluded, candidate, "main", dependency)})
 		}
 	}
-	return accessible, true
-}
-
-func (i *Index) javaModuleCanAccessLocked(from, target *ModuleInfo, packageName string) bool {
-	if from == nil || target == nil || from.JavaModuleName == "" || target.JavaModuleName == "" || from.JavaModuleName == target.JavaModuleName {
-		return true
-	}
-	readable := target.JavaModuleName == "java.base"
-	const maxJavaModuleStates = 100_000
-	if len(i.modules) > maxJavaModuleStates || len(from.JavaRequires) > maxJavaModuleStates {
-		return false
-	}
-	byJavaName := make(map[string][]*ModuleInfo, len(i.modules))
-	for index := range i.modules {
-		module := &i.modules[index]
-		if module.JavaModuleName != "" {
-			byJavaName[module.JavaModuleName] = append(byJavaName[module.JavaModuleName], module)
-		}
-	}
-	type readableModule struct {
-		name       string
-		transitive bool
-	}
-	queue := make([]readableModule, 0, len(from.JavaRequires))
-	for name := range from.JavaRequires {
-		queue = append(queue, readableModule{name: name, transitive: true})
-	}
-	seen := make(map[string]bool)
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-		if seen[current.name] {
-			continue
-		}
-		if len(seen) >= maxJavaModuleStates {
-			return false
-		}
-		seen[current.name] = true
-		if current.name == target.JavaModuleName {
-			readable = true
-			break
-		}
-		candidates := byJavaName[current.name]
-		if len(candidates) != 1 || !current.transitive {
-			continue
-		}
-		module := candidates[0]
-		for name, requirement := range module.JavaRequires {
-			if requirement.Transitive {
-				if len(queue)+len(seen) >= maxJavaModuleStates {
-					return false
-				}
-				queue = append(queue, readableModule{name: name, transitive: true})
-			}
-		}
-	}
-	if !readable {
-		return false
-	}
-	targets, exported := target.JavaExports[packageName]
-	if !exported {
-		return false
-	}
-	return containsString(targets, "*") || containsString(targets, from.JavaModuleName)
-}
-
-func (i *Index) libraryJavaModuleCanAccessLocked(from *ModuleInfo, target libraryJavaModule, packageName string) bool {
-	if from == nil || from.JavaModuleName == "" || target.Name == "" || from.JavaModuleName == target.Name {
-		return true
-	}
-	const maxJavaModuleStates = 100_000
-	if len(i.modules)+len(i.libraryModules) > maxJavaModuleStates || len(from.JavaRequires) > maxJavaModuleStates {
-		return false
-	}
-	readable := target.Name == "java.base"
-	sourceByName := make(map[string][]*ModuleInfo, len(i.modules))
-	for moduleIndex := range i.modules {
-		module := &i.modules[moduleIndex]
-		if module.JavaModuleName != "" {
-			sourceByName[module.JavaModuleName] = append(sourceByName[module.JavaModuleName], module)
-		}
-	}
-	libraryByName := make(map[string][]libraryJavaModule, len(i.libraryModules))
-	for _, module := range i.libraryModules {
-		if module.Name != "" {
-			libraryByName[module.Name] = append(libraryByName[module.Name], module)
-		}
-	}
-	queue := make([]string, 0, len(from.JavaRequires))
-	for name := range from.JavaRequires {
-		queue = append(queue, name)
-	}
-	seen := make(map[string]bool)
-	for len(queue) > 0 && !readable {
-		name := queue[0]
-		queue = queue[1:]
-		if seen[name] {
-			continue
-		}
-		if len(seen) >= maxJavaModuleStates {
-			return false
-		}
-		seen[name] = true
-		if name == target.Name {
-			readable = true
-			break
-		}
-		if candidates := sourceByName[name]; len(candidates) == 1 && len(libraryByName[name]) == 0 {
-			module := candidates[0]
-			for dependency, requirement := range module.JavaRequires {
-				if requirement.Transitive {
-					if len(queue)+len(seen) >= maxJavaModuleStates {
-						return false
-					}
-					queue = append(queue, dependency)
-				}
-			}
-		}
-		if candidates := libraryByName[name]; len(candidates) == 1 && len(sourceByName[name]) == 0 {
-			module := candidates[0]
-			for dependency, requirement := range module.Requires {
-				if requirement.Transitive {
-					if len(queue)+len(seen) >= maxJavaModuleStates {
-						return false
-					}
-					queue = append(queue, dependency)
-				}
-			}
-		}
-	}
-	if !readable {
-		return false
-	}
-	if target.Automatic {
-		return true
-	}
-	targets, exported := target.Exports[packageName]
-	return exported && (containsString(targets, "*") || containsString(targets, from.JavaModuleName))
+	return accessible, ""
 }
 
 // javaReadableSetLocked computes JPMS readability once for a foreground
@@ -1869,11 +1793,6 @@ func sourceSetDependencies(module *ModuleInfo, sourceSet string) []string {
 	return uniqueSortedStrings(dependencies)
 }
 
-func moduleDependenciesForSourceSet(module *ModuleInfo, sourceSet string) []string {
-	dependencies, _ := moduleDependenciesForSourceSetBounded(module, sourceSet)
-	return dependencies
-}
-
 func moduleDependenciesForSourceSetBounded(module *ModuleInfo, sourceSet string) ([]string, bool) {
 	if module == nil {
 		return nil, true
@@ -1900,11 +1819,6 @@ func moduleDependenciesForSourceSetBounded(module *ModuleInfo, sourceSet string)
 		dependencies = append(dependencies, module.DependenciesBySourceSet[dependencySet]...)
 	}
 	return uniqueSortedStrings(dependencies), true
-}
-
-func moduleExportedDependenciesForSourceSet(module *ModuleInfo, sourceSet string) []string {
-	dependencies, _ := moduleExportedDependenciesForSourceSetBounded(module, sourceSet)
-	return dependencies
 }
 
 func moduleExportedDependenciesForSourceSetBounded(module *ModuleInfo, sourceSet string) ([]string, bool) {
@@ -2014,6 +1928,7 @@ func (i *Index) BuildModels() []BuildModelStatus {
 			Module: module.Name, Directory: module.Dir, Importer: module.BuildImporter,
 			Authoritative: module.BuildModelAuthoritative, Failure: module.BuildModelFailure,
 			CompilerSettings: cloneModuleInfo(module).CompilerSettingsBySourceSet,
+			Formatters:       formatterNames(module.Formatters),
 		})
 	}
 	return models
@@ -2184,6 +2099,14 @@ func (i *Index) RuntimeClasspathFor(uri protocol.URI) []string {
 		}
 		seen[state] = true
 		candidates := byName[module.Root+"\x00"+path.name]
+		// A project the build model names but the index holds no module for
+		// has no sources of its own (an aggregator such as :services); its
+		// external jars already appear in the resolved runtime classpath of
+		// every module that depends on it. Ambiguous names still stop rather
+		// than guess which module's outputs to launch with.
+		if len(candidates) == 0 && path.name != module.Name {
+			continue
+		}
 		if len(candidates) != 1 {
 			return nil
 		}
@@ -2243,11 +2166,6 @@ func runtimeModuleDependenciesForSourceSetBounded(module *ModuleInfo, sourceSet 
 	return uniqueSortedStrings(dependencies), true
 }
 
-func sourceSetDependencyClosure(module *ModuleInfo, sourceSet string) []string {
-	closure, _ := sourceSetDependencyClosureBounded(module, sourceSet)
-	return closure
-}
-
 func sourceSetDependencyClosureBounded(module *ModuleInfo, sourceSet string) ([]string, bool) {
 	queue := append([]string(nil), sourceSetDependencies(module, sourceSet)...)
 	if len(queue) > 100_000 {
@@ -2273,4 +2191,84 @@ func sourceSetDependencyClosureBounded(module *ModuleInfo, sourceSet string) ([]
 		queue = append(queue, next...)
 	}
 	return result, true
+}
+
+// flattenSourcelessProjectDependencies replaces a dependency on a project that
+// has no sources -- an aggregating parent such as `:services` -- with what that
+// project exports. Such a project is never a module, so the dependency named
+// nothing the dependency closure could find, and one unknown name made the
+// whole closure unprovable: the compiler pass was withheld for the project.
+func flattenSourcelessProjectDependencies(modules []ModuleInfo, root string, resolution classpathResolution) {
+	if !resolution.Authoritative {
+		return
+	}
+	present := make(map[string]bool)
+	for index := range modules {
+		if pathWithin(modules[index].Dir, root) {
+			present[modules[index].Name] = true
+		}
+	}
+	var expand func(name string, seen map[string]bool) []string
+	expand = func(name string, seen map[string]bool) []string {
+		if present[name] {
+			return []string{name}
+		}
+		if seen[name] {
+			return nil
+		}
+		seen[name] = true
+		var out []string
+		for _, exported := range resolution.SourceSetExported[name]["main"] {
+			out = append(out, expand(exported, seen)...)
+		}
+		return out
+	}
+	flatten := func(dependencies []string) []string {
+		changed := false
+		for _, dependency := range dependencies {
+			if !present[dependency] && strings.HasPrefix(dependency, ":") {
+				changed = true
+				break
+			}
+		}
+		if !changed {
+			return dependencies
+		}
+		out := make([]string, 0, len(dependencies))
+		for _, dependency := range dependencies {
+			if !strings.HasPrefix(dependency, ":") {
+				out = append(out, dependency)
+				continue
+			}
+			out = append(out, expand(dependency, make(map[string]bool))...)
+		}
+		return uniqueSortedStrings(out)
+	}
+	for index := range modules {
+		module := &modules[index]
+		if !pathWithin(module.Dir, root) {
+			continue
+		}
+		module.Dependencies = flatten(module.Dependencies)
+		for _, sets := range []map[string][]string{module.DependenciesBySourceSet, module.RuntimeDependenciesBySourceSet, module.ExportedBySourceSet} {
+			for sourceSet, dependencies := range sets {
+				sets[sourceSet] = flatten(dependencies)
+			}
+		}
+	}
+}
+
+func formatterNames(specs []FormatterSpec) []string {
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.Format+": "+spec.Tool+" "+spec.Version)
+	}
+	return names
+}
+
+// isGradleScriptPath reports whether path is a Gradle Kotlin DSL script:
+// `build.gradle.kts`, `settings.gradle.kts`, an `init.gradle.kts` or a
+// precompiled-plugin-style `*.gradle.kts`.
+func isGradleScriptPath(path string) bool {
+	return strings.HasSuffix(strings.ToLower(path), ".gradle.kts")
 }

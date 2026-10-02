@@ -119,6 +119,11 @@ func symbolBucketShape(symbol analysis.Symbol) string {
 	// Start with the complete semantic shape used by stable-ID matching, then
 	// append index-visibility fields which do not participate in ID stability.
 	value.WriteString(stableSymbolShape(symbol))
+	// Buckets are keyed on the container's identity too: a member that keeps
+	// its ID while its container is re-identified (a parse error changed the
+	// class's shape) is filed under a new key, and the old entry must go.
+	value.WriteString(symbol.ContainerID)
+	value.WriteByte(0)
 	value.WriteString(symbol.OriginID)
 	value.WriteByte(0)
 	value.WriteString(symbol.Package)
@@ -243,10 +248,6 @@ func newBucketRemoval(symbols []analysis.Symbol) *bucketRemoval {
 	return batch
 }
 
-func (i *Index) removeSymbolIndicesLocked(symbol analysis.Symbol, replacing protocol.URI) {
-	i.removeSymbolIndicesBatchLocked(symbol, replacing, nil)
-}
-
 func (i *Index) removeSymbolIndicesBatchLocked(symbol analysis.Symbol, replacing protocol.URI, batch *bucketRemoval) {
 	remove := func(name string, index map[string][]string, key string) {
 		if batch == nil {
@@ -262,9 +263,7 @@ func (i *Index) removeSymbolIndicesBatchLocked(symbol analysis.Symbol, replacing
 	}
 	directSuperIDs := i.directSupertypeIDsLocked(symbol)
 	receiverIDs := i.receiverTypeIDsLocked(symbol)
-	i.semanticVersion++
-	i.semanticSymbolVersion[symbol.ID] = i.semanticVersion
-	i.semanticNameVersion[symbol.Name] = i.semanticVersion
+	i.bumpSemanticVersionLocked(symbol)
 	delete(i.symbols, symbol.ID)
 	if !isLexicalSymbol(symbol) {
 		i.invalidateResolvedTargetLocked(symbol.ID, symbol.Name, replacing)
@@ -326,9 +325,7 @@ func (i *Index) removeSymbolIndicesBatchLocked(symbol analysis.Symbol, replacing
 }
 
 func (i *Index) addSymbolIndicesLocked(symbol *analysis.Symbol) {
-	i.semanticVersion++
-	i.semanticSymbolVersion[symbol.ID] = i.semanticVersion
-	i.semanticNameVersion[symbol.Name] = i.semanticVersion
+	i.bumpSemanticVersionLocked(*symbol)
 	// removeSymbolIndicesLocked clears every bucket entry of a removed
 	// identity, so an identity absent from i.symbols cannot already sit in a
 	// bucket. Scanning the bucket anyway made indexing a large file quadratic
@@ -568,11 +565,11 @@ func (i *Index) prepareFileReferencesLocked(file *analysis.ParsedFile) {
 				reference.ResolvedID = lexicalBinding(file, *reference, file.Symbols)
 			}
 		}
-		if reference.ResolvedID == "" && i.Progress().Ready {
-			if resolved := i.resolveLocked(file, *reference); len(resolved) == 1 {
-				reference.ResolvedID = resolved[0].ID
-			}
-		}
+		// Resolving the rest here -- by type inference, for every reference in
+		// the file, while the index's write lock is held -- made each edit of a
+		// large file stall every other request for hundreds of milliseconds.
+		// The project's references are stored unresolved anyway, and queries
+		// resolve what they need on demand and remember it.
 	}
 }
 
@@ -623,64 +620,30 @@ func (i *Index) replaceReferenceDeltaLocked(old, replacement *analysis.ParsedFil
 }
 
 func (i *Index) addReferenceBucketsLocked(reference analysis.Reference) {
-	i.refsByName[reference.Name] = append(i.refsByName[reference.Name], reference)
+	i.refsByName.add(reference.Name, reference)
 	if reference.ResolvedID != "" {
-		i.refsByTarget[reference.ResolvedID] = append(i.refsByTarget[reference.ResolvedID], reference)
+		i.refsByTarget.add(reference.ResolvedID, reference)
 	} else {
-		i.unresolvedRefsByName[reference.Name] = append(i.unresolvedRefsByName[reference.Name], reference)
+		i.unresolvedRefsByName.add(reference.Name, reference)
 	}
 }
 
 func (i *Index) removeReferenceBucketsLocked(reference analysis.Reference) {
-	removeExactReference(i.refsByName, reference.Name, reference)
+	i.refsByName.remove(reference.Name, reference)
 	if reference.ResolvedID != "" {
-		removeExactReference(i.refsByTarget, reference.ResolvedID, reference)
+		i.refsByTarget.remove(reference.ResolvedID, reference)
 	} else {
-		removeExactReference(i.unresolvedRefsByName, reference.Name, reference)
+		i.unresolvedRefsByName.remove(reference.Name, reference)
 	}
 }
 
 func (i *Index) replaceReferenceBucketsLocked(old, replacement analysis.Reference) {
-	replaceExactReference(i.refsByName, old.Name, old, replacement)
+	i.refsByName.replace(old.Name, old, replacement)
 	if old.ResolvedID != "" {
-		replaceExactReference(i.refsByTarget, old.ResolvedID, old, replacement)
+		i.refsByTarget.replace(old.ResolvedID, old, replacement)
 	} else {
-		replaceExactReference(i.unresolvedRefsByName, old.Name, old, replacement)
+		i.unresolvedRefsByName.replace(old.Name, old, replacement)
 	}
-}
-
-func exactReferencePosition(bucket []analysis.Reference, wanted analysis.Reference) int {
-	for index, candidate := range bucket {
-		if candidate.URI == wanted.URI && candidate.StartByte == wanted.StartByte && candidate.EndByte == wanted.EndByte && candidate.Name == wanted.Name {
-			return index
-		}
-	}
-	return -1
-}
-
-func removeExactReference(index map[string][]analysis.Reference, key string, wanted analysis.Reference) {
-	bucket := index[key]
-	position := exactReferencePosition(bucket, wanted)
-	if position < 0 {
-		return
-	}
-	copy(bucket[position:], bucket[position+1:])
-	bucket = bucket[:len(bucket)-1]
-	if len(bucket) == 0 {
-		delete(index, key)
-	} else {
-		index[key] = bucket
-	}
-}
-
-func replaceExactReference(index map[string][]analysis.Reference, key string, old, replacement analysis.Reference) {
-	bucket := index[key]
-	if position := exactReferencePosition(bucket, old); position >= 0 {
-		bucket[position] = replacement
-		index[key] = bucket
-		return
-	}
-	index[key] = append(bucket, replacement)
 }
 
 func (i *Index) replaceImportDeltaLocked(old, replacement *analysis.ParsedFile) {
@@ -712,16 +675,15 @@ func (i *Index) replaceImportDeltaLocked(old, replacement *analysis.ParsedFile) 
 }
 
 func (i *Index) invalidateResolvedTargetLocked(target, name string, replacing protocol.URI) {
-	references := i.refsByTarget[target]
-	delete(i.refsByTarget, target)
+	references := i.refsByTarget.take(target)
 	for _, reference := range references {
 		if reference.URI == replacing {
 			continue
 		}
 		unresolved := reference
 		unresolved.ResolvedID = ""
-		replaceExactReference(i.refsByName, name, reference, unresolved)
-		i.unresolvedRefsByName[name] = append(i.unresolvedRefsByName[name], unresolved)
+		i.refsByName.replace(name, reference, unresolved)
+		i.unresolvedRefsByName.add(name, unresolved)
 		if file := i.files[reference.URI]; file != nil {
 			replacement := *file
 			replacement.References = append([]analysis.Reference(nil), file.References...)
@@ -738,6 +700,8 @@ func (i *Index) invalidateResolvedTargetLocked(target, name string, replacing pr
 }
 
 func (i *Index) addLibraryBatch(files []LibraryFile, generation uint64) {
+	guard := i.lockGuard()
+	defer guard.release()
 	// A short run of files per critical section bounds reader wait time even
 	// when a cached archive contains tens of thousands of classes. Library
 	// loading is background work; foreground completion/navigation wins a
@@ -764,15 +728,15 @@ func (i *Index) addLibraryBatch(files []LibraryFile, generation uint64) {
 			work += weight
 			end++
 		}
-		i.mu.Lock()
+		guard.Lock()
 		if i.closed.Load() {
-			i.mu.Unlock()
+			guard.Unlock()
 			return
 		}
 		for n := start; n < end; n++ {
 			i.addLibraryFileLocked(&files[n], generation)
 		}
-		i.mu.Unlock()
+		guard.Unlock()
 		start = end
 	}
 	i.signalSemanticProgress()
@@ -784,6 +748,8 @@ func (i *Index) addLibraryBatch(files []LibraryFile, generation uint64) {
 // the complete staged generation lands. Parsing and validation have already
 // succeeded, so the only abort is a superseding generation or Close.
 func (i *Index) addLibraryArchiveTransaction(archivePath string, files []LibraryFile, generation uint64, accessSnapshots ...map[string]bool) bool {
+	guard := i.lockGuard()
+	defer guard.release()
 	for index := range files {
 		if len(files[index].Parsed.Symbols)+len(files[index].Parsed.References) > maxPublishedFileOccurrences {
 			i.recordHealth("library-index", archivePath, "archive member exceeds the 32768-occurrence publication safety limit; previous archive snapshot retained")
@@ -797,13 +763,13 @@ func (i *Index) addLibraryArchiveTransaction(archivePath string, files []Library
 	}
 	archivePath = filepath.Clean(archivePath)
 	if len(accessSnapshots) > 0 {
-		i.mu.Lock()
+		guard.Lock()
 		access := make(map[string]bool, len(accessSnapshots[0]))
 		for key := range accessSnapshots[0] {
 			access[key] = true
 		}
 		i.libraryAccess[archivePath] = access
-		i.mu.Unlock()
+		guard.Unlock()
 	}
 	wanted := make(map[protocol.URI]bool, len(files))
 	for index := range files {
@@ -819,30 +785,30 @@ func (i *Index) addLibraryArchiveTransaction(archivePath string, files []Library
 			work += weight
 			end++
 		}
-		i.mu.Lock()
+		guard.Lock()
 		if i.closed.Load() {
-			i.mu.Unlock()
+			guard.Unlock()
 			return false
 		}
 		for index := start; index < end; index++ {
 			i.addLibraryFileLocked(&files[index], generation)
 		}
-		i.mu.Unlock()
+		guard.Unlock()
 		start = end
 	}
 	var stale []protocol.URI
-	i.mu.RLock()
-	for uri, source := range i.librarySources {
-		if filepath.Clean(source.Archive) == archivePath && !wanted[uri] {
+	guard.RLock()
+	for uri := range i.libraryURIsByArchive[archivePath] {
+		if !wanted[uri] {
 			stale = append(stale, uri)
 		}
 	}
-	i.mu.RUnlock()
+	guard.RUnlock()
 	for start := 0; start < len(stale); start += 32 {
 		end := min(start+32, len(stale))
-		i.mu.Lock()
+		guard.Lock()
 		if i.closed.Load() {
-			i.mu.Unlock()
+			guard.Unlock()
 			return false
 		}
 		for index := start; index < end; index++ {
@@ -851,7 +817,7 @@ func (i *Index) addLibraryArchiveTransaction(archivePath string, files []Library
 				i.removeLocked(uri)
 			}
 		}
-		i.mu.Unlock()
+		guard.Unlock()
 	}
 	complete := !i.closed.Load() && i.generation.Load() == generation
 	if complete {
@@ -864,7 +830,7 @@ func (i *Index) addLibraryFileLocked(file *LibraryFile, generation uint64) {
 	for symbol := range file.Parsed.Symbols {
 		file.Parsed.Symbols[symbol].Library = true
 	}
-	i.librarySources[file.Parsed.URI] = file.Source
+	i.rememberLibrarySourceLocked(file.Parsed.URI, file.Source)
 	matched := i.attachLibrarySourceLocked(file)
 	if len(matched) > 0 {
 		retainLibrarySourceOnlySymbols(&file.Parsed, matched)
@@ -1157,7 +1123,11 @@ func prepareInterop(file *analysis.ParsedFile) {
 	}
 	file.Symbols = base
 	interop := interopSymbols(file)
-	if len(interop) > 0 {
+	// The slice is about to be retained for the life of the index. Decoding and
+	// in-place filtering leave spare capacity that, across tens of thousands of
+	// library files, was a few hundred megabytes of nothing; copy to an exact
+	// size when the slack is worth reclaiming.
+	if len(interop) > 0 || cap(file.Symbols) > len(file.Symbols)+len(file.Symbols)/8+8 {
 		combined := make([]analysis.Symbol, len(file.Symbols)+len(interop))
 		copy(combined, file.Symbols)
 		copy(combined[len(file.Symbols):], interop)
@@ -1179,12 +1149,17 @@ func (i *Index) reserveLibraryCapacityLocked(files int64) {
 	if files <= 0 {
 		return
 	}
-	expected := int(files) * 8
+	// Per library file a Spring/jOOQ classpath carries about ten symbols,
+	// eight qualified names, thirteen container members, two and a half
+	// simple names and two containers. One shared estimate reserved four
+	// times the names and containers ever used and too little of the rest,
+	// which then doubled anyway.
+	expected := int(files) * 10
 	if expected < 1<<16 || len(i.symbols) >= expected/2 {
 		return
 	}
-	grow := func(m map[string][]string) map[string][]string {
-		out := make(map[string][]string, expected)
+	grow := func(m map[string][]string, perFile int) map[string][]string {
+		out := make(map[string][]string, int(files)*perFile)
 		for k, v := range m {
 			out[k] = v
 		}
@@ -1195,10 +1170,10 @@ func (i *Index) reserveLibraryCapacityLocked(files int64) {
 		symbols[k] = v
 	}
 	i.symbols = symbols
-	i.byName = grow(i.byName)
-	i.byFQN = grow(i.byFQN)
-	i.byContainerName = grow(i.byContainerName)
-	i.byContainerMember = grow(i.byContainerMember)
+	i.byName = grow(i.byName, 3)
+	i.byFQN = grow(i.byFQN, 8)
+	i.byContainerName = grow(i.byContainerName, 2)
+	i.byContainerMember = grow(i.byContainerMember, 14)
 }
 
 func (i *Index) replaceLocked(file *analysis.ParsedFile) {
@@ -1213,6 +1188,7 @@ func (i *Index) replaceLocked(file *analysis.ParsedFile) {
 		preserveLibraryAttachments(old, file)
 	}
 	prepareInterop(file)
+	i.noteDeclarationsLocked(file)
 	if old != nil && old.Package == file.Package {
 		stabilizeFileSymbolIDs(old, file)
 		i.replaceFileDeltaLocked(old, file)
@@ -1305,16 +1281,11 @@ func (i *Index) replaceLocked(file *analysis.ParsedFile) {
 				reference.ResolvedID = lexicalBinding(file, *reference, file.Symbols)
 			}
 		}
-		if reference.ResolvedID == "" && i.Progress().Ready {
-			if resolved := i.resolveLocked(file, *reference); len(resolved) == 1 {
-				reference.ResolvedID = resolved[0].ID
-			}
-		}
-		i.refsByName[reference.Name] = append(i.refsByName[reference.Name], *reference)
+		i.refsByName.add(reference.Name, *reference)
 		if reference.ResolvedID != "" {
-			i.refsByTarget[reference.ResolvedID] = append(i.refsByTarget[reference.ResolvedID], *reference)
+			i.refsByTarget.add(reference.ResolvedID, *reference)
 		} else {
-			i.unresolvedRefsByName[reference.Name] = append(i.unresolvedRefsByName[reference.Name], *reference)
+			i.unresolvedRefsByName.add(reference.Name, *reference)
 		}
 	}
 	if _, workspace := uriutil.Path(file.URI); workspace {
@@ -1491,8 +1462,8 @@ func (i *Index) removeFileContentsLocked(file *analysis.ParsedFile) {
 		referenceNames[r.Name] = true
 	}
 	for name := range referenceNames {
-		filterReferenceBucket(i.refsByName, name, file.URI)
-		filterReferenceBucket(i.unresolvedRefsByName, name, file.URI)
+		i.refsByName.dropFile(name, file.URI)
+		i.unresolvedRefsByName.dropFile(name, file.URI)
 	}
 	targets := make(map[string]bool)
 	for _, reference := range file.References {
@@ -1501,7 +1472,7 @@ func (i *Index) removeFileContentsLocked(file *analysis.ParsedFile) {
 		}
 	}
 	for target := range targets {
-		filterReferenceBucket(i.refsByTarget, target, file.URI)
+		i.refsByTarget.dropFile(target, file.URI)
 	}
 	if _, workspace := uriutil.Path(file.URI); workspace {
 		prefixes := make(map[string]bool)
@@ -1513,21 +1484,6 @@ func (i *Index) removeFileContentsLocked(file *analysis.ParsedFile) {
 		for prefix := range prefixes {
 			i.importersByPrefix[prefix] = withoutURI(i.importersByPrefix[prefix], file.URI)
 		}
-	}
-}
-
-func filterReferenceBucket(index map[string][]analysis.Reference, key string, uri protocol.URI) {
-	bucket := index[key]
-	out := bucket[:0]
-	for _, reference := range bucket {
-		if reference.URI != uri {
-			out = append(out, reference)
-		}
-	}
-	if len(out) == 0 {
-		delete(index, key)
-	} else {
-		index[key] = out
 	}
 }
 
@@ -1635,4 +1591,50 @@ func (i *Index) removeCompletionPackageLocked(packageName string) {
 		}
 		parent = full
 	}
+}
+
+func (i *Index) rememberLibrarySourceLocked(uri protocol.URI, source LibrarySource) {
+	if _, exists := i.librarySources[uri]; exists {
+		i.forgetLibrarySourceLocked(uri)
+	}
+	i.librarySources[uri] = source
+	archive := filepath.Clean(source.Archive)
+	if i.libraryURIsByArchive == nil {
+		i.libraryURIsByArchive = make(map[string]map[protocol.URI]bool)
+	}
+	if i.libraryURIsByArchive[archive] == nil {
+		i.libraryURIsByArchive[archive] = make(map[protocol.URI]bool)
+	}
+	i.libraryURIsByArchive[archive][uri] = true
+}
+
+func (i *Index) forgetLibrarySourceLocked(uri protocol.URI) {
+	source, exists := i.librarySources[uri]
+	if !exists {
+		return
+	}
+	delete(i.librarySources, uri)
+	archive := filepath.Clean(source.Archive)
+	if uris := i.libraryURIsByArchive[archive]; uris != nil {
+		delete(uris, uri)
+		if len(uris) == 0 {
+			delete(i.libraryURIsByArchive, archive)
+		}
+	}
+}
+
+// bumpSemanticVersionLocked records that symbol changed. A local variable or
+// parameter changes what its own file means and nothing else -- it is in no
+// global bucket -- so it moves only its own id's and name's versions. Typing
+// `val x = ...` inside a function used to move the index-wide version, which
+// every cross-file memo is keyed on, so each keystroke in a body emptied them.
+func (i *Index) bumpSemanticVersionLocked(symbol analysis.Symbol) {
+	// The per-identity versions need a clock of their own that every change
+	// advances, lexical or not; caches compare them for equality.
+	i.semanticChangeClock++
+	if !isLexicalSymbol(symbol) {
+		i.semanticVersion++
+	}
+	i.semanticSymbolVersion[symbol.ID] = i.semanticChangeClock
+	i.semanticNameVersion[symbol.Name] = i.semanticChangeClock
 }

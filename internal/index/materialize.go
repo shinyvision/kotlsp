@@ -146,10 +146,12 @@ func (i *Index) archiveDigest(archivePath string) ([sha256.Size]byte, bool) {
 }
 
 func (i *Index) archiveDigestContext(ctx context.Context, archivePath string) ([sha256.Size]byte, bool) {
+	guard := i.lockGuard()
+	defer guard.release()
 	clean := filepath.Clean(archivePath)
-	i.mu.RLock()
+	guard.RLock()
 	digest, ok := i.archiveDigests[clean]
-	i.mu.RUnlock()
+	guard.RUnlock()
 	if ok {
 		return digest, true
 	}
@@ -157,13 +159,13 @@ func (i *Index) archiveDigestContext(ctx context.Context, archivePath string) ([
 	if err != nil {
 		return [sha256.Size]byte{}, false
 	}
-	i.mu.Lock()
+	guard.Lock()
 	if existing, exists := i.archiveDigests[clean]; exists {
 		computed = existing
 	} else {
 		i.storeArchiveDigestLocked(clean, computed)
 	}
-	i.mu.Unlock()
+	guard.Unlock()
 	return computed, true
 }
 
@@ -463,12 +465,14 @@ func (i *Index) LibraryFileURI(uri protocol.URI) (protocol.URI, bool) {
 }
 
 func (i *Index) LibraryFileURIContext(ctx context.Context, uri protocol.URI) (protocol.URI, bool) {
+	guard := i.lockGuard()
+	defer guard.release()
 	if !isArchiveURI(uri) {
 		return "", false
 	}
-	i.mu.RLock()
+	guard.RLock()
 	source, known := i.librarySources[uri]
-	i.mu.RUnlock()
+	guard.RUnlock()
 	if !known || source.Archive == "" || source.Entry == "" {
 		return "", false
 	}
@@ -513,6 +517,8 @@ func (i *Index) LibraryFileURIContext(ctx context.Context, uri protocol.URI) (pr
 // DebugSourcePath maps a loaded JVM class to the same exact workspace or
 // attached-library source used by definition navigation.
 func (i *Index) DebugSourcePath(ctx context.Context, classPaths []string, className, sourceName string) (string, bool) {
+	guard := i.lockGuard()
+	defer guard.release()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -525,10 +531,10 @@ func (i *Index) DebugSourcePath(ctx context.Context, classPaths []string, classN
 		binaryArchive string
 		moduleDir     string
 	}
-	i.mu.RLock()
+	guard.RLock()
 	ids := i.byFQN[className]
 	if len(ids) > maxResolutionCandidates {
-		i.mu.RUnlock()
+		guard.RUnlock()
 		i.recordHealth("debug-source", className, "exact source candidate inventory exceeded its 512-symbol safety limit and was withheld")
 		return "", false
 	}
@@ -549,7 +555,7 @@ func (i *Index) DebugSourcePath(ctx context.Context, classPaths []string, classN
 		}
 		candidates = append(candidates, candidate)
 	}
-	i.mu.RUnlock()
+	guard.RUnlock()
 	bestRank := len(classPaths) + 1
 	paths := make(map[string]bool)
 	for _, candidate := range candidates {

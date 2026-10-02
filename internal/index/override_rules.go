@@ -1,6 +1,8 @@
 package index
 
 import (
+	"context"
+
 	"strings"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
@@ -25,7 +27,7 @@ func init() {
 	})
 }
 
-func hierarchyMismatches(i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
+func hierarchyMismatches(_ context.Context, i *Index, file *analysis.ParsedFile) []protocol.Diagnostic {
 	text := i.documentTextLocked(file.URI)
 	var out []protocol.Diagnostic
 	interesting := make(map[string]bool)

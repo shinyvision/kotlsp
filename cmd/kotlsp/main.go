@@ -17,8 +17,16 @@ import (
 var version = "dev"
 
 func main() {
-	debug.SetGCPercent(100)
-	debug.SetMemoryLimit(resourcebudget.GoSoftLimitBytes)
+	// How far the heap may grow before the next collection. Each collection
+	// marks the whole index, so a larger value trades memory for CPU.
+	gcPercent := 100
+	if value, err := strconv.Atoi(os.Getenv("KOTLSP_GOGC")); err == nil && value >= 25 && value <= 1000 {
+		gcPercent = value
+	}
+	debug.SetGCPercent(gcPercent)
+	// Same computation the reservation coordinator applies, so startup and
+	// every later adjustment agree on one number.
+	resourcebudget.ApplyGoMemoryLimit()
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "version", "--version", "-version":
@@ -37,6 +45,10 @@ func main() {
 	stdio := fs.Bool("stdio", true, "serve Language Server Protocol over stdin/stdout")
 	logFile := fs.String("log-file", "", "write diagnostic logs to this file (never stdout)")
 	_ = fs.Parse(os.Args[1:])
+	if *logFile == "" {
+		// Lets a session started by an editor be traced without changing its command line.
+		*logFile = os.Getenv("KOTLSP_LOG_FILE")
+	}
 	if !*stdio {
 		fmt.Fprintln(os.Stderr, "only --stdio is currently supported")
 		os.Exit(2)
@@ -56,6 +68,7 @@ func main() {
 			})
 		}
 	}
+	installProfileSignals()
 	if profilePath := os.Getenv("KOTLSP_HEAP_PROFILE"); profilePath != "" {
 		defer func() {
 			if profile, err := os.Create(profilePath); err == nil {

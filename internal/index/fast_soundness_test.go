@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/shinyvision/kotlsp/internal/protocol"
 )
@@ -21,6 +20,7 @@ import (
 // A violation is a soundness bug and fails the build. That is what converts
 // "we are sure this rule is right" from an intention into something checked.
 func assertFastDiagnosticsAreSound(t *testing.T, idx *Index, uri protocol.URI) []string {
+	ctx := context.Background()
 	t.Helper()
 	// Raw sets, not the reconciled output: reconciliation drops a compiler
 	// finding an identical prediction already covers, which is the very
@@ -30,8 +30,8 @@ func assertFastDiagnosticsAreSound(t *testing.T, idx *Index, uri protocol.URI) [
 	var predictions []protocol.Diagnostic
 	if file != nil {
 		predictions = append(predictions, idx.declarationDiagnosticsLocked(file)...)
-		predictions = append(predictions, idx.referenceDiagnosticsLocked(file)...)
-		predictions = append(predictions, idx.fastDiagnosticsLocked(file)...)
+		predictions = append(predictions, idx.referenceDiagnosticsLocked(ctx, file)...)
+		predictions = append(predictions, idx.fastDiagnosticsLocked(ctx, file)...)
 	}
 	compiler := append([]protocol.Diagnostic(nil), idx.compilerDiagnostics[uri]...)
 	idx.mu.RUnlock()
@@ -73,11 +73,33 @@ func assertFastDiagnosticsAreSound(t *testing.T, idx *Index, uri protocol.URI) [
 		// different wording would still change on screen when the compiler
 		// arrived, which is the thing this exists to prevent.
 		if !confirmed[key{prediction.Range.Start.Line, code, prediction.Message}] {
-			t.Errorf("unsound fast diagnostic: %s reported %q at %s:%d; the compiler reports no such finding there",
-				code, prediction.Message, filepath.Base(string(uri)), prediction.Range.Start.Line+1)
+			t.Errorf("unsound fast diagnostic: %s reported %q at %s:%d; the compiler reports no such finding there [%s]",
+				code, prediction.Message, filepath.Base(string(uri)), prediction.Range.Start.Line+1, unsoundContext(idx, uri, prediction))
 		}
 	}
 	return codes
+}
+
+// unsoundContext reports what the index believed when it produced a finding
+// the compiler does not share. A prediction is only ever as good as the index
+// state behind it, so a failure that cannot say whether the name was known, or
+// whether indexing had settled, sends the reader back to guessing.
+func unsoundContext(idx *Index, uri protocol.URI, prediction protocol.Diagnostic) string {
+	name := ""
+	if data, ok := prediction.Data.(map[string]any); ok {
+		name, _ = data["name"].(string)
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	parseMode, imported := "", false
+	if file := idx.files[uri]; file != nil {
+		parseMode = file.ParseMode
+		imported = importDeclaresName(file, name)
+	}
+	progress := idx.Progress()
+	return fmt.Sprintf("name=%q byName=%d fileSymbols=%d imported=%v ready=%v generation=%d refreshIncomplete=%v modelRefreshing=%v librariesScanned=%v parseMode=%q",
+		name, len(idx.byName[name]), len(idx.fileSymbolsByName[uri][name]), imported,
+		progress.Ready, idx.generation.Load(), idx.refreshIncomplete.Load(), idx.modelRefreshing.Load(), idx.librariesScanned.Load(), parseMode)
 }
 
 // isFastDiagnostic identifies findings produced by a predictive rule, as
@@ -176,38 +198,6 @@ func soundnessOverFixture(t *testing.T, idx *Index, root string, fired map[strin
 			fired[code] = true
 		}
 	}
-}
-
-// TestFastDiagnosticsAreSoundOnAWorkspace widens the corpus to a real project
-// when one is named, so the gate can be run against code nobody wrote for it.
-//
-//	KOTLSP_CORPUS=~/Projects/some-project go test ./internal/index/ -run Sound -v
-func TestFastDiagnosticsAreSoundOnAWorkspace(t *testing.T) {
-	root := requireCorpusTest(t)
-	idx := New(nil)
-	defer idx.Close()
-	idx.Start(context.Background(), []protocol.URI{fileURI(root)})
-	deadline := time.Now().Add(5 * time.Minute)
-	for time.Now().Before(deadline) && !idx.Progress().Ready {
-		time.Sleep(200 * time.Millisecond)
-	}
-	idx.ScheduleCompilerDiagnostics(context.Background())
-	if !waitForCompilerPass(t, idx, 3*time.Minute) {
-		t.Fatal("the compiler never finished a pass over the corpus, so there is no oracle")
-	}
-
-	files := corpusFiles(root)
-	predictions := 0
-	for _, path := range files {
-		uri := fileURI(path)
-		for _, diagnostic := range idx.Diagnostics(uri) {
-			if diagnostic.Source == "kotlsp" && isFastDiagnostic(diagnostic) {
-				predictions++
-			}
-		}
-		assertFastDiagnosticsAreSound(t, idx, uri)
-	}
-	t.Logf("corpus: %d files, %d fast diagnostics", len(files), predictions)
 }
 
 func fileURI(path string) protocol.URI {

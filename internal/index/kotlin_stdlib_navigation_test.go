@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,17 +12,13 @@ import (
 
 func TestDefinitionResolvesApplyFromKotlinBinaryMetadata(t *testing.T) {
 	ctx := context.Background()
-	stdlib := ""
-	for _, candidate := range defaultKotlinLibraries(ctx) {
-		base := strings.ToLower(filepath.Base(candidate))
-		if strings.HasPrefix(base, "kotlin-stdlib-") && !strings.Contains(base, "-sources") && !strings.Contains(base, "-jdk") && !strings.Contains(base, "-all") {
-			stdlib = candidate
-			break
-		}
+	// `apply` lives in StandardKt__StandardKt; the class is copied from
+	// kotlin-stdlib 2.4.10 into testdata.
+	class, err := os.ReadFile(filepath.Join("testdata", "kotlin-stdlib", "2.4.10", "kotlin", "StandardKt__StandardKt.class"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if stdlib == "" {
-		t.Skip("Kotlin standard library is unavailable")
-	}
+	stdlib := writeTestArchive(t, "kotlin-stdlib-2.4.10.jar", map[string]string{"kotlin/StandardKt__StandardKt.class": string(class)})
 
 	idx := New(nil)
 	defer idx.Close()

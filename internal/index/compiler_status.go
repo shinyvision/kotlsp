@@ -28,11 +28,28 @@ type CompilerPassStatus struct {
 	// Hosted reports whether the last pass reused the warm compiler process or
 	// fell back to starting one.
 	Hosted bool
+	// Run identifies the validation run this pass belongs to, so a pass that
+	// was replaced by a newer one can be told apart from one that failed.
+	Run uint64
 }
 
 type compilerStatusTracker struct {
 	mu       sync.RWMutex
 	byLangue map[string]*CompilerPassStatus
+	// dispatched identifies the newest run the scheduler has started. A pass
+	// whose context was cancelled while an older run than this one was in
+	// flight was replaced, not abandoned: every keystroke supersedes the pass
+	// before it, and calling that a cancellation made status readers -- the
+	// editor's status view and the latency gate among them -- report ordinary
+	// editing as a broken compiler.
+	dispatched uint64
+}
+
+// dispatch records the newest run the scheduler has started.
+func (t *compilerStatusTracker) dispatch(run uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.dispatched = run
 }
 
 func (t *compilerStatusTracker) begin(language string) time.Time {
@@ -49,6 +66,10 @@ func (t *compilerStatusTracker) begin(language string) time.Time {
 	status.Running = true
 	status.Published = false
 	status.PublicationOutcome = "running; no compiler transaction has been published"
+	// The scheduler records the run it dispatched before either language pass
+	// starts, so a pass can say which run it belongs to without every scan
+	// having to carry the identity through its signature.
+	status.Run = t.dispatched
 	return time.Now()
 }
 
@@ -73,6 +94,10 @@ func (t *compilerStatusTracker) finish(language string, started time.Time, hoste
 	status.LastDuration = time.Since(started)
 	status.LastFinished = time.Now()
 	status.Hosted = hosted
+	if outcome == "cancelled" && t.dispatched > status.Run {
+		// A newer run replaced this pass while it was in flight.
+		outcome, failure = "superseded", "a newer validation run replaced this pass"
+	}
 	status.LastOutcome = boundedStatusText(outcome, 256)
 	status.LastError = boundedStatusText(failure, 4096)
 	status.Compiler = boundedStatusText(compiler, 1024)

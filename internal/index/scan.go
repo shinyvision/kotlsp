@@ -19,6 +19,8 @@ import (
 )
 
 func (i *Index) Start(ctx context.Context, roots []protocol.URI) {
+	guard := i.lockGuard()
+	defer guard.release()
 	i.lifecycleMu.Lock()
 	defer i.lifecycleMu.Unlock()
 	if i.closed.Load() {
@@ -40,12 +42,12 @@ func (i *Index) Start(ctx context.Context, roots []protocol.URI) {
 			paths = append(paths, p)
 		}
 	}
-	i.mu.Lock()
+	guard.Lock()
 	for uri := range i.docs {
 		i.fileGeneration[uri] = generation
 	}
 	i.roots = paths
-	i.mu.Unlock()
+	guard.Unlock()
 	// Completion belongs to a scan generation. Retaining the previous
 	// generation's flag while its replacement is still being assembled would
 	// let fast unresolved diagnostics mistake a partial model for a complete
@@ -62,12 +64,15 @@ func (i *Index) Start(ctx context.Context, roots []protocol.URI) {
 	i.progress.Store(&Progress{})
 	i.scanWG.Add(1)
 	go func() {
+		defer i.recoverBackground("Start")
 		defer i.scanWG.Done()
 		i.scan(scanCtx, paths, generation)
 	}()
 }
 
 func (i *Index) scan(ctx context.Context, roots []string, generation uint64) {
+	guard := i.lockGuard()
+	defer guard.release()
 	const maxWorkspaceEntries = 2000000
 	const maxWorkspaceSources = 100000
 	const maxWorkspaceSourceBytes int64 = 1 << 30
@@ -226,6 +231,7 @@ func (i *Index) scan(ctx context.Context, roots []string, generation uint64) {
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
+			defer i.recoverBackground("scan")
 			defer wg.Done()
 			for path := range jobs {
 				if i.generation.Load() != generation {
@@ -299,16 +305,16 @@ func (i *Index) scan(ctx context.Context, roots []string, generation uint64) {
 	// prevents a subsequently failing scan from exposing a durable mix of two
 	// source inventories.
 	i.workspaceCommitMu.Lock()
-	i.mu.Lock()
+	guard.Lock()
 	if i.closed.Load() || i.generation.Load() != generation || ctx.Err() != nil {
-		i.mu.Unlock()
+		guard.Unlock()
 		i.workspaceCommitMu.Unlock()
 		return
 	}
 	i.modules = append([]ModuleInfo(nil), modules...)
 	i.libraryAccess = stagedLibraryAccess
 	i.semanticEnvironmentVersion++
-	i.mu.Unlock()
+	guard.Unlock()
 	const publicationChunkWork = maxPublishedFileOccurrences
 	for start := 0; start < len(results); {
 		end, work := start, 0
@@ -320,9 +326,9 @@ func (i *Index) scan(ctx context.Context, roots []string, generation uint64) {
 			work += weight
 			end++
 		}
-		i.mu.Lock()
+		guard.Lock()
 		if i.closed.Load() {
-			i.mu.Unlock()
+			guard.Unlock()
 			i.workspaceCommitMu.Unlock()
 			return
 		}
@@ -335,26 +341,26 @@ func (i *Index) scan(ctx context.Context, roots []string, generation uint64) {
 			i.replaceLocked(result.parsed)
 			i.fileGeneration[result.uri] = generation
 		}
-		i.mu.Unlock()
+		guard.Unlock()
 		runtime.Gosched()
 		start = end
 	}
 	// Pruning is part of the same logical source-generation commit. It is not
 	// deferred until libraries finish, because a superseding scan may fail
 	// before reaching publication and must still leave this generation whole.
-	i.mu.RLock()
+	guard.RLock()
 	var staleSources []protocol.URI
 	for uri := range i.files {
 		if i.docs[uri] == nil && i.librarySources[uri].Archive == "" && i.fileGeneration[uri] != generation {
 			staleSources = append(staleSources, uri)
 		}
 	}
-	i.mu.RUnlock()
+	guard.RUnlock()
 	for start := 0; start < len(staleSources); start += 32 {
 		end := min(start+32, len(staleSources))
-		i.mu.Lock()
+		guard.Lock()
 		if i.closed.Load() {
-			i.mu.Unlock()
+			guard.Unlock()
 			i.workspaceCommitMu.Unlock()
 			return
 		}
@@ -363,7 +369,7 @@ func (i *Index) scan(ctx context.Context, roots []string, generation uint64) {
 				i.removeLocked(uri)
 			}
 		}
-		i.mu.Unlock()
+		guard.Unlock()
 		runtime.Gosched()
 	}
 	i.workspaceCommitMu.Unlock()
@@ -423,20 +429,22 @@ func readWorkspaceSource(path string) ([]byte, error) {
 }
 
 func (i *Index) pruneOlderGeneration(generation uint64) {
+	guard := i.lockGuard()
+	defer guard.release()
 	const chunkSize = 32
-	i.mu.RLock()
+	guard.RLock()
 	var stale []protocol.URI
 	for uri := range i.files {
 		if i.docs[uri] == nil && i.fileGeneration[uri] != generation {
 			stale = append(stale, uri)
 		}
 	}
-	i.mu.RUnlock()
+	guard.RUnlock()
 	for start := 0; start < len(stale); start += chunkSize {
 		end := min(start+chunkSize, len(stale))
-		i.mu.Lock()
+		guard.Lock()
 		if i.closed.Load() || i.generation.Load() != generation {
-			i.mu.Unlock()
+			guard.Unlock()
 			return
 		}
 		for _, uri := range stale[start:end] {
@@ -444,7 +452,7 @@ func (i *Index) pruneOlderGeneration(generation uint64) {
 				i.removeLocked(uri)
 			}
 		}
-		i.mu.Unlock()
+		guard.Unlock()
 		runtime.Gosched()
 	}
 }

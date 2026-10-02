@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"unicode"
@@ -44,7 +45,7 @@ type springDataPropertySegment struct {
 	valid      bool
 }
 
-func (i *Index) springDataDiagnosticsLocked(file *analysis.ParsedFile) []protocol.Diagnostic {
+func (i *Index) springDataDiagnosticsLocked(ctx context.Context, file *analysis.ParsedFile) []protocol.Diagnostic {
 	document := i.documentLocked(file.URI)
 	if document == nil {
 		return nil
@@ -55,7 +56,7 @@ func (i *Index) springDataDiagnosticsLocked(file *analysis.ParsedFile) []protoco
 		if !analysis.IsCallableKind(method.Kind) || method.ContainerID == "" {
 			continue
 		}
-		segments, derived := i.springDataMethodSegmentsLocked(file, method)
+		segments, derived := i.springDataMethodSegmentsLocked(ctx, file, method)
 		if !derived {
 			continue
 		}
@@ -74,13 +75,13 @@ func (i *Index) springDataDiagnosticsLocked(file *analysis.ParsedFile) []protoco
 	return result
 }
 
-func (i *Index) springDataDefinitionLocked(file *analysis.ParsedFile, offset int) ([]analysis.Symbol, bool) {
+func (i *Index) springDataDefinitionLocked(ctx context.Context, file *analysis.ParsedFile, offset int) ([]analysis.Symbol, bool) {
 	for index := range file.Symbols {
 		method := &file.Symbols[index]
 		if !analysis.IsCallableKind(method.Kind) || method.ContainerID == "" || offset < method.NameStartByte || offset > method.NameEndByte {
 			continue
 		}
-		segments, derived := i.springDataMethodSegmentsLocked(file, *method)
+		segments, derived := i.springDataMethodSegmentsLocked(ctx, file, *method)
 		if !derived {
 			continue
 		}
@@ -100,7 +101,7 @@ func (i *Index) springDataDefinitionLocked(file *analysis.ParsedFile, offset int
 	return nil, false
 }
 
-func (i *Index) springDataMethodSegmentsLocked(file *analysis.ParsedFile, method analysis.Symbol) ([]springDataPropertySegment, bool) {
+func (i *Index) springDataMethodSegmentsLocked(ctx context.Context, file *analysis.ParsedFile, method analysis.Symbol) ([]springDataPropertySegment, bool) {
 	container := i.symbols[method.ContainerID]
 	if container == nil || !analysis.IsTypeKind(container.Kind) || i.springDataMethodHasExplicitQueryLocked(file, method) {
 		return nil, false
@@ -110,7 +111,7 @@ func (i *Index) springDataMethodSegmentsLocked(file *analysis.ParsedFile, method
 	if by < 0 {
 		return nil, false
 	}
-	domainType, repository := i.springDataRepositoryDomainLocked(file, *container)
+	domainType, repository := i.springDataRepositoryDomainLocked(ctx, file, *container)
 	if !repository || domainType == "" {
 		return nil, false
 	}
@@ -127,15 +128,15 @@ func (i *Index) springDataMethodSegmentsLocked(file *analysis.ParsedFile, method
 		criteria, order = criteria[:at], criteria[at+len("OrderBy"):]
 	}
 	absolute := method.NameStartByte + predicateStart
-	result := i.springDataCriteriaSegmentsLocked(file, domainType, criteria, absolute, method.NameStartByte)
+	result := i.springDataCriteriaSegmentsLocked(ctx, file, domainType, criteria, absolute, method.NameStartByte)
 	if order != "" {
 		orderAbsolute := absolute + len(criteria) + len("OrderBy")
-		result = append(result, i.springDataOrderSegmentsLocked(file, domainType, order, orderAbsolute, method.NameStartByte)...)
+		result = append(result, i.springDataOrderSegmentsLocked(ctx, file, domainType, order, orderAbsolute, method.NameStartByte)...)
 	}
 	return result, true
 }
 
-func (i *Index) springDataCriteriaSegmentsLocked(file *analysis.ParsedFile, domainType, source string, absolute, at int) []springDataPropertySegment {
+func (i *Index) springDataCriteriaSegmentsLocked(ctx context.Context, file *analysis.ParsedFile, domainType, source string, absolute, at int) []springDataPropertySegment {
 	parts := springDataSplitKeywords(source, "Or", "And")
 	result := make([]springDataPropertySegment, 0, len(parts))
 	for _, part := range parts {
@@ -149,12 +150,12 @@ func (i *Index) springDataCriteriaSegmentsLocked(file *analysis.ParsedFile, doma
 		if property == "" {
 			continue
 		}
-		result = append(result, i.resolveSpringDataPropertyPathLocked(file, domainType, property, absolute+part.start, at)...)
+		result = append(result, i.resolveSpringDataPropertyPathLocked(ctx, file, domainType, property, absolute+part.start, at)...)
 	}
 	return result
 }
 
-func (i *Index) springDataOrderSegmentsLocked(file *analysis.ParsedFile, domainType, source string, absolute, at int) []springDataPropertySegment {
+func (i *Index) springDataOrderSegmentsLocked(ctx context.Context, file *analysis.ParsedFile, domainType, source string, absolute, at int) []springDataPropertySegment {
 	var result []springDataPropertySegment
 	for cursor := 0; cursor < len(source); {
 		direction := -1
@@ -178,7 +179,7 @@ func (i *Index) springDataOrderSegmentsLocked(file *analysis.ParsedFile, domainT
 			end = direction
 		}
 		if end > cursor {
-			result = append(result, i.resolveSpringDataPropertyPathLocked(file, domainType, source[cursor:end], absolute+cursor, at)...)
+			result = append(result, i.resolveSpringDataPropertyPathLocked(ctx, file, domainType, source[cursor:end], absolute+cursor, at)...)
 		}
 		if direction < 0 {
 			break
@@ -270,12 +271,12 @@ func springDataTrailingKeyword(source string, values ...string) string {
 	return ""
 }
 
-func (i *Index) springDataRepositoryDomainLocked(file *analysis.ParsedFile, repository analysis.Symbol) (string, bool) {
+func (i *Index) springDataRepositoryDomainLocked(ctx context.Context, file *analysis.ParsedFile, repository analysis.Symbol) (string, bool) {
 	start := repository.FQN
 	if start == "" {
 		start = repository.Name
 	}
-	for _, instantiated := range i.instantiatedTypeHierarchyLocked(file, start) {
+	for _, instantiated := range i.instantiatedTypeHierarchyLocked(ctx, file, start) {
 		name := instantiated.symbol.FQN
 		if name == "" {
 			name = instantiated.symbol.Name
@@ -305,7 +306,7 @@ func springDataRepositoryType(name string) bool {
 	}
 }
 
-func (i *Index) resolveSpringDataPropertyPathLocked(file *analysis.ParsedFile, ownerType, source string, absolute, at int) []springDataPropertySegment {
+func (i *Index) resolveSpringDataPropertyPathLocked(ctx context.Context, file *analysis.ParsedFile, ownerType, source string, absolute, at int) []springDataPropertySegment {
 	if source == "" {
 		return nil
 	}
@@ -315,14 +316,14 @@ func (i *Index) resolveSpringDataPropertyPathLocked(file *analysis.ParsedFile, o
 			continue
 		}
 		head := source[:cursor]
-		resolved, nextType := i.springDataPropertyLocked(file, ownerType, head, at)
+		resolved, nextType := i.springDataPropertyLocked(ctx, file, ownerType, head, at)
 		segment := springDataPropertySegment{start: absolute, end: absolute + len(head), symbol: resolved, valid: resolved.ID != ""}
 		if !segment.valid {
 			return []springDataPropertySegment{segment}
 		}
-		return append([]springDataPropertySegment{segment}, i.resolveSpringDataPropertyPathLocked(file, nextType, source[cursor+1:], absolute+cursor+1, at)...)
+		return append([]springDataPropertySegment{segment}, i.resolveSpringDataPropertyPathLocked(ctx, file, nextType, source[cursor+1:], absolute+cursor+1, at)...)
 	}
-	if resolved, _ := i.springDataPropertyLocked(file, ownerType, source, at); resolved.ID != "" {
+	if resolved, _ := i.springDataPropertyLocked(ctx, file, ownerType, source, at); resolved.ID != "" {
 		return []springDataPropertySegment{{start: absolute, end: absolute + len(source), symbol: resolved, valid: true}}
 	}
 	// PropertyPath tries camel-case heads from right to left so addressZip wins
@@ -331,11 +332,11 @@ func (i *Index) resolveSpringDataPropertyPathLocked(file *analysis.ParsedFile, o
 	for boundaryIndex := len(boundaries) - 1; boundaryIndex >= 0; boundaryIndex-- {
 		boundary := boundaries[boundaryIndex]
 		head, tail := source[:boundary], source[boundary:]
-		resolved, nextType := i.springDataPropertyLocked(file, ownerType, head, at)
+		resolved, nextType := i.springDataPropertyLocked(ctx, file, ownerType, head, at)
 		if resolved.ID == "" {
 			continue
 		}
-		tailSegments := i.resolveSpringDataPropertyPathLocked(file, nextType, tail, absolute+boundary, at)
+		tailSegments := i.resolveSpringDataPropertyPathLocked(ctx, file, nextType, tail, absolute+boundary, at)
 		if len(tailSegments) > 0 && tailSegments[len(tailSegments)-1].valid {
 			return append([]springDataPropertySegment{{start: absolute, end: absolute + boundary, symbol: resolved, valid: true}}, tailSegments...)
 		}
@@ -355,13 +356,13 @@ func springDataCamelBoundaries(source string) []int {
 	return result
 }
 
-func (i *Index) springDataPropertyLocked(file *analysis.ParsedFile, ownerType, encodedName string, at int) (analysis.Symbol, string) {
+func (i *Index) springDataPropertyLocked(ctx context.Context, file *analysis.ParsedFile, ownerType, encodedName string, at int) (analysis.Symbol, string) {
 	propertyName := encodedName
 	if !springDataAllUpper(encodedName) {
 		propertyName = lowerFirst(encodedName)
 	}
 	ownerType = springDataCollectionElement(ownerType)
-	for _, instantiated := range i.instantiatedTypeHierarchyLocked(file, ownerType) {
+	for _, instantiated := range i.instantiatedTypeHierarchyLocked(ctx, file, ownerType) {
 		owner, arguments := instantiated.symbol, instantiated.arguments
 		var getter *analysis.Symbol
 		for _, candidateName := range []string{propertyName, "get" + upperFirst(propertyName), "is" + upperFirst(propertyName)} {

@@ -70,6 +70,7 @@ func (s *Server) serverStatus() (any, *jsonrpc.ResponseError) {
 			"importer":         model.Importer,
 			"authoritative":    model.Authoritative,
 			"compilerSettings": model.CompilerSettings,
+			"formatters":       model.Formatters,
 		}
 		if model.Failure != "" {
 			entry["failure"] = model.Failure

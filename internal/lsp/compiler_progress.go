@@ -14,6 +14,9 @@ import (
 const (
 	compilerProgressToken = "kotlsp/validating"
 	compilerProgressPoll  = 150 * time.Millisecond
+	// compilerProgressIdlePoll is how often an idle server looks for a pass
+	// that has started; a pass is only announced after compilerProgressFloor.
+	compilerProgressIdlePoll = time.Second
 	// A pass shorter than this finishes before a reader could register it, and
 	// announcing it would only make the status line flicker.
 	compilerProgressFloor = 400 * time.Millisecond
@@ -29,8 +32,10 @@ func (s *Server) watchCompilerProgress() {
 	}
 	if !s.launchBackground(func() {
 		defer s.compilerProgressActive.Store(false)
-		ticker := time.NewTicker(compilerProgressPoll)
-		defer ticker.Stop()
+		// Polled quickly only while a pass runs: idle, the server used to wake
+		// every 150 ms for the whole session just to find nothing running.
+		timer := time.NewTimer(compilerProgressIdlePoll)
+		defer timer.Stop()
 		token := ""
 		since := time.Time{}
 		for {
@@ -38,7 +43,12 @@ func (s *Server) watchCompilerProgress() {
 			case <-s.ctx.Done():
 				s.endCompilerProgress(&token)
 				return
-			case <-ticker.C:
+			case <-timer.C:
+				if token != "" || !since.IsZero() {
+					timer.Reset(compilerProgressPoll)
+				} else {
+					timer.Reset(compilerProgressIdlePoll)
+				}
 				if s.shutdown.Load() {
 					s.endCompilerProgress(&token)
 					return

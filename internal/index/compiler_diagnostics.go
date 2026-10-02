@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -132,6 +133,8 @@ func (transaction *compilerDiagnosticTransaction) stage(language string, files [
 }
 
 func (i *Index) commitCompilerDiagnosticTransaction(transaction *compilerDiagnosticTransaction, run, generation uint64) bool {
+	guard := i.lockGuard()
+	defer guard.release()
 	if transaction == nil || !transaction.succeeded["kotlin"] || !transaction.succeeded["java"] {
 		return false
 	}
@@ -141,25 +144,44 @@ func (i *Index) commitCompilerDiagnosticTransaction(transaction *compilerDiagnos
 	// linearization point: a newly requested pass is either before it (and this
 	// transaction is rejected) or after it (and will supersede this snapshot).
 	i.compilerCancelMu.Lock()
-	defer i.compilerCancelMu.Unlock()
 	if i.compilerRun.Load() != run || i.modelRefreshing.Load() {
+		i.compilerCancelMu.Unlock()
 		return false
 	}
-	i.mu.Lock()
+	guard.Lock()
 	if i.generation.Load() != generation || i.compilerRun.Load() != run || i.modelRefreshing.Load() {
-		i.mu.Unlock()
+		guard.Unlock()
+		i.compilerCancelMu.Unlock()
 		return false
 	}
+	// A cleared file whose compiler findings were empty before and are empty
+	// after has nothing to tell the client, and recomputing its diagnostics to
+	// say so cost ~100ms per file: 5.9s for the 57 files of this workspace, of
+	// which 2 carry findings. Collect the files whose published set can
+	// actually differ, while the pre-publication state is still visible.
+	notifiable := make([]protocol.URI, 0, len(transaction.values)+1)
 	for uri := range transaction.clear {
+		_, had := i.compilerDiagnostics[uri]
+		_, gets := transaction.values[uri]
+		if had || gets {
+			notifiable = append(notifiable, uri)
+		}
 		delete(i.compilerDiagnostics, uri)
 	}
 	for uri, values := range transaction.values {
 		i.compilerDiagnostics[uri] = values
 	}
 	i.diagnosticsVersion.Add(1)
-	i.mu.Unlock()
-	if i.onParsed != nil {
-		for uri := range transaction.clear {
+	guard.Unlock()
+	// The linearization this mutex provides is the version check plus the
+	// publication, and both are complete here. Notifying under it as well
+	// recomputed every cleared file's diagnostics inside the critical section:
+	// 5.6s for 57 files on this workspace, during which every keystroke's
+	// cancelCompilerDiagnostics waited for the same mutex, so interactive
+	// editing stalled for the length of the notification.
+	i.compilerCancelMu.Unlock()
+	if i.onParsed != nil && !i.pushDisabled.Load() {
+		for _, uri := range notifiable {
 			i.onParsed(uri, i.Diagnostics(uri))
 		}
 	}
@@ -167,6 +189,8 @@ func (i *Index) commitCompilerDiagnosticTransaction(transaction *compilerDiagnos
 }
 
 func (i *Index) scanJavaCompilerDiagnostics(parent context.Context, generation uint64, transactions ...*compilerDiagnosticTransaction) {
+	guard := i.lockGuard()
+	defer guard.release()
 	started := i.compilerStatus.begin("java")
 	javacHosted := false
 	outcome, failure, compilerName := "skipped", "", ""
@@ -198,7 +222,7 @@ func (i *Index) scanJavaCompilerDiagnostics(parent context.Context, generation u
 		}
 		return
 	}
-	temporary, err := os.MkdirTemp("", "kotlsp-javac-")
+	temporary, err := compilerWorkDirectory("kotlsp-javac-")
 	if err != nil {
 		outcome, failure = "failed", err.Error()
 		return
@@ -396,9 +420,9 @@ func (i *Index) scanJavaCompilerDiagnostics(parent context.Context, generation u
 		return
 	}
 	budgetCompilerDiagnostics(diagnostics)
-	i.mu.Lock()
+	guard.Lock()
 	if i.generation.Load() != generation {
-		i.mu.Unlock()
+		guard.Unlock()
 		return
 	}
 	for _, file := range files {
@@ -411,8 +435,8 @@ func (i *Index) scanJavaCompilerDiagnostics(parent context.Context, generation u
 	}
 	i.diagnosticsVersion.Add(1)
 	outcome, failure = "succeeded", ""
-	i.mu.Unlock()
-	if i.onParsed != nil {
+	guard.Unlock()
+	if i.onParsed != nil && !i.pushDisabled.Load() {
 		for _, file := range files {
 			if strings.HasSuffix(strings.ToLower(string(file.URI)), ".java") {
 				i.onParsed(file.URI, i.Diagnostics(file.URI))
@@ -438,6 +462,8 @@ type kotlinCompiler struct {
 // Gradle cache. It is optional and entirely background; the in-memory
 // diagnostic providers remain available when neither compiler is installed.
 func (i *Index) scanKotlinCompilerDiagnostics(parent context.Context, generation uint64, transactions ...*compilerDiagnosticTransaction) {
+	guard := i.lockGuard()
+	defer guard.release()
 	started := i.compilerStatus.begin("kotlin")
 	hosted := false
 	outcome, failure, compilerName, compilerVersion := "skipped", "", "", ""
@@ -474,7 +500,7 @@ func (i *Index) scanKotlinCompilerDiagnostics(parent context.Context, generation
 		return
 	}
 	compilerName, compilerVersion = compiler.executable, compiler.version
-	temporary, err := os.MkdirTemp("", "kotlsp-kotlinc-")
+	temporary, err := compilerWorkDirectory("kotlsp-kotlinc-")
 	if err != nil {
 		outcome, failure = "failed", err.Error()
 		return
@@ -652,9 +678,9 @@ func (i *Index) scanKotlinCompilerDiagnostics(parent context.Context, generation
 		return
 	}
 	budgetCompilerDiagnostics(diagnostics)
-	i.mu.Lock()
+	guard.Lock()
 	if i.generation.Load() != generation {
-		i.mu.Unlock()
+		guard.Unlock()
 		return
 	}
 	for _, file := range files {
@@ -668,8 +694,8 @@ func (i *Index) scanKotlinCompilerDiagnostics(parent context.Context, generation
 	}
 	i.diagnosticsVersion.Add(1)
 	outcome, failure = "succeeded", ""
-	i.mu.Unlock()
-	if i.onParsed != nil {
+	guard.Unlock()
+	if i.onParsed != nil && !i.pushDisabled.Load() {
 		for _, file := range files {
 			lower := strings.ToLower(string(file.URI))
 			if strings.HasSuffix(lower, ".kt") || strings.HasSuffix(lower, ".kts") {
@@ -724,13 +750,15 @@ func (i *Index) compilerUnits(files []*analysis.ParsedFile) []compilerUnit {
 }
 
 func (i *Index) compilerUnitsContext(ctx context.Context, files []*analysis.ParsedFile) ([]compilerUnit, error) {
+	guard := i.lockGuard()
+	defer guard.release()
 	const maxCompilerUnits = 2048
 	type unitIdentity struct {
 		moduleDir string
 		module    *ModuleInfo
 		sourceSet string
 	}
-	i.mu.RLock()
+	guard.RLock()
 	moduleSnapshot := make([]ModuleInfo, len(i.modules))
 	for moduleIndex, module := range i.modules {
 		moduleSnapshot[moduleIndex] = cloneModuleInfo(module)
@@ -738,7 +766,7 @@ func (i *Index) compilerUnitsContext(ctx context.Context, files []*analysis.Pars
 	fallbackClasspath := append([]string(nil), i.classpath...)
 	defaultJavaHome := i.defaultJavaHome
 	environmentVersion := i.semanticEnvironmentVersion
-	i.mu.RUnlock()
+	guard.RUnlock()
 	identities := make(map[string]*unitIdentity)
 	primaryByKey := make(map[string][]*analysis.ParsedFile)
 	for fileIndex, file := range files {
@@ -753,6 +781,11 @@ func (i *Index) compilerUnitsContext(ctx context.Context, files []*analysis.Pars
 		// has exactly one compilation unit: every source and the fallback
 		// classpath. Ownership can only be missing or ambiguous once modules
 		// exist to claim files.
+		// A build script is no source of the module: it compiles against the
+		// Gradle script template, which the compiler pass does not model.
+		if path, ok := uriutil.Path(file.URI); ok && isGradleScriptPath(path) {
+			continue
+		}
 		var module *ModuleInfo
 		set, key := "main", "<workspace>\x00main"
 		if len(moduleSnapshot) > 0 {
@@ -801,10 +834,10 @@ func (i *Index) compilerUnitsContext(ctx context.Context, files []*analysis.Pars
 	for _, key := range keys {
 		identity := identities[key]
 		if identity.module != nil {
-			var complete bool
-			accessByKey[key], complete = moduleAccessSet(identity.module, identity.sourceSet, modulesByName)
-			if !complete {
-				return nil, fmt.Errorf("compiler dependency closure for %s exceeds its 100000-state safety limit", key)
+			var incomplete string
+			accessByKey[key], incomplete = moduleAccessSetExplained(identity.module, identity.sourceSet, modulesByName)
+			if incomplete != "" {
+				return nil, fmt.Errorf("compiler dependency closure for %s/%s is unprovable: %s", identity.module.Name, identity.sourceSet, incomplete)
 			}
 		}
 	}
@@ -904,9 +937,9 @@ func (i *Index) compilerUnitsContext(ctx context.Context, files []*analysis.Pars
 		}
 		units[unitIndex].Hash = binary.LittleEndian.Uint64(contentHash.Sum(nil)[:8])
 	}
-	i.mu.RLock()
+	guard.RLock()
 	modelCurrent := i.semanticEnvironmentVersion == environmentVersion
-	i.mu.RUnlock()
+	guard.RUnlock()
 	if !modelCurrent {
 		return nil, fmt.Errorf("compiler model changed while its unit snapshot was being assembled")
 	}
@@ -935,24 +968,12 @@ func writeDigestUint64(destination interface{ Write([]byte) (int, error) }, valu
 }
 
 func (i *Index) cachedArchiveDigest(path string) ([sha256.Size]byte, bool) {
-	i.mu.RLock()
+	guard := i.lockGuard()
+	defer guard.release()
+	guard.RLock()
 	digest, ok := i.archiveDigests[filepath.Clean(path)]
-	i.mu.RUnlock()
+	guard.RUnlock()
 	return digest, ok
-}
-
-func (i *Index) sourceSetForCompilerURI(uri protocol.URI, module ModuleInfo) string {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	for sourceSet, roots := range module.SourceSets {
-		for _, root := range roots {
-			path, ok := uriutil.Path(uri)
-			if ok && pathWithin(path, root) {
-				return sourceSet
-			}
-		}
-	}
-	return "main"
 }
 
 type compilerCacheEntry struct {
@@ -1168,7 +1189,7 @@ func (i *Index) compilerClassesDirectory(language string, unit compilerUnit) (st
 	i.compilerCacheMu.Lock()
 	defer i.compilerCacheMu.Unlock()
 	if i.compilerCacheRoot == "" {
-		root, err := os.MkdirTemp("", "kotlsp-compiler-cache-")
+		root, err := compilerWorkDirectory("kotlsp-compiler-cache-")
 		if err != nil {
 			return "", err
 		}
@@ -1409,7 +1430,7 @@ func (i *Index) compilerAffectedClosure(changed map[protocol.URI]bool, files map
 			if isLexicalSymbol(symbol) || symbol.Synthetic {
 				continue
 			}
-			for _, reference := range i.refsByTarget[symbol.ID] {
+			for _, reference := range i.refsByTarget.get(symbol.ID) {
 				edges++
 				if edges > maxCompilerDependencyEdges {
 					return nil, false
@@ -1418,7 +1439,7 @@ func (i *Index) compilerAffectedClosure(changed map[protocol.URI]bool, files map
 			}
 			// A reference can still be unresolved while its declaring file is
 			// changing. Including name matches is intentionally conservative.
-			for _, reference := range i.unresolvedRefsByName[symbol.Name] {
+			for _, reference := range i.unresolvedRefsByName.get(symbol.Name) {
 				edges++
 				if edges > maxCompilerDependencyEdges {
 					return nil, false
@@ -1496,6 +1517,97 @@ func javacExecutableInHome(home string) string {
 	return ""
 }
 
+// detectedJavaHome resolves the JDK this machine would run, for clients that
+// configure none. JAVA_HOME wins when it really contains a launcher; otherwise
+// the `java` on PATH is resolved through symlinks to its home.
+func detectedJavaHome() string {
+	if home := os.Getenv("JAVA_HOME"); home != "" && javaExecutableInConfiguredHome(home) != "" {
+		return filepath.Clean(home)
+	}
+	executable, err := exec.LookPath("java")
+	if err != nil {
+		return ""
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(executable); resolveErr == nil {
+		executable = resolved
+	}
+	home := filepath.Dir(filepath.Dir(executable))
+	if javaExecutableInConfiguredHome(home) == "" {
+		return ""
+	}
+	return filepath.Clean(home)
+}
+
+// compilerWorkDirectory places compiler scratch space on disk rather than in
+// the system temporary directory. On Linux /tmp is commonly a tmpfs, so class
+// output written there is written into RAM, and a full tmpfs makes a compiler
+// pass fail while it still reports success.
+func compilerWorkDirectory(prefix string) (string, error) {
+	cacheRoot, err := os.UserCacheDir()
+	if err != nil {
+		return os.MkdirTemp("", prefix)
+	}
+	root := filepath.Join(cacheRoot, "kotlsp", "compiler-work")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return os.MkdirTemp("", prefix)
+	}
+	sweepStaleCompilerWork(root)
+	// The owner's process id is part of the name, so a directory whose
+	// process is gone can be removed at once (see sweepStaleCompilerWork).
+	return os.MkdirTemp(root, prefix+strconv.Itoa(os.Getpid())+"-")
+}
+
+var compilerWorkSweep atomic.Int64
+
+// sweepStaleCompilerWork removes work directories an exited process left
+// behind. An editor that kills the server right after `exit` -- or a crash --
+// skips the cleanup; 3600 such directories (286 MB) had piled up. A directory
+// named for a process that no longer runs is removed at once; one from before
+// directories carried their owner's id once it is a day old.
+func sweepStaleCompilerWork(root string) {
+	now := time.Now()
+	if last := compilerWorkSweep.Load(); last != 0 && now.Sub(time.Unix(0, last)) < 10*time.Minute {
+		return
+	}
+	compilerWorkSweep.Store(now.UnixNano())
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	cutoff := now.Add(-24 * time.Hour)
+	for _, entry := range entries {
+		if pid, ok := compilerWorkOwner(entry.Name()); ok {
+			if pid != os.Getpid() && !processAlive(pid) {
+				_ = os.RemoveAll(filepath.Join(root, entry.Name()))
+			}
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(root, entry.Name()))
+	}
+}
+
+// compilerWorkOwner reads the process id from a work directory name,
+// `kotlsp-kotlinc-<pid>-<random>`.
+func compilerWorkOwner(name string) (int, bool) {
+	for _, prefix := range []string{"kotlsp-compiler-cache-", "kotlsp-kotlinc-", "kotlsp-javac-"} {
+		rest, ok := strings.CutPrefix(name, prefix)
+		if !ok {
+			continue
+		}
+		pidText, _, found := strings.Cut(rest, "-")
+		if !found {
+			return 0, false
+		}
+		pid, err := strconv.Atoi(pidText)
+		return pid, err == nil && pid > 0
+	}
+	return 0, false
+}
+
 func javaExecutableInConfiguredHome(home string) string {
 	if home == "" {
 		return ""
@@ -1507,10 +1619,6 @@ func javaExecutableInConfiguredHome(home string) string {
 		}
 	}
 	return ""
-}
-
-func (i *Index) kotlinCompiler() (kotlinCompiler, bool) {
-	return i.kotlinCompilerContext(context.Background())
 }
 
 func (i *Index) kotlinCompilerContext(ctx context.Context) (kotlinCompiler, bool) {
@@ -1550,16 +1658,6 @@ func isJavaOrKotlinSource(path string) bool {
 	return strings.HasSuffix(lower, ".java") || strings.HasSuffix(lower, ".kt") || strings.HasSuffix(lower, ".kts")
 }
 
-func hasKotlinSource(paths []string) bool {
-	for _, path := range paths {
-		lower := strings.ToLower(path)
-		if strings.HasSuffix(lower, ".kt") || strings.HasSuffix(lower, ".kts") {
-			return true
-		}
-	}
-	return false
-}
-
 // kotlinCompilerArguments builds the compiler's own arguments, shared by the
 // one-shot command line and the persistent host.
 func kotlinCompilerArguments(compiler kotlinCompiler, destination, argumentFile string, classpath []string) []string {
@@ -1574,7 +1672,11 @@ func kotlinCompilerArgumentsWithSettings(compiler kotlinCompiler, destination, a
 	// Joint compilation is required for cyclic Java/Kotlin source dependencies:
 	// Java sources serve as symbols for K2 and are compiled by javac in the same
 	// invocation, making both language outputs available to the follow-up lint.
-	arguments = append(arguments, "-Xcompile-java", "-Xrender-internal-diagnostic-names")
+	// Kotlin 2.4 removed -Xcompile-java (it warns and ignores it).
+	if kotlinVersionBefore(compiler.version, 2, 4) {
+		arguments = append(arguments, "-Xcompile-java")
+	}
+	arguments = append(arguments, "-Xrender-internal-diagnostic-names")
 	arguments = append(arguments, normalizedKotlinCompilerArguments(settings)...)
 	arguments = append(arguments, "-d", destination)
 	if len(classpath) > 0 {
@@ -1608,6 +1710,28 @@ func javaProcessorConfigured(arguments []string) bool {
 	return false
 }
 
+// kotlinJVMTargetValue renders a build model's JVM target the way the compiler
+// spells it. Gradle reports the enum constant (`JVM_21`, `JVM_1_8`), which
+// kotlinc rejects with "Unknown JVM target version" -- and that error carries
+// no source location, which fails the entire pass, so one wrong spelling
+// silences every compiler diagnostic in the project. Anything that is not a
+// version is dropped rather than passed on, for the same reason.
+func kotlinJVMTargetValue(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if upper := strings.ToUpper(trimmed); strings.HasPrefix(upper, "JVM_") {
+		trimmed = strings.ReplaceAll(trimmed[len("JVM_"):], "_", ".")
+	}
+	for _, value := range trimmed {
+		if (value < '0' || value > '9') && value != '.' {
+			return ""
+		}
+	}
+	return trimmed
+}
+
 func normalizedKotlinCompilerArguments(settings CompilerSettings) []string {
 	arguments := make([]string, 0, len(settings.KotlinArguments)+6)
 	if settings.KotlinLanguageVersion != "" {
@@ -1616,8 +1740,8 @@ func normalizedKotlinCompilerArguments(settings CompilerSettings) []string {
 	if settings.KotlinAPIVersion != "" {
 		arguments = append(arguments, "-api-version", settings.KotlinAPIVersion)
 	}
-	if settings.KotlinJVMTarget != "" {
-		arguments = append(arguments, "-jvm-target", settings.KotlinJVMTarget)
+	if target := kotlinJVMTargetValue(settings.KotlinJVMTarget); target != "" {
+		arguments = append(arguments, "-jvm-target", target)
 	}
 	return append(arguments, normalizeCompilerArguments(settings.KotlinArguments, false)...)
 }
@@ -1691,12 +1815,6 @@ func (i *Index) runKotlinCompilerHosted(ctx context.Context, compiler kotlinComp
 	return runKotlinCompiler(ctx, compiler, paths, destination, classpath)
 }
 
-// runKotlinCompilerHostedTracked reports whether the warm host answered, so the
-// status surface can say whether validation is running hot or cold.
-func (i *Index) runKotlinCompilerHostedTracked(ctx context.Context, compiler kotlinCompiler, paths []string, destination string, classpath []string) ([]byte, bool, error) {
-	return i.runKotlinCompilerHostedTrackedWithSettings(ctx, compiler, paths, destination, classpath, CompilerSettings{})
-}
-
 func (i *Index) runKotlinCompilerHostedTrackedWithSettings(ctx context.Context, compiler kotlinCompiler, paths []string, destination string, classpath []string, settings CompilerSettings) ([]byte, bool, error) {
 	if err := os.MkdirAll(destination, 0o700); err == nil {
 		if argumentFile, argErr := writeCompilerArgumentFile(destination, paths); argErr == nil {
@@ -1705,10 +1823,22 @@ func (i *Index) runKotlinCompilerHostedTrackedWithSettings(ctx context.Context, 
 				return output, true, nil
 			} else if ctx.Err() != nil {
 				return nil, false, hostErr
+			} else {
+				i.logPrintf("kotlin compiler host unavailable for %s %s (embedded=%v), falling back to a one-shot compiler: %v", compiler.executable, compiler.version, compiler.embedded, hostErr)
+				i.recordHealth("compiler-kotlin-host", compiler.executable, hostErr.Error())
 			}
+		} else {
+			i.logPrintf("kotlin compiler argument file: %v", argErr)
 		}
 	}
 	output, err := runKotlinCompilerWithSettings(ctx, compiler, paths, destination, classpath, settings)
+	if err != nil && ctx.Err() == nil && !compilerCommandCompleted(ctx, err) {
+		head := string(output)
+		if len(head) > 2000 {
+			head = head[:2000]
+		}
+		i.logPrintf("one-shot kotlin compiler failed: %v\n%s", err, head)
+	}
 	return output, false, err
 }
 
@@ -1850,19 +1980,21 @@ func budgetCompilerDiagnostics(values map[protocol.URI][]protocol.Diagnostic) {
 // source paths, and the original base name is retained for Java's public-type
 // filename rule.
 func (i *Index) compilerSourcePaths(ctx context.Context, files []*analysis.ParsedFile, temporary string, include func(string) bool) ([]string, map[string]protocol.URI, error) {
+	guard := i.lockGuard()
+	defer guard.release()
 	const maxStagedCompilerBytes = 512 << 20
-	i.mu.RLock()
+	guard.RLock()
 	snapshots := make(map[protocol.URI]string, min(len(files), 100_000))
 	for fileIndex, file := range files {
 		if fileIndex&255 == 0 && ctx.Err() != nil {
-			i.mu.RUnlock()
+			guard.RUnlock()
 			return nil, nil, ctx.Err()
 		}
 		if file == nil {
 			continue
 		}
 		if len(snapshots) >= 100_000 {
-			i.mu.RUnlock()
+			guard.RUnlock()
 			return nil, nil, fmt.Errorf("compiler source snapshot exceeds its 100000-file safety limit")
 		}
 		if doc := i.docs[file.URI]; doc != nil {
@@ -1871,7 +2003,7 @@ func (i *Index) compilerSourcePaths(ctx context.Context, files []*analysis.Parse
 			snapshots[file.URI] = doc.Text
 		}
 	}
-	i.mu.RUnlock()
+	guard.RUnlock()
 	paths := make([]string, 0, len(files))
 	staged := make(map[string]protocol.URI)
 	stagedBytes := 0
@@ -2009,10 +2141,6 @@ func findKotlinCompilerContext(ctx context.Context) (kotlinCompiler, bool) {
 	return embeddedKotlinCompiler("")
 }
 
-func findKotlinCompilerVersion(version string) (kotlinCompiler, bool) {
-	return findKotlinCompilerVersionContext(context.Background(), version)
-}
-
 func findKotlinCompilerVersionContext(ctx context.Context, version string) (kotlinCompiler, bool) {
 	if ctx != nil && ctx.Err() != nil {
 		return kotlinCompiler{}, false
@@ -2091,10 +2219,6 @@ type compilerVersionCacheEntry struct {
 	version  string
 	size     int64
 	modified int64
-}
-
-func externalKotlinCompilerVersion(executable string) string {
-	return externalKotlinCompilerVersionContext(context.Background(), executable)
 }
 
 func externalKotlinCompilerVersionContext(parent context.Context, executable string) string {
@@ -2218,7 +2342,16 @@ func (i *Index) scheduleCompilerDiagnosticsNow(parent context.Context) {
 	if disableCompilerPasses || i.closed.Load() {
 		return
 	}
-	lifetimeCtx, finish, started := i.beginBackground(parent)
+	if parent == nil {
+		parent = context.Background()
+	}
+	// The pass outlives whatever asked for it. didOpen/didChange hand in their
+	// own operation context and cancel it as soon as the notification returns,
+	// which used to cancel the debounce timer before it ever fired: nothing was
+	// validated while typing, only on save. Keep the caller's values, drop its
+	// cancellation; the index lifecycle still stops this through
+	// beginBackground, and a newer run still supersedes it.
+	lifetimeCtx, finish, started := i.beginBackground(context.WithoutCancel(parent))
 	if !started {
 		return
 	}
@@ -2230,8 +2363,10 @@ func (i *Index) scheduleCompilerDiagnosticsNow(parent context.Context) {
 	i.compilerCancel = cancel
 	run := i.compilerRun.Add(1)
 	i.compilerCancelMu.Unlock()
+	i.compilerStatus.dispatch(run)
 	generation := i.generation.Load()
 	go func() {
+		defer i.recoverBackground("scheduleCompilerDiagnosticsNow")
 		defer finish()
 		timer := time.NewTimer(250 * time.Millisecond)
 		defer timer.Stop()
@@ -2457,4 +2592,36 @@ func quoteJavacArgument(value string) string {
 		return value
 	}
 	return `"` + strings.ReplaceAll(strings.ReplaceAll(value, `\`, `\\`), `"`, `\"`) + `"`
+}
+
+var kotlinVersionNumber = regexp.MustCompile(`(\d+)\.(\d+)(?:\.\d+)?`)
+
+// kotlinVersionBefore reports whether a compiler version string ("2.4.10", or
+// kotlinc's "info: kotlinc-jvm 2.4.20 (JRE ...)") is older than major.minor.
+// An unreadable version counts as older, which keeps the established flags.
+func kotlinVersionBefore(version string, major, minor int) bool {
+	match := kotlinVersionNumber.FindStringSubmatch(version)
+	if match == nil {
+		return true
+	}
+	gotMajor, _ := strconv.Atoi(match[1])
+	gotMinor, _ := strconv.Atoi(match[2])
+	return gotMajor < major || gotMajor == major && gotMinor < minor
+}
+
+// ClosedFileCompilerDiagnostics returns what the last compiler passes found in
+// workspace files the editor does not have open. They are already computed --
+// workspace/diagnostic can report the whole project from them without typing
+// a single closed file, which is what made covering the workspace too slow.
+func (i *Index) ClosedFileCompilerDiagnostics() map[protocol.URI][]protocol.Diagnostic {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	out := make(map[protocol.URI][]protocol.Diagnostic, len(i.compilerDiagnostics))
+	for uri, diagnostics := range i.compilerDiagnostics {
+		if _, open := i.docs[uri]; open || len(diagnostics) == 0 {
+			continue
+		}
+		out[uri] = append([]protocol.Diagnostic(nil), diagnostics...)
+	}
+	return out
 }

@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"github.com/shinyvision/kotlsp/internal/analysis"
 	"strings"
 	"testing"
 
@@ -207,4 +208,44 @@ val c = 'x'; val t = """raw $name"""`
 	check("'x'", false)
 	check("raw", false)
 	check("name\"\"\"", true)
+}
+
+// `every { ... } answers { secondArg() }`: the lambda belongs to an infix
+// call, and its receiver is a member type of the left operand's type. The
+// engine cannot name that receiver, so it must not prove secondArg unbound.
+func TestScopeEngineAbstainsInsideAnInfixCallLambda(t *testing.T) {
+	idx := scopeIndex(t, map[string]string{
+		"mock/Stub.kt": "package mock\nclass Answers { fun secondArg(): Any = Unit }\nclass Stub { infix fun answers(block: Answers.() -> Any) {} }\nfun every(block: () -> Any): Stub = Stub()\n",
+		"app/Use.kt":   "package app\n\nimport mock.every\n\nclass Use {\n    fun run() {\n        every { 1 } answers {\n            secondArg()\n        }\n    }\n}\n",
+	})
+	for _, name := range unresolvedNames(idx, "file:///workspace/app/Use.kt") {
+		if name == "secondArg" {
+			t.Fatalf("secondArg inside an infix call's lambda was reported unresolved")
+		}
+	}
+}
+
+// `when (this) { is Fixed -> overrides }` refines the implicit receiver, so
+// the subtype's members are bound in that branch.
+func TestScopeEngineSeesMembersOfASmartCastReceiver(t *testing.T) {
+	idx := scopeIndex(t, map[string]string{
+		"app/Cells.kt": "package app\n\nsealed class Cell\nclass Fixed(val overrides: Int) : Cell()\nclass Empty : Cell()\n\nfun Cell.glass(): Int? = when (this) {\n    is Fixed -> overrides\n    else -> null\n}\n",
+	})
+	for _, name := range unresolvedNames(idx, "file:///workspace/app/Cells.kt") {
+		if name == "overrides" {
+			t.Fatalf("a member of the smart-cast receiver was reported unresolved")
+		}
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	file := idx.files["file:///workspace/app/Cells.kt"]
+	for _, reference := range file.References {
+		if reference.Name == "overrides" && reference.Role == analysis.RoleRead {
+			if resolved := idx.resolveLocked(context.Background(), file, reference); len(resolved) != 1 || resolved[0].Name != "overrides" {
+				t.Fatalf("overrides resolved to %v", resolved)
+			}
+			return
+		}
+	}
+	t.Fatal("no overrides reference")
 }

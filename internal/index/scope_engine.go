@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"strings"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
@@ -210,14 +211,14 @@ var scopeEngineSkips = map[string]bool{
 
 // nameProvablyUnresolvedLocked is the entry point for an unqualified read,
 // write, or call whose name the resolver could not bind.
-func (i *Index) nameProvablyUnresolvedLocked(c *unresolvedNameContext, ref analysis.Reference) bool {
-	unresolved, _ := i.unresolvedVerdictLocked(c, ref)
+func (i *Index) nameProvablyUnresolvedLocked(ctx context.Context, c *unresolvedNameContext, ref analysis.Reference) bool {
+	unresolved, _ := i.unresolvedVerdictLocked(ctx, c, ref)
 	return unresolved
 }
 
 // unresolvedVerdictLocked is the engine proper. The reason is for tests and
 // for explaining an abstention on a real project; it costs nothing.
-func (i *Index) unresolvedVerdictLocked(c *unresolvedNameContext, ref analysis.Reference) (bool, string) {
+func (i *Index) unresolvedVerdictLocked(ctx context.Context, c *unresolvedNameContext, ref analysis.Reference) (bool, string) {
 	name := ref.Name
 	if name == "" || scopeEngineSkips[name] {
 		return false, "name is bound by the language"
@@ -253,7 +254,7 @@ func (i *Index) unresolvedVerdictLocked(c *unresolvedNameContext, ref analysis.R
 	if c.isDeclarationName(ref.StartByte) {
 		return false, "the reference is a declaration's own name"
 	}
-	scope := i.scopeAtLocked(c, ref)
+	scope := i.scopeAtLocked(ctx, c, ref)
 	if scope == nil || !scope.complete {
 		reason := "scope incomplete"
 		if scope != nil && scope.reason != "" {
@@ -298,7 +299,7 @@ func (i *Index) candidatePossiblyVisibleLocked(c *unresolvedNameContext, scope *
 			return false
 		}
 		if candidate.ScopeEndByte > candidate.ScopeStartByte {
-			return candidate.ScopeStartByte <= ref.StartByte && ref.StartByte <= candidate.ScopeEndByte
+			return candidate.InScopeAt(ref.StartByte)
 		}
 		return true
 	}
@@ -355,7 +356,7 @@ func (i *Index) topLevelVisibleLocked(file *analysis.ParsedFile, symbol analysis
 	if symbol.Package == file.Package {
 		return true
 	}
-	for _, imported := range file.Imports {
+	for _, imported := range i.effectiveImportsLocked(file) {
 		if imported.Wildcard {
 			if imported.Path == symbol.Package {
 				return true
@@ -382,15 +383,9 @@ func (c *unresolvedNameContext) contextualBranchLabel(ref analysis.Reference) bo
 	return ref.ContextualBranch
 }
 
-func inImportOrPackageLine(text string, at int) bool {
-	lineStart := strings.LastIndexByte(text[:at], '\n') + 1
-	line := strings.TrimSpace(text[lineStart:at])
-	return strings.HasPrefix(line, "import ") || strings.HasPrefix(line, "package ")
-}
-
 // scopeAtLocked computes the set of types whose members are visible at the
 // reference, or an incomplete scope when any part of it cannot be enumerated.
-func (i *Index) scopeAtLocked(c *unresolvedNameContext, ref analysis.Reference) *scopeSet {
+func (i *Index) scopeAtLocked(ctx context.Context, c *unresolvedNameContext, ref analysis.Reference) *scopeSet {
 	at := ref.StartByte
 	var keyParts []string
 	keyParts = append(keyParts, ref.ContainerID)
@@ -474,6 +469,9 @@ func (i *Index) scopeAtLocked(c *unresolvedNameContext, ref analysis.Reference) 
 		for _, contextType := range i.enclosingContextReceiverTypesLocked(file, at) {
 			addTypeName(contextType)
 		}
+		for _, refined := range i.thisSmartCastTypesLocked(file, at) {
+			addTypeName(refined)
+		}
 		if strings.Contains(c.text, "context(") {
 			// Context parameters and receivers are modelled loosely; the
 			// receiver types above may not be the whole story.
@@ -489,7 +487,7 @@ func (i *Index) scopeAtLocked(c *unresolvedNameContext, ref analysis.Reference) 
 			if lambda.start < at && at < lambda.end {
 				if !lambda.classified {
 					lambda.classified = true
-					lambda.receivers, lambda.known, lambda.reason = i.lambdaReceiversLocked(c, lambda.start, scope)
+					lambda.receivers, lambda.known, lambda.reason = i.lambdaReceiversLocked(ctx, c, lambda.start, scope)
 				}
 				if !lambda.known {
 					scope.incomplete("lambda at " + itoa(lambda.start) + ": " + lambda.reason)
@@ -636,7 +634,7 @@ func (i *Index) lambdaSpansLocked(c *unresolvedNameContext) []lambdaSpan {
 // lambdaReceiversLocked works out what a lambda's implicit receiver could be
 // from the call it is passed to. It returns known=false for any shape it does
 // not understand, which makes every name inside the lambda unreportable.
-func (i *Index) lambdaReceiversLocked(c *unresolvedNameContext, open int, scope *scopeSet) ([]string, bool, string) {
+func (i *Index) lambdaReceiversLocked(ctx context.Context, c *unresolvedNameContext, open int, scope *scopeSet) ([]string, bool, string) {
 	text, mask := c.text, c.mask
 	at := skipBackCode(text, mask, open-1)
 	if at < 0 {
@@ -696,6 +694,13 @@ func (i *Index) lambdaReceiversLocked(c *unresolvedNameContext, open int, scope 
 		receiverExpression = strings.TrimSpace(text[exprStart:exprEnd])
 		receiverOffset = exprStart
 	}
+	// `every { ... } answers { ... }`: an expression ends just before the
+	// callee on the same line, so this is an infix call on that expression.
+	// Its lambda's receiver comes from the left operand's type, which this
+	// lexical engine does not compute.
+	if !hasReceiver && infixCalleeAt(text, mask, nameStart) {
+		return nil, false, "infix call " + callee + " on an expression"
+	}
 	// A local or parameter of this name is a value, and a value with a
 	// trailing lambda is an invoke-operator call whose receiver is unknown.
 	for _, symbol := range i.fileSymbolsByName[c.file.URI][callee] {
@@ -753,7 +758,7 @@ func (i *Index) lambdaReceiversLocked(c *unresolvedNameContext, open int, scope 
 			if containsString(candidate.TypeParameters, receiver) {
 				bound := ""
 				if hasReceiver {
-					typ, ok := i.simpleExpressionTypeLocked(c, receiverExpression, receiverOffset, scope)
+					typ, ok := i.simpleExpressionTypeLocked(ctx, c, receiverExpression, receiverOffset, scope)
 					if !ok {
 						return nil, false, "receiver expression " + receiverExpression + " has no evident type"
 					}
@@ -766,15 +771,20 @@ func (i *Index) lambdaReceiversLocked(c *unresolvedNameContext, open int, scope 
 					if !argumentsKnown || index >= len(arguments) || strings.Contains(arguments[index], "=") {
 						return nil, false, "argument binding " + receiver + " of " + callee + " is not evident"
 					}
-					typ, ok := i.simpleExpressionTypeLocked(c, arguments[index], argumentOffsets[index], scope)
+					typ, ok := i.simpleExpressionTypeLocked(ctx, c, arguments[index], argumentOffsets[index], scope)
 					if !ok {
 						return nil, false, "argument " + arguments[index] + " has no evident type"
 					}
 					bound = typ
 				}
-				if bound != "" {
-					receivers = append(receivers, bound)
+				// `mockk { status }` -- `fun <T> mockk(block: T.() -> Unit): T`
+				// -- binds T from the type the call is expected to produce,
+				// which a lexical engine does not see. Dropping the receiver
+				// then reported every member of the mocked type as unresolved.
+				if bound == "" {
+					return nil, false, "receiver " + receiver + " of " + callee + " is bound by nothing evident"
 				}
+				receivers = append(receivers, bound)
 				continue
 			}
 			receivers = append(receivers, receiver)
@@ -867,7 +877,7 @@ func (i *Index) functionTypeReceiverLocked(callable *analysis.Symbol, parameterT
 // simpleExpressionTypeLocked types the few expression shapes that need no
 // inference: a constructor call of a resolvable class, a literal, or a name
 // bound to a declaration with an explicit type.
-func (i *Index) simpleExpressionTypeLocked(c *unresolvedNameContext, expression string, at int, scope *scopeSet) (string, bool) {
+func (i *Index) simpleExpressionTypeLocked(ctx context.Context, c *unresolvedNameContext, expression string, at int, scope *scopeSet) (string, bool) {
 	expression = strings.TrimSpace(expression)
 	if expression == "" || expression == "this" {
 		return "", false
@@ -915,7 +925,7 @@ func (i *Index) simpleExpressionTypeLocked(c *unresolvedNameContext, expression 
 	if local != nil {
 		resolved = []analysis.Symbol{*local}
 	} else {
-		resolved = i.resolveLocked(c.file, analysis.Reference{Name: expression, URI: c.file.URI, StartByte: at, EndByte: at + len(expression), ContainerID: i.containerIDAtLocked(c.file, at), Role: analysis.RoleRead, Arity: -1})
+		resolved = i.resolveLocked(ctx, c.file, analysis.Reference{Name: expression, URI: c.file.URI, StartByte: at, EndByte: at + len(expression), ContainerID: i.containerIDAtLocked(c.file, at), Role: analysis.RoleRead, Arity: -1, Synthetic: true})
 	}
 	if len(resolved) != 1 {
 		return "", false
@@ -1297,6 +1307,29 @@ func isJvmFunctionType(base string) bool {
 				return true
 			}
 		}
+	}
+	return false
+}
+
+// infixCalleeAt reports whether the identifier starting at start is the
+// function of an infix call: on the same line, an operand ends right before it.
+func infixCalleeAt(text string, mask []bool, start int) bool {
+	at := start - 1
+	for at >= 0 && (text[at] == ' ' || text[at] == '\t') {
+		at--
+	}
+	if at < 0 || at == start-1 || !mask[at] && text[at] != '"' && text[at] != '\'' {
+		return false
+	}
+	switch value := text[at]; {
+	case value == ')' || value == '}' || value == ']' || value == '"' || value == '\'':
+		return true
+	case isIdentifierByteFast(value):
+		wordEnd := at + 1
+		for at > 0 && isIdentifierByteFast(text[at-1]) {
+			at--
+		}
+		return !isKeyword(text[at:wordEnd])
 	}
 	return false
 }

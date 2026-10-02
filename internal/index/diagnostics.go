@@ -1,7 +1,9 @@
 package index
 
 import (
+	"context"
 	"fmt"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -12,6 +14,13 @@ import (
 // Diagnostics augments parser errors with bounded, index-backed semantic
 // checks. It performs no I/O and only touches precomputed maps.
 func (i *Index) Diagnostics(uri protocol.URI) []protocol.Diagnostic {
+	return i.DiagnosticsContext(context.Background(), uri)
+}
+
+// DiagnosticsContext is Diagnostics bounded by the caller's context: a
+// superseded edit or a cancelled request stops the semantic checks early, and
+// whatever they had not proved yet is simply not reported.
+func (i *Index) DiagnosticsContext(ctx context.Context, uri protocol.URI) []protocol.Diagnostic {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	file := i.files[uri]
@@ -25,14 +34,14 @@ func (i *Index) Diagnostics(uri protocol.URI) []protocol.Diagnostic {
 	// compiler's own code and wording, so a confirming finding changes nothing.
 	var predictions []protocol.Diagnostic
 	if file.ParseMode != "large" {
-		predictions = append(i.declarationDiagnosticsLocked(file), i.referenceDiagnosticsLocked(file)...)
-		predictions = append(predictions, i.fastDiagnosticsLocked(file)...)
-		predictions = append(predictions, i.springDataDiagnosticsLocked(file)...)
+		predictions = append(i.declarationDiagnosticsLocked(file), i.referenceDiagnosticsLocked(ctx, file)...)
+		predictions = append(predictions, i.fastDiagnosticsLocked(ctx, file)...)
+		predictions = append(predictions, i.springDataDiagnosticsLocked(ctx, file)...)
 	}
 	predictions, compiler := reconcilePredictions(predictions, i.compilerDiagnostics[uri])
 	out = append(out, compiler...)
 	if file.ParseMode != "large" {
-		out = append(out, i.importDiagnosticsLocked(file)...)
+		out = append(out, i.importDiagnosticsLocked(ctx, file)...)
 	}
 	out = append(out, predictions...)
 	sort.SliceStable(out, func(a, b int) bool {
@@ -69,8 +78,27 @@ func (i *Index) Diagnostics(uri protocol.URI) []protocol.Diagnostic {
 	return out
 }
 
-func (i *Index) importDiagnosticsLocked(file *analysis.ParsedFile) []protocol.Diagnostic {
-	usedImports := i.usedImportsLocked(file)
+// isBuildScriptURI reports whether a document is a build script rather than
+// project source. Its classpath belongs to the build tool, not to the module
+// model, so absence-based findings cannot be proven there.
+func isBuildScriptURI(uri protocol.URI) bool {
+	lower := strings.ToLower(string(uri))
+	return strings.HasSuffix(lower, ".gradle.kts") || strings.HasSuffix(lower, "/settings.gradle.kts") || strings.HasSuffix(lower, ".main.kts")
+}
+
+// importedPackage is the package an import path names, which is the path
+// without its final segment: the segment itself is the declaration, and for a
+// top-level Kotlin function or a typealias the index may hold no symbol for it
+// even though the package is fully indexed.
+func importedPackage(path string) string {
+	if dot := strings.LastIndexByte(path, '.'); dot > 0 {
+		return path[:dot]
+	}
+	return ""
+}
+
+func (i *Index) importDiagnosticsLocked(ctx context.Context, file *analysis.ParsedFile) []protocol.Diagnostic {
+	usedImports := i.usedImportsLocked(ctx, file)
 	seen := make(map[string]bool)
 	var out []protocol.Diagnostic
 	for _, imp := range file.Imports {
@@ -87,6 +115,20 @@ func (i *Index) importDiagnosticsLocked(file *analysis.ParsedFile) []protocol.Di
 			if !i.absenceProvesUnresolvedLocked(file) || i.hasUnmodelledGeneratedSourcesFor(file) {
 				// Library archives are published incrementally. Absence is not proof
 				// of an invalid import until their authoritative index is complete.
+				continue
+			}
+			// A build script compiles against the build tool's own classpath --
+			// the Gradle API, the plugins it applies -- which is not part of the
+			// project model at all. Nothing here can be proven absent, and every
+			// import in build.gradle.kts was reported as invalid.
+			if isBuildScriptURI(file.URI) {
+				continue
+			}
+			// The imported name may be declared by something the archive index
+			// summarises rather than holds: a Kotlin top-level function lives in
+			// a facade class (`org.springframework.boot.runApplication`), and a
+			// typealias has no class file at all.
+			if i.holdsLibrarySymbolLocked(i.byPackage[importedPackage(imp.Path)]) {
 				continue
 			}
 			out = append(out, protocol.Diagnostic{Range: imp.Range, Severity: 1, Code: "unresolved-import", Source: "kotlsp", Message: "Unresolved import: " + imp.Path, Data: map[string]any{"kind": "removeImport"}})
@@ -204,6 +246,13 @@ func declarationDiscriminator(symbol analysis.Symbol) string {
 	}
 	var b strings.Builder
 	b.WriteString("callable(")
+	// `A.toDto(x)` and `B.toDto(x)` are different functions: the receiver is
+	// part of the signature.
+	if symbol.ReceiverType != "" {
+		b.WriteString("receiver:")
+		b.WriteString(simpleType(symbol.ReceiverType))
+		b.WriteByte(';')
+	}
 	for _, parameter := range symbol.Parameters {
 		b.WriteString(simpleType(parameter.Type))
 		b.WriteByte(';')
@@ -212,7 +261,7 @@ func declarationDiscriminator(symbol analysis.Symbol) string {
 	return b.String()
 }
 
-func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol.Diagnostic {
+func (i *Index) referenceDiagnosticsLocked(ctx context.Context, file *analysis.ParsedFile) []protocol.Diagnostic {
 	var out []protocol.Diagnostic
 	deprecationCache := make(map[string]bool)
 	scopeContext := newUnresolvedNameContext(file)
@@ -226,11 +275,31 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 		resolvedTypeScope[key] = answer
 		return answer
 	}
-	for _, ref := range file.References {
+	for referenceNumber, ref := range file.References {
 		if len(out) >= maxCompilerDiagnosticsPerFile {
 			break
 		}
+		// This is the long part of a document's diagnostics, and it holds the
+		// read lock. A writer waiting for that lock also blocks every new
+		// reader, so an edit used to stall unrelated requests for as long as
+		// the pass took. Let a waiting writer in every few references; if the
+		// file was replaced meanwhile the result is stale anyway.
+		if referenceNumber%16 == 15 {
+			i.mu.RUnlock()
+			runtime.Gosched()
+			i.mu.RLock()
+			if i.files[file.URI] != file {
+				return out
+			}
+		}
 		reportUnresolved := ref.Role == analysis.RoleType || ref.Qualifier == "" && (ref.Role == analysis.RoleCall || ref.Role == analysis.RoleRead || ref.Role == analysis.RoleWrite)
+		// `colorsRepository.doesNotExist()`: a member name declared nowhere in
+		// a complete index cannot be any receiver's member or extension. The
+		// receiver must still have a known type (checked below), which rules
+		// out package paths and anything inference cannot see through.
+		qualifiedUnknown := file.Language == analysis.LanguageKotlin && ref.Qualifier != "" && !ref.Synthetic && (ref.Role == analysis.RoleCall || ref.Role == analysis.RoleRead || ref.Role == analysis.RoleWrite) &&
+			len(i.byName[ref.Name]) == 0 && len(i.fileSymbolsByName[file.URI][ref.Name]) == 0
+		reportUnresolved = reportUnresolved || qualifiedUnknown
 		if i.generation.Load() > 0 && !i.Progress().Ready {
 			reportUnresolved = false
 		}
@@ -266,17 +335,17 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 			if !i.hasDeprecatedNameLocked(ref.Name) {
 				continue
 			}
-			deprecationKey = i.deprecationCacheKeyLocked(file, ref)
+			deprecationKey = i.deprecationCacheKeyLocked(ctx, file, ref)
 			if deprecationKey != "" {
 				if deprecated, cached := deprecationCache[deprecationKey]; cached {
-					if deprecated {
+					if deprecated && !(ref.Role == analysis.RoleCall && i.liveOverloadExistsLocked(ref)) {
 						out = append(out, protocol.Diagnostic{Range: ref.Range, Severity: 2, Code: "deprecated", Source: "kotlsp", Message: ref.Name + " is deprecated", Tags: []int{2}})
 					}
 					continue
 				}
 			}
 		}
-		resolved := i.resolveLocked(file, ref)
+		resolved := i.resolveLocked(ctx, file, ref)
 		allDeprecated := len(resolved) > 0
 		for _, candidate := range resolved {
 			allDeprecated = allDeprecated && candidate.Deprecated
@@ -285,7 +354,12 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 			deprecationCache[deprecationKey] = allDeprecated
 		}
 		if len(resolved) > 0 {
-			if allDeprecated {
+			// Resolution without full overload selection can keep only the
+			// deprecated overload of a call (`toList()` against a deprecated
+			// `toList(destination)`, `a + b` against a deprecated `plus`). The
+			// warning is only certain when no live overload of that name could
+			// take the call; the compiler pass reports the rest accurately.
+			if allDeprecated && !(ref.Role == analysis.RoleCall && i.liveOverloadExistsLocked(ref)) {
 				out = append(out, protocol.Diagnostic{Range: ref.Range, Severity: 2, Code: "deprecated", Source: "kotlsp", Message: ref.Name + " is deprecated", Tags: []int{2}})
 			}
 			continue
@@ -341,8 +415,24 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 			continue
 		}
 		knownName := len(i.byName[ref.Name]) > 0 || len(i.fileSymbolsByName[file.URI][ref.Name]) > 0
-		if knownName && (ref.Role == analysis.RoleType || !i.fastDiagnosticsEligibleLocked(file) || !i.nameProvablyUnresolvedLocked(scopeContext, ref)) {
+		if knownName && (ref.Role == analysis.RoleType || !i.fastDiagnosticsEligibleLocked(file) || !i.nameProvablyUnresolvedLocked(ctx, scopeContext, ref)) {
 			continue
+		}
+		// A name declared nowhere in the index is still bound when an implicit
+		// receiver the index cannot name supplies it: a member of the receiver
+		// of `every { } answers { secondArg() }`. Absence proves something only
+		// where every receiver in scope is known.
+		if !knownName && ref.Role != analysis.RoleType && ref.Qualifier == "" && !i.nameProvablyUnresolvedLocked(ctx, scopeContext, ref) {
+			continue
+		}
+		if ref.Qualifier != "" && ref.Role != analysis.RoleType {
+			// An operator's convention call (`a + b` is `plus`) is not spelled
+			// where it is reported, and absence means something only once the
+			// standard library -- every receiver's extensions -- is indexed.
+			if knownName || !referenceSpelledAt(i.documentTextLocked(file.URI), ref) || len(i.byFQN["kotlin.collections.map"]) == 0 ||
+				i.inferExpressionResultContextLocked(ctx, file, ref.Qualifier, ref.StartByte).Type == "" {
+				continue
+			}
 		}
 		// A name with no declaration anywhere may still be a package: the
 		// first segments of `java.io.IOException` are references too.
@@ -351,6 +441,9 @@ func (i *Index) referenceDiagnosticsLocked(file *analysis.ParsedFile) []protocol
 			packageSegment = scopeContext.isRootPackageSegment(i, ref.Name)
 		}
 		if packageSegment || scopeContext.isDeclarationName(ref.StartByte) {
+			continue
+		}
+		if i.nameMayBindThroughUnmodelledScopeLocked(file, ref.Name) {
 			continue
 		}
 		data := map[string]any{"name": ref.Name}
@@ -412,7 +505,7 @@ func referenceInUnparsedRegion(file *analysis.ParsedFile, target protocol.Range)
 // operator shapes; resolving every occurrence merely to discover the same
 // deprecation bit otherwise dominates didOpen. Ambiguous position-sensitive
 // cases deliberately return an empty key and take the complete resolver path.
-func (i *Index) deprecationCacheKeyLocked(file *analysis.ParsedFile, reference analysis.Reference) string {
+func (i *Index) deprecationCacheKeyLocked(ctx context.Context, file *analysis.ParsedFile, reference analysis.Reference) string {
 	if reference.Qualifier == "" || reference.ArgumentLabel || callableReferenceOperatorBefore(i.documentTextLocked(file.URI), reference.StartByte) {
 		return ""
 	}
@@ -439,7 +532,7 @@ func (i *Index) deprecationCacheKeyLocked(file *analysis.ParsedFile, reference a
 			qualifier = textual
 		}
 	}
-	receiverType := i.typeOfExpressionLocked(file, qualifier, reference.StartByte)
+	receiverType := i.typeOfExpressionLocked(ctx, file, qualifier, reference.StartByte)
 	if receiverType == "" || len(i.fileAnonymousByName[file.URI][strings.TrimSpace(qualifier)]) > 0 {
 		return ""
 	}
@@ -460,7 +553,7 @@ func (i *Index) deprecationCacheKeyLocked(file *analysis.ParsedFile, reference a
 		}
 		expression := strings.TrimSpace(document.Text[start:end])
 		key.WriteByte('|')
-		key.WriteString(i.inferExpressionTypeLocked(file, expression, start))
+		key.WriteString(i.inferExpressionTypeLocked(ctx, file, expression, start))
 		// Kotlin integer literals are context-sensitive. Record every primitive
 		// range they fit so values with different overload applicability never
 		// share a cached deprecation result.
@@ -560,6 +653,59 @@ func languageIntrinsicReference(ref analysis.Reference, language analysis.Langua
 // published: its universe is complete by construction, so absence is proof
 // immediately. A scanned workspace must first finish (and be authoritative)
 // before a missing declaration can mean anything.
+// nameMayBindThroughUnmodelledScopeLocked reports whether a bare name could
+// still bind through something this index models incompletely, which makes its
+// absence from the visible scope no proof of anything:
+//
+//   - An extension binds by receiver type, and no receiver typing happens here.
+//     `javaClass` is an extension property on Any; nothing about the scope of
+//     the file says whether it applies.
+//   - A wildcard import of a library type or package brings in members that are
+//     summarised when the archive is indexed, and Kotlin typealiases that have
+//     no class file of their own: `kotlin.test.Test` is an actual typealias to
+//     the JUnit annotation, and `org.mockito.Mockito.*` imports static members.
+//
+// Both were reported as undefined names on code that compiles.
+func (i *Index) nameMayBindThroughUnmodelledScopeLocked(file *analysis.ParsedFile, name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, id := range boundedIDs(i.byName[name]) {
+		if symbol := i.symbols[id]; symbol != nil && symbol.ReceiverType != "" {
+			return true
+		}
+	}
+	for _, imported := range file.Imports {
+		if !imported.Wildcard {
+			continue
+		}
+		if i.holdsLibrarySymbolLocked(i.byFQN[imported.Path]) || i.holdsLibrarySymbolLocked(i.byPackage[imported.Path]) {
+			return true
+		}
+	}
+	return false
+}
+
+func (i *Index) holdsLibrarySymbolLocked(ids []string) bool {
+	for _, id := range boundedIDs(ids) {
+		if symbol := i.symbols[id]; symbol != nil && symbol.Library {
+			return true
+		}
+	}
+	return false
+}
+
+// boundedIDs keeps these scope questions proportional to a cursor request: a
+// popular name or a large package must not turn an abstention check into a
+// walk of the whole dependency graph.
+func boundedIDs(ids []string) []string {
+	const limit = 256
+	if len(ids) > limit {
+		return ids[:limit]
+	}
+	return ids
+}
+
 func (i *Index) absenceProvesUnresolvedLocked(file *analysis.ParsedFile) bool {
 	if i.generation.Load() == 0 {
 		return true
@@ -572,6 +718,21 @@ func (i *Index) absenceProvesUnresolvedLocked(file *analysis.ParsedFile) bool {
 func importDeclaresName(file *analysis.ParsedFile, name string) bool {
 	for _, imported := range file.Imports {
 		if imported.LocalName() == name || imported.Alias == name {
+			return true
+		}
+	}
+	return false
+}
+
+// liveOverloadExistsLocked reports whether some callable of the reference's
+// name that is not deprecated could take a call of its arity.
+func (i *Index) liveOverloadExistsLocked(ref analysis.Reference) bool {
+	for _, id := range i.byName[ref.Name] {
+		candidate := i.symbols[id]
+		if candidate == nil || candidate.Deprecated || candidate.Synthetic || !analysis.IsCallableKind(candidate.Kind) {
+			continue
+		}
+		if ref.Arity < 0 || matchesArityForLanguage(*candidate, ref.Arity, analysis.LanguageKotlin) {
 			return true
 		}
 	}

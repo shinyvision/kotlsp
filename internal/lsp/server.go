@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/shinyvision/kotlsp/internal/formathost"
+	"hash/fnv"
 	"io"
 	"log"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +35,10 @@ import (
 const latencyLimit = 100 * time.Millisecond
 
 type Server struct {
+	// formatPool runs the build's own formatter (Spotless/ktlint) warm.
+	formatPool               formathost.Pool
+	lastActivity             atomic.Int64
+	memoryReleased           atomic.Bool
 	ctx                      context.Context
 	cancel                   context.CancelFunc
 	closeOnce                sync.Once
@@ -94,7 +101,11 @@ type Server struct {
 }
 
 type completionApplication struct {
-	Edit       *protocol.WorkspaceEdit
+	Edit *protocol.WorkspaceEdit
+	// ImportFQN is the declaration accepting the item must import. The edit is
+	// recomputed from the document as it is when the command runs, because
+	// the one in Edit was placed against the text the menu was built from.
+	ImportFQN  string
 	URI        protocol.URI
 	Version    int
 	Generation int64
@@ -129,6 +140,7 @@ func Serve(ctx context.Context, in io.Reader, out io.Writer, logPath string) err
 	conn := jsonrpc.NewConn(in, out, s)
 	s.conn = conn
 	defer s.Close()
+	s.launchBackground(s.releaseMemoryWhenIdle)
 	return conn.Run(ctx)
 }
 
@@ -151,6 +163,7 @@ func NewServer(ctx context.Context, logger *log.Logger) *Server {
 	// client that pulls diagnostics has to be told to ask again, or the
 	// recomputed set is never seen.
 	s.index.SetDiagnosticsListener(s.queueDiagnosticRefresh)
+	s.index.SetLogger(logger.Printf)
 	return s
 }
 
@@ -166,6 +179,7 @@ func (s *Server) Close() {
 		}
 		s.backgroundMu.Unlock()
 		s.closeDAP()
+		s.formatPool.Close()
 		s.backgroundWG.Wait()
 		s.index.Close()
 	})
@@ -191,6 +205,8 @@ func (s *Server) launchBackground(work func()) bool {
 
 func (s *Server) Request(ctx context.Context, method string, params json.RawMessage) (result any, responseErr *jsonrpc.ResponseError) {
 	start := time.Now()
+	s.noteActivity()
+	countRequest(method)
 	if budget := requestBudget(method); budget > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, budget)
@@ -200,7 +216,7 @@ func (s *Server) Request(ctx context.Context, method string, params json.RawMess
 		if recovered := recover(); recovered != nil {
 			result = nil
 			responseErr = &jsonrpc.ResponseError{Code: jsonrpc.InternalError, Message: fmt.Sprintf("internal error: %v", recovered)}
-			s.log.Printf("panic in %s: %v", method, recovered)
+			s.log.Printf("panic in %s: %v\n%s", method, recovered, debug.Stack())
 		}
 		d := time.Since(start)
 		s.latencyMu.Lock()
@@ -247,6 +263,8 @@ func (s *Server) Request(ctx context.Context, method string, params json.RawMess
 		return s.references(params, ctx)
 	case "textDocument/documentHighlight":
 		return s.documentHighlight(params, ctx)
+	case "textDocument/selectionRange":
+		return s.selectionRange(params)
 	case "textDocument/documentSymbol":
 		return s.documentSymbols(params, ctx)
 	case "workspace/symbol":
@@ -308,8 +326,31 @@ func requestBudget(method string) time.Duration {
 	switch method {
 	case "initialize", "shutdown", "workspace/executeCommand", "workspace/willRenameFiles":
 		return 2 * time.Second
-	case "workspace/symbol", "textDocument/references", "textDocument/rename":
+	case "workspace/symbol":
 		return 500 * time.Millisecond
+	case "textDocument/formatting", "textDocument/rangeFormatting":
+		// A large file can take longer than the interaction budget to format, and
+		// a client that gets an error simply does not format on save.
+		return 3 * time.Second
+	case "textDocument/semanticTokens/full", "textDocument/semanticTokens/full/delta", "textDocument/semanticTokens/range", "textDocument/inlayHint":
+		// Highlighting and hints classify every reference in the document. The
+		// first request for a version of a large file resolves them all (the
+		// result is remembered), and answering a little late beats answering
+		// nothing: an editor that gets an empty result shows no highlighting.
+		return 3 * time.Second
+	case "textDocument/references", "textDocument/rename", "callHierarchy/incomingCalls", "callHierarchy/outgoingCalls", "typeHierarchy/subtypes", "textDocument/implementation":
+		// Explicit, whole-project actions. The first query on a widely used name
+		// resolves every occurrence by inference; the result is cached, so only
+		// that first one is slow, and one that still runs out returns what it
+		// has resolved so far.
+		return 8 * time.Second
+	case "textDocument/diagnostic":
+		// One document's fast rules are milliseconds on ordinary files, but a
+		// long file over a deep dependency graph can exceed the interaction
+		// budget. A pull client that receives an error shows no diagnostics at
+		// all for that file, and silence is indistinguishable from "clean", so
+		// this answers late rather than not at all.
+		return 5 * time.Second
 	case "workspace/diagnostic":
 		// A workspace report evaluates every document's fast rules; on a
 		// modest Spring project that is seconds, not milliseconds, and a
@@ -335,6 +376,8 @@ func canceledResponse(ctx context.Context) *jsonrpc.ResponseError {
 }
 
 func (s *Server) Notify(ctx context.Context, method string, params json.RawMessage) {
+	s.noteActivity()
+	countRequest("notify:" + method)
 	if method == "exit" {
 		s.Close()
 		if s.conn != nil {
@@ -639,6 +682,8 @@ func (s *Server) initialize(ctx context.Context, raw json.RawMessage) (any, *jso
 	s.clientCaps = p.Capabilities
 	s.defaultJavaHome = defaultJavaHome
 	s.rootMu.Unlock()
+	// A client that pulls diagnostics ignores pushed ones, so do not compute them.
+	s.index.SetDiagnosticsPush(!s.clientCapabilityPresent("textDocument", "diagnostic"))
 	// Indexing must outlive the initialize request. The JSON-RPC transport
 	// cancels each request context as soon as its response is written.
 	s.index.Start(s.ctx, roots)
@@ -651,6 +696,7 @@ func serverCapabilities() map[string]any {
 		"completionProvider": map[string]any{"resolveProvider": true, "triggerCharacters": []string{"."}},
 		"hoverProvider":      true, "definitionProvider": true, "declarationProvider": true, "typeDefinitionProvider": true, "implementationProvider": true, "referencesProvider": true,
 		"documentHighlightProvider": true,
+		"selectionRangeProvider":    true,
 		"documentSymbolProvider":    true, "workspaceSymbolProvider": map[string]any{"resolveProvider": false, "workDoneProgress": true},
 		"documentFormattingProvider": true, "documentRangeFormattingProvider": true,
 		"codeActionProvider": map[string]any{"codeActionKinds": []string{"quickfix", "refactor", "source.organizeImports", "refactor.extract.variable", "refactor.extract.function", "refactor.extract.field", "refactor.extract.constant", "refactor.inline.variable"}, "resolveProvider": false, "workDoneProgress": false},
@@ -692,6 +738,15 @@ func (s *Server) completion(raw json.RawMessage, contexts ...context.Context) (a
 	// declarations only where a tag takes a reference.
 	position := index.CompletionPosition{Scope: index.CompletionCode}
 	if hasDocument {
+		// `project(":")` in a build script completes the build's project paths.
+		if items, ok := s.index.GradleProjectPathCompletions(p.TextDocument.URI, doc.Text, doc.Offset(p.Position)); ok {
+			out := make([]protocol.CompletionItem, 0, len(items))
+			for n, item := range items {
+				out = append(out, protocol.CompletionItem{Label: item.Path, Kind: protocol.CompletionModule, Detail: item.Dir, SortText: fmt.Sprintf("%04d", n),
+					TextEdit: &protocol.TextEdit{Range: doc.Range(item.Start, item.End), NewText: item.Path}})
+			}
+			return protocol.CompletionList{Items: out}, nil
+		}
 		position = index.CompletionPositionAt(doc.Text, doc.Offset(p.Position), kotlin)
 	}
 	switch position.Scope {
@@ -715,9 +770,12 @@ func (s *Server) completion(raw json.RawMessage, contexts ...context.Context) (a
 	s.completionMu.Lock()
 	for id, application := range s.completionSessions {
 		expired := !application.Created.IsZero() && now.Sub(application.Created) > transientSessionTTL
-		oldGeneration := application.URI == p.TextDocument.URI && application.Generation < generation-3
-		changedVersion := hasDocument && application.URI == p.TextDocument.URI && application.Version != doc.Version
-		if expired || oldGeneration || changedVersion {
+		// A session outlives edits to the document: the menu keeps showing the
+		// previous request's items while the next one is in flight, so accepting
+		// one routinely happens after the version has moved on. Age and the
+		// number of requests since bound the table instead.
+		oldGeneration := application.URI == p.TextDocument.URI && application.Generation < generation-8
+		if expired || oldGeneration {
 			delete(s.completionSessions, id)
 		}
 	}
@@ -748,7 +806,7 @@ func (s *Server) completion(raw json.RawMessage, contexts ...context.Context) (a
 				item.Detail = qualified + " · " + item.Detail
 			}
 		}
-		if snippets && analysis.IsCallableKind(sym.Kind) {
+		if snippets && analysis.IsCallableKind(sym.Kind) && (!hasDocument || snippetCallAllowed(doc.Text, doc.Offset(p.Position))) {
 			insertSymbol := sym
 			insertSymbol.Name = insertName
 			item.InsertText = completionSnippet(insertSymbol)
@@ -772,8 +830,11 @@ func (s *Server) completion(raw json.RawMessage, contexts ...context.Context) (a
 				application.Version = doc.Version
 			}
 			if needsImport {
-				workspaceEdit := protocol.WorkspaceEdit{Changes: map[protocol.URI][]protocol.TextEdit{p.TextDocument.URI: {importEdit}}}
-				application.Edit = &workspaceEdit
+				// The import travels with the item, the standard way every
+				// client applies on accept; the command no longer edits, so
+				// the import is never written twice.
+				item.AdditionalTextEdits = append(item.AdditionalTextEdits, importEdit)
+				application.ImportFQN = sym.FQN
 			}
 			s.completionSessions[id] = application
 			item.Command = &protocol.Command{Title: "Apply Kotlin completion", Command: "jetbrains.kotlin.completion.apply", Arguments: []any{id}}
@@ -785,6 +846,24 @@ func (s *Server) completion(raw json.RawMessage, contexts ...context.Context) (a
 			}
 		}
 		items = append(items, item)
+	}
+	// Inside a call's argument list the parameters it can take by name come
+	// first: `ColorDto(` offers `id =`, `ralName =`, ... as IntelliJ does.
+	if kotlin && hasDocument && position.Scope == index.CompletionCode {
+		named := s.index.NamedArgumentsAt(ctx, p.TextDocument.URI, p.Position)
+		argumentItems := make([]protocol.CompletionItem, 0, len(named))
+		for n, argument := range named {
+			label := argument.Name + " ="
+			detail := argument.Type
+			if !argument.Required {
+				detail += " (optional)"
+			}
+			argumentItems = append(argumentItems, protocol.CompletionItem{
+				Label: label, Kind: 6, Detail: detail, InsertText: kotlinIdentifierInsertion(argument.Name) + " = ",
+				FilterText: argument.Name, SortText: fmt.Sprintf("0000_%04d", n),
+			})
+		}
+		items = append(argumentItems, items...)
 	}
 	keywords := keywordCompletions(p.TextDocument.URI)
 	if position.Scope != index.CompletionCode {
@@ -1089,7 +1168,16 @@ func (s *Server) hover(raw json.RawMessage, contexts ...context.Context) (any, *
 		return nil, nil
 	}
 	lang := sym.Language.String()
-	value := "```" + lang + "\n" + sym.DisplaySignature() + "\n```"
+	signature := sym.DisplaySignature()
+	// Kotlin omits a type wherever it can be inferred, which is most locals and
+	// every expression-bodied function. Hovering one showed only its name while
+	// completion and go-to-definition were already working from its type.
+	if sym.Type == "" {
+		if inferred := s.index.InferredDisplayTypeContext(ctx, sym); inferred != "" {
+			signature += ": " + inferred
+		}
+	}
+	value := "```" + lang + "\n" + signature + "\n```"
 	if sym.Documentation != "" {
 		value += "\n\n" + sym.Documentation
 	}
@@ -1174,7 +1262,7 @@ func (s *Server) documentSymbols(raw json.RawMessage, contexts ...context.Contex
 		return nil, invalidParams(err)
 	}
 	ctx := operationContext(contexts)
-	symbols := s.index.SymbolsInFile(p.TextDocument.URI)
+	symbols := withoutPrimaryConstructors(s.index.SymbolsInFile(p.TextDocument.URI))
 	result, completed := hierarchicalSymbolsContext(ctx, symbols)
 	if !completed {
 		return nil, canceledResponse(ctx)
@@ -1196,7 +1284,12 @@ func (s *Server) workspaceSymbols(raw json.RawMessage, contexts ...context.Conte
 	if responseErr := canceledResponse(ctx); responseErr != nil {
 		return nil, responseErr
 	}
-	if truncated {
+	// Hitting the cap means the ranking considered as many matches as the
+	// budget allows, not that the answer is worthless: every editor presents a
+	// bounded, ranked list here. Refusing outright showed the user nothing for
+	// ordinary queries, so the refusal is now reserved for a query that
+	// produced no result at all.
+	if truncated && len(symbols) == 0 {
 		return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestCanceled, Message: "workspace symbol candidate safety limit exceeded", Data: map[string]any{"resultLimit": 500, "candidateLimit": 4000, "retry": "use a more specific query"}}
 	}
 	out := make([]protocol.SymbolInformation, 0, len(symbols))
@@ -1227,6 +1320,11 @@ func (s *Server) diagnostic(raw json.RawMessage, contexts ...context.Context) (a
 		textHash := uint64(0)
 		if ok {
 			textHash = file.TextHash
+		}
+		// The client already has this exact version: say so before doing the
+		// work of computing it.
+		if p.PreviousResultID != "" && p.PreviousResultID == diagnosticResultID(textHash, epoch) {
+			return map[string]any{"kind": "unchanged", "resultId": diagnosticResultID(textHash, epoch)}, nil
 		}
 		items := s.index.Diagnostics(p.TextDocument.URI)
 		if responseErr := canceledResponse(ctx); responseErr != nil {
@@ -1282,7 +1380,14 @@ func (s *Server) workspaceDiagnostics(ctx context.Context, raw json.RawMessage) 
 		previous[item.URI] = item.ResultID
 	}
 	epoch := s.index.DiagnosticsEpoch()
-	files, truncated := s.index.WorkspaceFilesContext(ctx, maxWorkspaceDiagnosticDocuments+1)
+	// Typed only for the documents the editor has open; closed files report
+	// the compiler's findings below. This used to evaluate every
+	// indexed file -- hundreds, at 100-200ms each -- and clients ask again after
+	// every `workspace/diagnostic/refresh`, which the compiler pass sends each
+	// time it finishes. Neovim does exactly that, so a single edit kept the
+	// server saturated for minutes and starved completion. A closed file's
+	// diagnostics reach the client by push when the compiler pass produces them.
+	files, truncated := s.openWorkspaceFiles(), false
 	if ctx.Err() != nil {
 		return nil, canceledResponse(ctx)
 	}
@@ -1321,6 +1426,39 @@ func (s *Server) workspaceDiagnostics(ctx context.Context, raw json.RawMessage) 
 			return nil, &jsonrpc.ResponseError{Code: jsonrpc.RequestCanceled, Message: "workspace diagnostic payload safety limit exceeded", Data: map[string]any{"itemLimit": maxWorkspaceDiagnosticItems, "byteLimit": maxWorkspaceDiagnosticBytes}}
 		}
 		items = append(items, protocol.WorkspaceDocumentDiagnosticReport{URI: file.URI, Kind: "full", ResultID: resultID, Items: diagnostics})
+	}
+	// Closed files: what the compiler pass found, already computed.
+	closed := s.index.ClosedFileCompilerDiagnostics()
+	closedURIs := make([]protocol.URI, 0, len(closed))
+	for uri := range closed {
+		if !seen[uri] {
+			closedURIs = append(closedURIs, uri)
+		}
+	}
+	sort.Slice(closedURIs, func(left, right int) bool { return closedURIs[left] < closedURIs[right] })
+	for _, uri := range closedURIs {
+		if len(items) >= maxWorkspaceDiagnosticDocuments {
+			break
+		}
+		diagnostics := closed[uri]
+		encoded, encodeErr := json.Marshal(diagnostics)
+		if encodeErr != nil {
+			continue
+		}
+		diagnosticItems += len(diagnostics)
+		diagnosticBytes += len(encoded)
+		if diagnosticItems > maxWorkspaceDiagnosticItems || diagnosticBytes > maxWorkspaceDiagnosticBytes {
+			break
+		}
+		seen[uri] = true
+		digest := fnv.New64a()
+		_, _ = digest.Write(encoded)
+		resultID := diagnosticResultID(digest.Sum64(), epoch)
+		if previous[uri] == resultID {
+			items = append(items, protocol.WorkspaceDocumentDiagnosticReport{URI: uri, Kind: "unchanged", ResultID: resultID})
+			continue
+		}
+		items = append(items, protocol.WorkspaceDocumentDiagnosticReport{URI: uri, Kind: "full", ResultID: resultID, Items: diagnostics})
 	}
 	for uri := range previous {
 		if seen[uri] {
@@ -1504,8 +1642,18 @@ func (s *Server) prepareRename(raw json.RawMessage, contexts ...context.Context)
 		return nil, invalidParams(err)
 	}
 	ctx := operationContext(contexts)
+	// Only what is cheap: the symbol exists and is not a library's. The proof
+	// that every occurrence can be found is `rename`'s, under its own budget.
+	// Doing it here as well ran it twice, the first time inside the 100 ms
+	// default budget, where it timed out for any widely used name -- and a
+	// client that gets an error from prepareRename gives up on the rename.
 	sym, ref, ok := s.index.SymbolAtContext(ctx, p.TextDocument.URI, p.Position)
-	if !ok || sym.Library || !s.index.RenameableContext(ctx, p.TextDocument.URI, p.Position) {
+	if ok && !sym.Library && (!s.spelledAsSymbol(p.TextDocument.URI, sym, ref) || usedByConvention(sym)) {
+		// Spelled differently from the symbol (an operator or other convention
+		// use, an accessor spelling): only the full proof can say.
+		ok = s.index.RenameableContext(ctx, p.TextDocument.URI, p.Position)
+	}
+	if !ok || sym.Library {
 		if responseErr := canceledResponse(ctx); responseErr != nil {
 			return nil, responseErr
 		}
@@ -1866,21 +2014,77 @@ func deprecatedTags(sym analysis.Symbol) []int {
 	return nil
 }
 func completionSnippet(sym analysis.Symbol) string {
-	if len(sym.Parameters) == 0 {
+	parameters := sym.Parameters
+	if sym.Language == analysis.LanguageKotlin {
+		// A parameter with a default, or a vararg, is optional: asking for them
+		// makes every data-class constructor a wall of placeholders.
+		required := make([]analysis.Parameter, 0, len(parameters))
+		for _, parameter := range parameters {
+			if parameter.Default == "" && !parameter.Variadic {
+				required = append(required, parameter)
+			}
+		}
+		// A trailing lambda is written outside the parentheses: `let { }`.
+		if n := len(sym.Parameters); n > 0 {
+			last := sym.Parameters[n-1]
+			if lambdaParameter(last) && last.Default == "" && !last.Variadic {
+				if head := required[:len(required)-1]; len(head) > 0 {
+					return sym.Name + "(" + snippetPlaceholders(head) + ") { $0 }"
+				}
+				return sym.Name + " { $0 }"
+			}
+		}
+		parameters = required
+	}
+	if len(parameters) == 0 {
 		return sym.Name + "()"
 	}
+	return sym.Name + "(" + snippetPlaceholders(parameters) + ")$0"
+}
+
+func snippetPlaceholders(parameters []analysis.Parameter) string {
 	var b strings.Builder
-	b.WriteString(sym.Name)
-	b.WriteByte('(')
-	for n, p := range sym.Parameters {
+	for n, p := range parameters {
 		if n > 0 {
 			b.WriteString(", ")
 		}
 		fmt.Fprintf(&b, "${%d:%s}", n+1, p.Name)
 	}
-	b.WriteString(")$0")
 	return b.String()
 }
+
+// lambdaParameter reports whether the parameter is a non-null function type.
+func lambdaParameter(parameter analysis.Parameter) bool {
+	typ := strings.TrimSpace(parameter.Type)
+	return strings.Contains(typ, "->") && !strings.HasSuffix(typ, "?")
+}
+
+// snippetCallAllowed reports whether completing a function at the offset should
+// insert an argument list. It must not when one already follows (`foo|(x)`) or
+// when the function is being referenced rather than called (`::foo`).
+func snippetCallAllowed(text string, offset int) bool {
+	if offset < 0 || offset > len(text) {
+		return true
+	}
+	start := offset
+	for start > 0 {
+		c := text[start-1]
+		if c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= 0x80 {
+			start--
+			continue
+		}
+		break
+	}
+	if start >= 2 && text[start-2:start] == "::" {
+		return false
+	}
+	end := offset
+	for end < len(text) && (text[end] == '_' || text[end] >= '0' && text[end] <= '9' || text[end] >= 'a' && text[end] <= 'z' || text[end] >= 'A' && text[end] <= 'Z') {
+		end++
+	}
+	return end >= len(text) || text[end] != '('
+}
+
 func keywordCompletions(uri protocol.URI) []protocol.CompletionItem {
 	words := []string{"class", "interface", "fun", "val", "var", "object", "when", "if", "else", "for", "while", "return", "import", "package", "private", "public", "protected", "internal", "override", "suspend", "data", "sealed", "enum", "typealias", "this", "super", "null", "true", "false"}
 	if strings.HasSuffix(strings.ToLower(string(uri)), ".java") {
@@ -1892,11 +2096,6 @@ func keywordCompletions(uri protocol.URI) []protocol.CompletionItem {
 	}
 	return out
 }
-func hierarchicalSymbols(symbols []analysis.Symbol) []protocol.DocumentSymbol {
-	result, _ := hierarchicalSymbolsContext(context.Background(), symbols)
-	return result
-}
-
 func hierarchicalSymbolsContext(ctx context.Context, symbols []analysis.Symbol) ([]protocol.DocumentSymbol, bool) {
 	const maxDocumentSymbols = 50000
 	if ctx == nil {
@@ -1939,11 +2138,6 @@ func hierarchicalSymbolsContext(ctx context.Context, symbols []analysis.Symbol) 
 	result := build("", 0)
 	return result, completed
 }
-func encodeSemanticTokens(tokens []analysis.Token, filter *protocol.Range) []uint32 {
-	encoded, _ := encodeSemanticTokensContext(context.Background(), tokens, filter)
-	return encoded
-}
-
 func encodeSemanticTokensContext(ctx context.Context, tokens []analysis.Token, filter *protocol.Range) ([]uint32, bool) {
 	out := make([]uint32, 0, len(tokens)*5)
 	prevLine, prevChar := 0, 0
@@ -2058,4 +2252,107 @@ func javaExecutableInHome(home string) string {
 		return path
 	}
 	return ""
+}
+
+// openWorkspaceFiles returns the parsed files of the documents the client has
+// open, library mirrors excluded.
+func (s *Server) openWorkspaceFiles() []*analysis.ParsedFile {
+	uris := s.index.OpenDocuments()
+	files := make([]*analysis.ParsedFile, 0, len(uris))
+	for _, uri := range uris {
+		if _, workspace := uriutil.Path(uri); !workspace || strings.Contains(string(uri), index.LibrarySourceBaseMarker) {
+			continue
+		}
+		if file, ok := s.index.Parsed(uri); ok && file != nil {
+			files = append(files, file)
+		}
+	}
+	return files
+}
+
+func (s *Server) selectionRange(raw json.RawMessage) (any, *jsonrpc.ResponseError) {
+	var p protocol.SelectionRangeParams
+	if err := decode(raw, &p); err != nil {
+		return nil, invalidParams(err)
+	}
+	if len(p.Positions) > 256 {
+		return nil, invalidParams(fmt.Errorf("selectionRange accepts at most 256 positions"))
+	}
+	doc, ok := s.index.Document(p.TextDocument.URI)
+	if !ok {
+		return nil, nil
+	}
+	offsets := make([]int, len(p.Positions))
+	for index, position := range p.Positions {
+		offsets[index] = doc.Offset(position)
+	}
+	spans, ok := s.index.SelectionSpans(p.TextDocument.URI, offsets)
+	if !ok {
+		return nil, nil
+	}
+	result := make([]*protocol.SelectionRange, len(p.Positions))
+	for index, position := range p.Positions {
+		// Outermost first, so each step can point at the one around it.
+		var parent *protocol.SelectionRange
+		for n := len(spans[index]) - 1; n >= 0; n-- {
+			span := spans[index][n]
+			parent = &protocol.SelectionRange{Range: protocol.Range{Start: doc.Position(span[0]), End: doc.Position(span[1])}, Parent: parent}
+		}
+		if parent == nil {
+			parent = &protocol.SelectionRange{Range: protocol.Range{Start: position, End: position}}
+		}
+		result[index] = parent
+	}
+	return result, nil
+}
+
+// spelledAsSymbol reports whether the position names the symbol the way a
+// rename expects: a declaration, or a reference whose text is the symbol's name.
+func (s *Server) spelledAsSymbol(uri protocol.URI, symbol analysis.Symbol, reference *analysis.Reference) bool {
+	if reference == nil {
+		return true // the declaration itself
+	}
+	doc, ok := s.index.Document(uri)
+	if !ok {
+		return false
+	}
+	start, end := doc.Offset(reference.Range.Start), doc.Offset(reference.Range.End)
+	if start < 0 || end > len(doc.Text) || start >= end {
+		return false
+	}
+	return strings.Trim(doc.Text[start:end], "`") == symbol.Name
+}
+
+// usedByConvention reports whether a symbol can be reached without its name:
+// a Kotlin operator, or a Java method which Kotlin may call as one. Renaming it
+// needs the full proof of what its uses are.
+func usedByConvention(symbol analysis.Symbol) bool {
+	if !analysis.IsCallableKind(symbol.Kind) {
+		return false
+	}
+	return symbol.Language == analysis.LanguageJava || containsModifier(symbol.Modifiers, "operator") || containsModifier(symbol.Modifiers, "infix")
+}
+
+func containsModifier(modifiers []string, wanted string) bool {
+	for _, modifier := range modifiers {
+		if modifier == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutPrimaryConstructors drops a Kotlin class's primary constructor from
+// the outline: it is the class header, and listing it as a child named like
+// the class showed every class twice. Its properties and the secondary
+// constructors stay.
+func withoutPrimaryConstructors(symbols []analysis.Symbol) []analysis.Symbol {
+	out := symbols[:0:0]
+	for _, symbol := range symbols {
+		if symbol.Kind == analysis.KindConstructor && containsModifier(symbol.Modifiers, "primary-constructor") {
+			continue
+		}
+		out = append(out, symbol)
+	}
+	return out
 }

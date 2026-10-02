@@ -2,6 +2,8 @@ package index
 
 import (
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
@@ -12,12 +14,34 @@ type kotlinMetadataParameter struct {
 	Name       string
 	HasDefault bool
 	Type       kotlinMetadataType
+	// Vararg is set when the parameter carries a vararg element type.
+	Vararg bool
+	// VarargElement is that element type.
+	VarargElement kotlinMetadataType
 }
 
 type kotlinMetadataType struct {
 	Present   bool
 	Nullable  bool
 	Arguments []kotlinMetadataType
+	// Suspend marks a suspend function type, whose JVM spelling ends in a
+	// Continuation parameter.
+	Suspend bool
+	// Extension marks a function type with a receiver, `T.() -> Unit`: the
+	// type carries @ExtensionFunctionType, which the JVM spelling drops.
+	Extension bool
+	// TypeParameter is the id of the type parameter this type is, plus one
+	// (0: not a type parameter). The JVM spelling erases it to its bound.
+	TypeParameter int
+	// TypeParameterName is the type parameter's name when the metadata spells
+	// it by name (type_parameter_name) instead of by id.
+	TypeParameterName string
+	// ClassName is the classifier's class id, `kotlin/collections/MutableList`.
+	ClassName string
+	// Projection is this type's variance as a type argument: 0 in, 1 out,
+	// 2 invariant. Star marks a star projection, which has no type.
+	Projection int
+	Star       bool
 }
 
 type kotlinMetadataCallable struct {
@@ -26,15 +50,26 @@ type kotlinMetadataCallable struct {
 	Parameters []kotlinMetadataParameter
 	ReturnType kotlinMetadataType
 	Receiver   bool
-	Visibility string
+	// ReceiverType is the extension receiver's type.
+	ReceiverType kotlinMetadataType
+	// JVMDescriptor is the method descriptor the metadata records when it
+	// differs from the one the Kotlin signature implies.
+	JVMDescriptor string
+	Visibility    string
+	// TypeParameters maps a type parameter id to its name.
+	TypeParameters map[int]string
 }
 
 type kotlinBinaryMetadata struct {
 	Constructors []kotlinMetadataCallable
 	Functions    []kotlinMetadataCallable
-	Visibility   string
-	Schema       kotlinMetadataSchema
-	Valid        bool
+	Properties   []kotlinMetadataProperty
+	// ClassTypeParameters names the class's own type parameters by id; its
+	// members' types refer to them.
+	ClassTypeParameters map[int]string
+	Visibility          string
+	Schema              kotlinMetadataSchema
+	Valid               bool
 }
 
 type kotlinMetadataSchema struct {
@@ -53,20 +88,32 @@ func decodeKotlinBinaryMetadata(metadata *classfile.KotlinMetadata) kotlinBinary
 		return kotlinBinaryMetadata{}
 	}
 	message := data[prefix+int(nameTableSize):]
+	stringTable := resolveKotlinStringTable(data[prefix:prefix+int(nameTableSize)], metadata.Data2)
 	decoded := kotlinBinaryMetadata{Schema: schema, Valid: true}
 	valid := protobufFieldsStrict(message, func(number int, wire int, integer uint64, value []byte) {
 		switch {
 		case metadata.Kind == 1 && number == 1 && wire == 0:
 			decoded.Visibility = kotlinMetadataVisibility(integer)
+		case metadata.Kind == 1 && number == 5 && wire == 2:
+			if id, name, ok := decodeKotlinTypeParameter(value, stringTable); ok {
+				if decoded.ClassTypeParameters == nil {
+					decoded.ClassTypeParameters = make(map[int]string)
+				}
+				decoded.ClassTypeParameters[id] = name
+			}
 		case metadata.Kind == 1 && number == 8 && wire == 2:
-			callable, ok := decodeKotlinCallable(value, metadata.Data2, true)
+			callable, ok := decodeKotlinCallable(value, stringTable, true)
 			if !ok {
 				decoded.Valid = false
 			} else {
 				decoded.Constructors = append(decoded.Constructors, callable)
 			}
+		case metadata.Kind == 1 && number == 10 && wire == 2, (metadata.Kind == 2 || metadata.Kind == 5) && number == 4 && wire == 2:
+			if property, ok := decodeKotlinProperty(value, stringTable); ok {
+				decoded.Properties = append(decoded.Properties, property)
+			}
 		case metadata.Kind == 1 && number == 9 && wire == 2, (metadata.Kind == 2 || metadata.Kind == 5) && number == 3 && wire == 2:
-			callable, ok := decodeKotlinCallable(value, metadata.Data2, false)
+			callable, ok := decodeKotlinCallable(value, stringTable, false)
 			if !ok {
 				decoded.Valid = false
 			} else {
@@ -101,7 +148,7 @@ func kotlinMetadataSchemaFor(metadata *classfile.KotlinMetadata) (kotlinMetadata
 			return kotlinMetadataSchema{Major: major, Minor: minor}, true
 		}
 	case 2:
-		if minor >= 0 && minor <= 2 {
+		if minor >= 0 && minor <= 4 {
 			return kotlinMetadataSchema{Major: major, Minor: minor}, true
 		}
 	}
@@ -162,18 +209,33 @@ func decodeKotlinCallable(message []byte, stringsTable []string, constructor boo
 			callable.Name = kotlinMetadataString(stringsTable, integer)
 		case !constructor && number == 3 && wire == 2:
 			var valid bool
-			callable.ReturnType, valid = decodeKotlinMetadataType(value)
+			callable.ReturnType, valid = decodeKotlinMetadataTypeWithStrings(value, stringsTable)
 			semanticValid = semanticValid && valid
 		case constructor && number == 2 && wire == 2, !constructor && number == 6 && wire == 2:
 			parameter, ok := decodeKotlinMetadataParameter(value, stringsTable)
 			semanticValid = semanticValid && ok
 			callable.Parameters = append(callable.Parameters, parameter)
-		case !constructor && (number == 5 && wire == 2 || number == 8 && wire == 0):
+		case !constructor && number == 5 && wire == 2:
 			callable.Receiver = true
+			var valid bool
+			callable.ReceiverType, valid = decodeKotlinMetadataTypeWithStrings(value, stringsTable)
+			semanticValid = semanticValid && valid
+		case !constructor && number == 8 && wire == 0:
+			callable.Receiver = true
+		case !constructor && number == 4 && wire == 2:
+			if id, name, ok := decodeKotlinTypeParameter(value, stringsTable); ok {
+				if callable.TypeParameters == nil {
+					callable.TypeParameters = make(map[int]string)
+				}
+				callable.TypeParameters[id] = name
+			}
 		case !constructor && number == 100 && wire == 2:
 			if !protobufFieldsStrict(value, func(field int, fieldWire int, fieldInteger uint64, _ []byte) {
 				if field == 1 && fieldWire == 0 {
 					callable.JVMName = kotlinMetadataString(stringsTable, fieldInteger)
+				}
+				if field == 2 && fieldWire == 0 {
+					callable.JVMDescriptor = kotlinMetadataString(stringsTable, fieldInteger)
 				}
 			}) {
 				semanticValid = false
@@ -187,6 +249,20 @@ func decodeKotlinCallable(message []byte, stringsTable []string, constructor boo
 	return callable, structuralValid && semanticValid
 }
 
+// decodeKotlinTypeParameter reads a TypeParameter message: id (1), name (2).
+func decodeKotlinTypeParameter(message []byte, stringsTable []string) (int, string, bool) {
+	id, name, hasID := 0, "", false
+	protobufFields(message, func(number int, wire int, integer uint64, _ []byte) {
+		switch {
+		case number == 1 && wire == 0:
+			id, hasID = int(integer), true
+		case number == 2 && wire == 0:
+			name = kotlinMetadataString(stringsTable, integer)
+		}
+	})
+	return id, name, hasID && name != ""
+}
+
 func decodeKotlinMetadataParameter(message []byte, stringsTable []string) (kotlinMetadataParameter, bool) {
 	parameter := kotlinMetadataParameter{}
 	semanticValid := true
@@ -198,19 +274,28 @@ func decodeKotlinMetadataParameter(message []byte, stringsTable []string) (kotli
 			parameter.Name = kotlinMetadataString(stringsTable, integer)
 		case number == 3 && wire == 2:
 			var typeValid bool
-			parameter.Type, typeValid = decodeKotlinMetadataType(value)
+			parameter.Type, typeValid = decodeKotlinMetadataTypeWithStrings(value, stringsTable)
 			semanticValid = semanticValid && typeValid
+		case number == 4 && wire == 2:
+			// vararg_element_type: `vararg moreInterfaces: KClass<*>`, an
+			// optional argument list rather than a required array.
+			parameter.Vararg = true
+			parameter.VarargElement, _ = decodeKotlinMetadataTypeWithStrings(value, stringsTable)
 		}
 	})
 	return parameter, valid && semanticValid && parameter.Name != ""
 }
 
 func decodeKotlinMetadataType(message []byte) (kotlinMetadataType, bool) {
-	work := 0
-	return decodeKotlinMetadataTypeAt(message, 0, &work)
+	return decodeKotlinMetadataTypeWithStrings(message, nil)
 }
 
-func decodeKotlinMetadataTypeAt(message []byte, depth int, work *int) (kotlinMetadataType, bool) {
+func decodeKotlinMetadataTypeWithStrings(message []byte, stringsTable []string) (kotlinMetadataType, bool) {
+	work := 0
+	return decodeKotlinMetadataTypeAt(message, 0, &work, stringsTable)
+}
+
+func decodeKotlinMetadataTypeAt(message []byte, depth int, work *int, stringsTable []string) (kotlinMetadataType, bool) {
 	if depth > 64 || *work >= 4096 {
 		return kotlinMetadataType{}, false
 	}
@@ -221,15 +306,36 @@ func decodeKotlinMetadataTypeAt(message []byte, depth int, work *int) (kotlinMet
 		switch {
 		case number == 3 && wire == 0:
 			typ.Nullable = integer != 0
+		case number == 1 && wire == 0:
+			// Type flags: bit 0 is SUSPEND.
+			typ.Suspend = integer&1 != 0
+		case number == 7 && wire == 0:
+			typ.TypeParameter = int(integer) + 1
+		case number == 9 && wire == 0:
+			typ.TypeParameterName = kotlinMetadataString(stringsTable, integer)
+		case number == 6 && wire == 0:
+			typ.ClassName = kotlinMetadataString(stringsTable, integer)
+		case number == 100 && wire == 2:
+			// JvmProtoBuf.typeAnnotation: an Annotation whose field 1 names
+			// the annotation class in the string table.
+			protobufFields(value, func(annotationField int, annotationWire int, annotationInteger uint64, _ []byte) {
+				if annotationField == 1 && annotationWire == 0 && strings.Contains(kotlinMetadataString(stringsTable, annotationInteger), "ExtensionFunctionType") {
+					typ.Extension = true
+				}
+			})
 		case number == 2 && wire == 2:
-			argument := kotlinMetadataType{}
-			argumentValid := protobufFieldsStrict(value, func(argumentField int, argumentWire int, _ uint64, argumentValue []byte) {
+			argument, projection := kotlinMetadataType{}, 2
+			argumentValid := protobufFieldsStrict(value, func(argumentField int, argumentWire int, argumentInteger uint64, argumentValue []byte) {
+				if argumentField == 1 && argumentWire == 0 {
+					projection = int(argumentInteger)
+				}
 				if argumentField == 2 && argumentWire == 2 {
 					var valid bool
-					argument, valid = decodeKotlinMetadataTypeAt(argumentValue, depth+1, work)
+					argument, valid = decodeKotlinMetadataTypeAt(argumentValue, depth+1, work, stringsTable)
 					semanticValid = semanticValid && valid
 				}
 			})
+			argument.Projection, argument.Star = projection, projection == 3
 			semanticValid = semanticValid && argumentValid
 			typ.Arguments = append(typ.Arguments, argument)
 		}
@@ -330,6 +436,12 @@ func applyKotlinBinaryMetadata(parsed *analysis.ParsedFile, class *classfile.Cla
 	if !supported {
 		return fmt.Errorf("unsupported Kotlin metadata schema %v", metadata.MetadataVersion)
 	}
+	// A synthetic class (a lambda, `$WhenMappings`, `$DefaultImpls`) and a
+	// multi-file facade carry no declarations: the first has no metadata
+	// message, the second only names its parts in d1. Neither is malformed.
+	if metadata.Kind == 3 || metadata.Kind == 4 {
+		return nil
+	}
 	decoded := decodeKotlinBinaryMetadata(metadata)
 	if !decoded.Valid {
 		// The bytecode declarations remain authoritative Java-visible symbols.
@@ -360,10 +472,13 @@ func applyKotlinBinaryMetadata(parsed *analysis.ParsedFile, class *classfile.Cla
 			}
 		}
 		for _, constructor := range decoded.Constructors {
-			applyKotlinCallableParameters(parsed.Symbols, ownerID, "", constructor, true)
+			applyKotlinCallableParameters(parsed.Symbols, ownerID, "", constructor, true, decoded.ClassTypeParameters)
 		}
 		for _, function := range decoded.Functions {
-			applyKotlinCallableParameters(parsed.Symbols, ownerID, function.Name, function, false)
+			applyKotlinCallableParameters(parsed.Symbols, ownerID, function.Name, function, false, decoded.ClassTypeParameters)
+		}
+		if ownerID != "" {
+			applyKotlinProperties(parsed, ownerID, ownerFQN, "", decoded.Properties, decoded.ClassTypeParameters)
 		}
 	}
 	if metadata.Kind != 2 && metadata.Kind != 5 {
@@ -380,11 +495,9 @@ func applyKotlinBinaryMetadata(parsed *analysis.ParsedFile, class *classfile.Cla
 			packageName = strings.ReplaceAll(class.InternalName[:slash], "/", ".")
 		}
 	}
+	claimed := make(map[string]bool)
 	for _, function := range decoded.Functions {
-		for _, original := range parsed.Symbols {
-			if original.ContainerID != ownerID || original.Name != kotlinMetadataJVMName(function) || !analysis.IsCallableKind(original.Kind) {
-				continue
-			}
+		for _, original := range kotlinMetadataJVMCandidates(parsed.Symbols, ownerID, function, claimed) {
 			receiverCount := 0
 			if function.Receiver {
 				receiverCount = 1
@@ -394,8 +507,13 @@ func applyKotlinBinaryMetadata(parsed *analysis.ParsedFile, class *classfile.Cla
 			if len(original.Parameters) != expected && !suspend {
 				continue
 			}
+			claimed[original.ID] = true
 			copy := original
 			copy.ID = original.ID + "#kotlin-top-level"
+			// The Kotlin name, not the @JvmName one: `maxBy` is compiled as
+			// maxByOrThrow, and completion offered the latter.
+			copy.Name = function.Name
+			copy.JVMName = original.Name
 			copy.OriginID = original.ID
 			copy.Language = analysis.LanguageKotlin
 			copy.InteropLanguage = analysis.LanguageKotlin
@@ -407,7 +525,7 @@ func applyKotlinBinaryMetadata(parsed *analysis.ParsedFile, class *classfile.Cla
 				copy.FQN = packageName + "." + function.Name
 			}
 			if function.Receiver {
-				copy.ReceiverType = kotlinizeBinaryType(original.Parameters[0].Type)
+				copy.ReceiverType = kotlinMetadataReceiverType(original.Parameters[0].Type, function, nil)
 				copy.Parameters = append([]analysis.Parameter(nil), original.Parameters[1:]...)
 			} else {
 				copy.Parameters = append([]analysis.Parameter(nil), original.Parameters...)
@@ -424,8 +542,8 @@ func applyKotlinBinaryMetadata(parsed *analysis.ParsedFile, class *classfile.Cla
 				copy.Parameters[parameter].Type = kotlinizeBinaryType(copy.Parameters[parameter].Type)
 			}
 			applyKotlinParameterMetadata(copy.Parameters, function.Parameters)
-			copy.Type = applyKotlinMetadataType(copy.Type, function.ReturnType)
-			applyKotlinParameterTypes(copy.Parameters, function.Parameters)
+			copy.Type = applyKotlinMetadataType(copy.Type, function.ReturnType, function.TypeParameters)
+			applyKotlinParameterTypes(copy.Parameters, function.Parameters, function.TypeParameters)
 			applyKotlinVisibility(&copy, function)
 			if function.Visibility == "internal" || function.Visibility == "private" {
 				break
@@ -435,13 +553,11 @@ func applyKotlinBinaryMetadata(parsed *analysis.ParsedFile, class *classfile.Cla
 			break
 		}
 	}
-	// Properties/type aliases require their actual metadata records. Bean-name
-	// reconstruction is intentionally not used as a substitute: arbitrary Java
-	// accessors are not proof of Kotlin source properties.
+	applyKotlinProperties(parsed, ownerID, "", packageName, decoded.Properties, nil)
 	return nil
 }
 
-func applyKotlinCallableParameters(symbols []analysis.Symbol, ownerID, name string, callable kotlinMetadataCallable, constructor bool) {
+func applyKotlinCallableParameters(symbols []analysis.Symbol, ownerID, name string, callable kotlinMetadataCallable, constructor bool, classTypeParameters map[int]string) {
 	for index := range symbols {
 		symbol := &symbols[index]
 		jvmName := name
@@ -461,7 +577,7 @@ func applyKotlinCallableParameters(symbols []analysis.Symbol, ownerID, name stri
 			continue
 		}
 		if callable.Receiver && len(symbol.Parameters) > 0 {
-			symbol.ReceiverType = kotlinizeBinaryType(symbol.Parameters[0].Type)
+			symbol.ReceiverType = kotlinMetadataReceiverType(symbol.Parameters[0].Type, callable, classTypeParameters)
 			symbol.Parameters = append([]analysis.Parameter(nil), symbol.Parameters[1:]...)
 		}
 		if suspend && len(symbol.Parameters) > 0 {
@@ -476,8 +592,8 @@ func applyKotlinCallableParameters(symbols []analysis.Symbol, ownerID, name stri
 			symbol.Parameters[parameter].Type = kotlinizeBinaryType(symbol.Parameters[parameter].Type)
 		}
 		applyKotlinParameterMetadata(symbol.Parameters, callable.Parameters)
-		symbol.Type = applyKotlinMetadataType(symbol.Type, callable.ReturnType)
-		applyKotlinParameterTypes(symbol.Parameters, callable.Parameters)
+		symbol.Type = applyKotlinMetadataType(symbol.Type, callable.ReturnType, callable.TypeParameters, classTypeParameters)
+		applyKotlinParameterTypes(symbol.Parameters, callable.Parameters, callable.TypeParameters, classTypeParameters)
 		applyKotlinVisibility(symbol, callable)
 		if callable.Visibility == "internal" {
 			symbol.InteropLanguage = analysis.LanguageJava
@@ -494,24 +610,91 @@ func kotlinMetadataJVMName(callable kotlinMetadataCallable) string {
 	return callable.Name
 }
 
-func applyKotlinParameterTypes(parameters []analysis.Parameter, metadata []kotlinMetadataParameter) {
+func applyKotlinParameterTypes(parameters []analysis.Parameter, metadata []kotlinMetadataParameter, names ...map[int]string) {
 	for index := range parameters {
 		if index >= len(metadata) {
 			break
 		}
-		parameters[index].Type = applyKotlinMetadataType(parameters[index].Type, metadata[index].Type)
+		if metadata[index].Vararg {
+			if element, ok := renderKotlinMetadataType(metadata[index].VarargElement, names...); ok {
+				parameters[index].Type = "vararg " + element
+			}
+			continue
+		}
+		parameters[index].Type = applyKotlinMetadataType(parameters[index].Type, metadata[index].Type, names...)
 	}
 }
 
-func applyKotlinMetadataType(value string, metadata kotlinMetadataType) string {
+func applyKotlinMetadataType(value string, metadata kotlinMetadataType, names ...map[int]string) string {
 	if !metadata.Present || value == "" {
 		return value
 	}
-	value = transformGenericTypeArguments(value, metadata.Arguments, applyKotlinMetadataType)
+	if rendered, ok := renderKotlinMetadataType(metadata, names...); ok {
+		return rendered
+	}
+	// The JVM erases a type parameter to its bound: `T?` reads as `Any?`.
+	if metadata.TypeParameterName != "" {
+		if metadata.Nullable {
+			return metadata.TypeParameterName + "?"
+		}
+		return metadata.TypeParameterName
+	}
+	if metadata.TypeParameter > 0 {
+		for _, table := range names {
+			if name := table[metadata.TypeParameter-1]; name != "" {
+				if metadata.Nullable {
+					return name + "?"
+				}
+				return name
+			}
+		}
+	}
+	value = transformGenericTypeArguments(value, metadata.Arguments, func(argument string, argumentMetadata kotlinMetadataType) string {
+		return applyKotlinMetadataType(argument, argumentMetadata, names...)
+	})
+	if function, ok := kotlinFunctionTypeFromBinary(value, metadata); ok {
+		if metadata.Nullable {
+			return "(" + function + ")?"
+		}
+		return function
+	}
 	if metadata.Nullable && !strings.HasSuffix(strings.TrimSpace(value), "?") {
 		value += "?"
 	}
 	return value
+}
+
+// kotlinFunctionTypeFromBinary spells a JVM function interface the way
+// Kotlin source does. `Function1<in T, Unit>` with @ExtensionFunctionType is
+// `T.() -> Unit` -- the receiver of `apply`'s block, without which nothing
+// inside `x.apply { }` resolved -- and a suspend function type drops its
+// trailing Continuation parameter for the result it carries.
+func kotlinFunctionTypeFromBinary(value string, metadata kotlinMetadataType) (string, bool) {
+	base, arguments := splitInstantiatedType(value)
+	simple := base[strings.LastIndexByte(base, '.')+1:]
+	if !strings.HasPrefix(simple, "Function") || len(arguments) == 0 || base != "kotlin.jvm.functions."+simple && base != "kotlin."+simple && base != simple {
+		return "", false
+	}
+	if _, err := strconv.Atoi(strings.TrimPrefix(simple, "Function")); err != nil {
+		return "", false
+	}
+	for index := range arguments {
+		arguments[index] = withoutVariance(arguments[index])
+	}
+	parameters, result := arguments[:len(arguments)-1], arguments[len(arguments)-1]
+	prefix := ""
+	if metadata.Suspend && len(parameters) > 0 {
+		if continuation, continuationArguments := splitInstantiatedType(parameters[len(parameters)-1]); strings.HasSuffix(continuation, "Continuation") && len(continuationArguments) == 1 {
+			result = withoutVariance(continuationArguments[0])
+			parameters = parameters[:len(parameters)-1]
+		}
+		prefix = "suspend "
+	}
+	receiver := ""
+	if metadata.Extension && len(parameters) > 0 {
+		receiver, parameters = parameters[0]+".", parameters[1:]
+	}
+	return prefix + receiver + "(" + strings.Join(parameters, ", ") + ") -> " + result, true
 }
 
 func applyKotlinVisibility(symbol *analysis.Symbol, callable kotlinMetadataCallable) {
@@ -634,6 +817,10 @@ func kotlinizeBinaryType(value string) string {
 		return value
 	}
 	value = strings.ReplaceAll(strings.ReplaceAll(value, "? extends ", "out "), "? super ", "in ")
+	// A bare JVM wildcard is Kotlin's star projection: `KClass<?>` is KClass<*>.
+	for replaced := bareWildcard.ReplaceAllString(value, "${1}*${2}"); replaced != value; replaced = bareWildcard.ReplaceAllString(value, "${1}*${2}") {
+		value = replaced
+	}
 	var result strings.Builder
 	for index := 0; index < len(value); {
 		if !isBinaryTypeTokenByte(value[index]) {
@@ -652,7 +839,33 @@ func kotlinizeBinaryType(value string) string {
 		result.WriteString(token)
 		index = end
 	}
-	return result.String()
+	return kotlinizeArrayTypes(result.String())
+}
+
+var bareWildcard = regexp.MustCompile(`([<,]\s*)\?(\s*[>,])`)
+
+var binaryArraySuffix = regexp.MustCompile(`([A-Za-z_$][\w.$]*(?:<[^<>\[\]]*>)?)\[\]`)
+
+var kotlinPrimitiveArrays = map[string]string{
+	"Int": "IntArray", "Long": "LongArray", "Short": "ShortArray", "Byte": "ByteArray",
+	"Char": "CharArray", "Boolean": "BooleanArray", "Float": "FloatArray", "Double": "DoubleArray",
+}
+
+// kotlinizeArrayTypes spells JVM array types the way Kotlin does: `T[]` is
+// Array<T>, `int[]` is IntArray. Without it an extension on `Array<out T>`
+// decoded from a class file has the receiver `T[]`, which no Kotlin type ever
+// matches, so none of the standard library's array extensions applied.
+func kotlinizeArrayTypes(value string) string {
+	for pass := 0; pass < 4 && strings.Contains(value, "[]"); pass++ {
+		value = binaryArraySuffix.ReplaceAllStringFunc(value, func(match string) string {
+			element := strings.TrimSuffix(match, "[]")
+			if primitive, ok := kotlinPrimitiveArrays[element]; ok {
+				return primitive
+			}
+			return "Array<" + element + ">"
+		})
+	}
+	return value
 }
 
 func isBinaryTypeTokenByte(value byte) bool {
@@ -697,7 +910,26 @@ func applyKotlinParameterMetadata(parameters []analysis.Parameter, metadata []ko
 		if metadata[index].HasDefault {
 			parameters[index].Default = "<default>"
 		}
+		if metadata[index].Vararg {
+			parameters[index].Variadic = true
+			parameters[index].Type = "vararg " + kotlinArrayElementType(parameters[index].Type)
+		}
 	}
+}
+
+// kotlinArrayElementType is the element type of an array spelling: `Array<out
+// KClass<*>>` holds KClass<*>, `IntArray` holds Int.
+func kotlinArrayElementType(value string) string {
+	value = strings.TrimSpace(value)
+	if base, arguments := splitInstantiatedType(value); (base == "Array" || base == "kotlin.Array") && len(arguments) == 1 {
+		return withoutVariance(arguments[0])
+	}
+	for element, array := range kotlinPrimitiveArrays {
+		if value == array || value == "kotlin."+array {
+			return element
+		}
+	}
+	return value
 }
 
 func kotlinBinarySignature(symbol analysis.Symbol) string {
@@ -734,4 +966,87 @@ func kotlinBinarySignature(symbol analysis.Symbol) string {
 		signature.WriteString(symbol.Type)
 	}
 	return signature.String()
+}
+
+// kotlinMetadataReceiverType is an extension's receiver as Kotlin declares it.
+// The JVM's first parameter erases it: `Result<T>.getOrThrow` took `Object`,
+// so it was offered on every value, and `MutableList<T>.sort` took
+// `java.util.List`, so it was offered on read-only lists.
+func kotlinMetadataReceiverType(jvmType string, callable kotlinMetadataCallable, classTypeParameters map[int]string) string {
+	if rendered, ok := renderKotlinMetadataType(callable.ReceiverType, callable.TypeParameters, classTypeParameters); ok {
+		return rendered
+	}
+	return kotlinizeBinaryType(jvmType)
+}
+
+// kotlinMetadataJVMCandidates lists the bytecode methods a metadata function
+// may describe, best first. Overloads share a JVM name and often an arity
+// (`sort` on IntArray and on MutableList), so the descriptor decides when the
+// metadata records one, and a method another function already claimed is
+// never reused.
+func kotlinMetadataJVMCandidates(symbols []analysis.Symbol, ownerID string, function kotlinMetadataCallable, claimed map[string]bool) []analysis.Symbol {
+	jvmName := kotlinMetadataJVMName(function)
+	var exact, rest []analysis.Symbol
+	for _, symbol := range symbols {
+		if symbol.ContainerID != ownerID || symbol.Name != jvmName || !analysis.IsCallableKind(symbol.Kind) || claimed[symbol.ID] {
+			continue
+		}
+		if function.JVMDescriptor != "" && symbol.JVMDescriptor != "" {
+			if symbol.JVMDescriptor == function.JVMDescriptor {
+				exact = append(exact, symbol)
+			}
+			continue
+		}
+		rest = append(rest, symbol)
+	}
+	if function.JVMDescriptor != "" && len(exact) > 0 {
+		return exact
+	}
+	return rest
+}
+
+// kotlinJavaCollectionViews are the Kotlin types a Java collection is seen as.
+// A Java `List` is the platform type `(Mutable)List`: Kotlin lets you call
+// both `add` and every `List` extension on it, which MutableList covers.
+var kotlinJavaCollectionViews = map[string]string{
+	"java.util.List": "MutableList", "java.util.Collection": "MutableCollection", "java.util.Set": "MutableSet",
+	"java.util.Map": "MutableMap", "java.lang.Iterable": "MutableIterable", "java.util.Iterator": "MutableIterator",
+	"java.util.ListIterator": "MutableListIterator", "java.util.Map.Entry": "MutableMap.MutableEntry",
+}
+
+// kotlinViewOfJavaType spells a type declared in Java the way Kotlin code
+// sees it: `java.lang.String` is kotlin.String, whose members and extensions
+// apply, rather than the Java class, whose `split(String)` returned an array
+// where Kotlin's returns a List.
+func kotlinViewOfJavaType(value string) string {
+	if !strings.Contains(value, "java.") && !strings.ContainsAny(value, "[") && !strings.Contains(value, "? ") && !kotlinHasJavaPrimitive(value) {
+		return value
+	}
+	var result strings.Builder
+	for index := 0; index < len(value); {
+		if !isBinaryTypeTokenByte(value[index]) {
+			result.WriteByte(value[index])
+			index++
+			continue
+		}
+		end := index + 1
+		for end < len(value) && isBinaryTypeTokenByte(value[end]) {
+			end++
+		}
+		token := value[index:end]
+		if view := kotlinJavaCollectionViews[token]; view != "" {
+			token = view
+		}
+		result.WriteString(token)
+		index = end
+	}
+	return kotlinizeBinaryType(result.String())
+}
+
+func kotlinHasJavaPrimitive(value string) bool {
+	switch value {
+	case "int", "long", "short", "byte", "char", "boolean", "float", "double", "void":
+		return true
+	}
+	return false
 }

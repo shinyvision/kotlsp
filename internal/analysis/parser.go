@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -236,6 +237,29 @@ func (s *SyntaxState) Close() {
 	s.mu.Unlock()
 }
 
+// SelectionSpans returns the byte spans of the syntax nodes containing the
+// offset, innermost first, without consecutive duplicates. It is what "expand
+// selection" walks outwards through.
+func (s *SyntaxState) SelectionSpans(offset int) [][2]int {
+	if s == nil || offset < 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tree == nil {
+		return nil
+	}
+	node := s.tree.RootNode().DescendantForByteRange(uint(offset), uint(offset))
+	var spans [][2]int
+	for ; node != nil; node = node.Parent() {
+		span := [2]int{int(node.StartByte()), int(node.EndByte())}
+		if len(spans) == 0 || spans[len(spans)-1] != span {
+			spans = append(spans, span)
+		}
+	}
+	return spans
+}
+
 func (s *SyntaxState) IncrementalParses() uint64 {
 	if s == nil {
 		return 0
@@ -363,7 +387,9 @@ func parseDocument(ctx context.Context, doc *textdoc.Document, state *SyntaxStat
 	// recovered tree supplies the semantic walk for this snapshot.
 	if language == LanguageKotlin && tree.RootNode().HasError() {
 		recovered := kotlinEmptyCollectionDefaultRecovery(parserSource)
+		recovered = kotlinTrailingTypeArgumentCommaRecovery(recovered)
 		recovered = kotlinBraceLineRecovery(recovered)
+		recovered = kotlinSuspendLambdaRecovery(recovered)
 		if !bytes.Equal(recovered, parserSource) {
 			if candidate := parseTreeContext(ctx, p, recovered, nil); candidate != nil {
 				if syntaxErrorScore(candidate.RootNode()) < syntaxErrorScore(tree.RootNode()) {
@@ -371,6 +397,47 @@ func parseDocument(ctx context.Context, doc *textdoc.Document, state *SyntaxStat
 				} else {
 					candidate.Close()
 				}
+			}
+		}
+	}
+	// A source file (not a script) holds only declarations, so a top-level
+	// expression means the grammar took a declaration for one: stacked
+	// annotations before `sealed class T { ... }` or a bodiless `abstract class
+	// T` parse as an annotated infix expression, depending on what precedes
+	// them. No error node marks it; the class is simply missing, and every use
+	// of it reads as unresolved. The same span parsed on its own -- the rest of
+	// the file blanked, so every offset is unchanged -- is read correctly, and
+	// the walk takes its nodes in place of the misparse.
+	if language == LanguageKotlin && !isKotlinScriptURI(doc.URI) && len(doc.Text) < 256<<10 {
+		if spans := kotlinTopLevelExpressions(tree.RootNode()); len(spans) > 0 && len(spans) <= 64 {
+			for _, span := range spans {
+				isolated := isolateSourceSpan(parserSource, span)
+				candidate := parseTreeContext(ctx, p, isolated, nil)
+				if candidate == nil {
+					continue
+				}
+				nodes, declares := topLevelNodesWithin(candidate.RootNode(), span)
+				if !declares || candidate.RootNode().HasError() {
+					// Some spellings misparse even alone: `@Retention(...)
+					// annotation class Marker` on one line. Without its modifier
+					// keywords the declaration parses; modifiers reads them back
+					// from the real source.
+					candidate.Close()
+					candidate = parseTreeContext(ctx, p, blankDeclarationModifiers(isolated, span), nil)
+					if candidate == nil {
+						continue
+					}
+					nodes, declares = topLevelNodesWithin(candidate.RootNode(), span)
+					if !declares || candidate.RootNode().HasError() {
+						candidate.Close()
+						continue
+					}
+				}
+				if b.replacements == nil {
+					b.replacements = make(map[[2]uint][]*sitter.Node)
+				}
+				b.replacements[[2]uint{uint(span[0]), uint(span[1])}] = nodes
+				defer candidate.Close()
 			}
 		}
 	}
@@ -677,6 +744,168 @@ func kotlinCodeMask(source []byte) []bool {
 	return mask
 }
 
+// kotlinTrailingTypeArgumentCommaRecovery blanks a comma that directly precedes
+// the closing `>` of a type-argument list:
+//
+//	typealias Row = Record3<
+//	    UUID?,
+//	    String?,
+//	    >
+//
+// A trailing comma is legal there (Kotlin 1.4), but the bundled grammar only
+// accepts one in parameter and argument lists, and reported a syntax error on
+// code that compiles. The replacement keeps every offset.
+func kotlinTrailingTypeArgumentCommaRecovery(source []byte) []byte {
+	var recovered []byte
+	mask := kotlinCodeMask(source)
+	for index, isCode := range mask {
+		if !isCode || source[index] != ',' {
+			continue
+		}
+		next := index + 1
+		for next < len(source) && (source[next] == ' ' || source[next] == '\t' || source[next] == '\r' || source[next] == '\n') {
+			next++
+		}
+		if next < len(source) && source[next] == '>' && mask[next] && (index == 0 || source[index-1] != '-') {
+			if recovered == nil {
+				recovered = append([]byte(nil), source...)
+			}
+			recovered[index] = ' '
+		}
+	}
+	if recovered == nil {
+		return source
+	}
+	return recovered
+}
+
+// kotlinSuspendLambdaRecovery respells `suspend` where it calls the standard
+// library's suspend function with a lambda: `val fallback = suspend { ... }`.
+// The bundled grammar only knows `suspend` as a modifier, so it reported a
+// syntax error there and lost every declaration after it in the file. The
+// recovered spelling is an ordinary identifier of the same length; names are
+// read from the real source, so nothing downstream sees it.
+func kotlinSuspendLambdaRecovery(source []byte) []byte {
+	const word = "suspend"
+	var recovered []byte
+	mask := kotlinCodeMask(source)
+	for index := bytes.Index(source, []byte(word)); index >= 0; {
+		end := index + len(word)
+		boundaryBefore := index == 0 || !kotlinIdentifierByte(source[index-1])
+		boundaryAfter := end >= len(source) || !kotlinIdentifierByte(source[end])
+		next := end
+		for next < len(source) && (source[next] == ' ' || source[next] == '\t') {
+			next++
+		}
+		if mask[index] && boundaryBefore && boundaryAfter && next < len(source) && source[next] == '{' {
+			if recovered == nil {
+				recovered = append([]byte(nil), source...)
+			}
+			recovered[index] = 'S'
+		}
+		following := bytes.Index(source[end:], []byte(word))
+		if following < 0 {
+			break
+		}
+		index = end + following
+	}
+	if recovered == nil {
+		return source
+	}
+	return recovered
+}
+
+func kotlinIdentifierByte(value byte) bool {
+	return value == '_' || value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
+}
+
+func isKotlinScriptURI(uri protocol.URI) bool {
+	return strings.HasSuffix(strings.ToLower(string(uri)), ".kts")
+}
+
+// kotlinTopLevelExpressions lists the spans of expressions written directly in
+// a source file, which only a misparse produces.
+func kotlinTopLevelExpressions(root *sitter.Node) [][2]int {
+	if root == nil {
+		return nil
+	}
+	var spans [][2]int
+	for index := uint(0); index < root.NamedChildCount(); index++ {
+		child := root.NamedChild(index)
+		switch child.Kind() {
+		case "annotated_expression", "infix_expression", "call_expression", "navigation_expression", "identifier", "simple_identifier":
+			spans = append(spans, [2]int{int(child.StartByte()), int(child.EndByte())})
+		}
+	}
+	return spans
+}
+
+// isolateSourceSpan blanks everything outside span except line breaks, so the
+// span parses on its own at its real offsets.
+func isolateSourceSpan(source []byte, span [2]int) []byte {
+	isolated := make([]byte, len(source))
+	for index, value := range source {
+		if index >= span[0] && index < span[1] || value == '\n' || value == '\r' {
+			isolated[index] = value
+		} else {
+			isolated[index] = ' '
+		}
+	}
+	return isolated
+}
+
+// blankDeclarationModifiers blanks the modifier keywords written directly
+// before a declaration keyword inside span, keeping every offset.
+func blankDeclarationModifiers(source []byte, span [2]int) []byte {
+	declarationKeywords := map[string]bool{"class": true, "interface": true, "object": true, "fun": true, "val": true, "var": true, "typealias": true}
+	out := append([]byte(nil), source...)
+	mask := kotlinCodeMask(source)
+	type word struct{ start, end int }
+	var words []word
+	for index := span[0]; index < span[1] && index < len(source); {
+		if !mask[index] || !kotlinIdentifierByte(source[index]) || index > 0 && (kotlinIdentifierByte(source[index-1]) || source[index-1] == '@' || source[index-1] == '.') {
+			index++
+			continue
+		}
+		end := index
+		for end < len(source) && kotlinIdentifierByte(source[end]) {
+			end++
+		}
+		words = append(words, word{index, end})
+		index = end
+	}
+	for index, current := range words {
+		if !declarationKeywords[string(source[current.start:current.end])] {
+			continue
+		}
+		for back := index - 1; back >= 0 && kotlinModifierKeywords[string(source[words[back].start:words[back].end])] && string(source[words[back].start:words[back].end]) != "fun"; back-- {
+			for offset := words[back].start; offset < words[back].end; offset++ {
+				out[offset] = ' '
+			}
+		}
+	}
+	return out
+}
+
+// topLevelNodesWithin returns root's children inside span, and whether any of
+// them is a declaration.
+func topLevelNodesWithin(root *sitter.Node, span [2]int) ([]*sitter.Node, bool) {
+	var nodes []*sitter.Node
+	declares := false
+	for index := uint(0); index < root.NamedChildCount(); index++ {
+		child := root.NamedChild(index)
+		if int(child.StartByte()) < span[0] || int(child.EndByte()) > span[1] {
+			continue
+		}
+		nodes = append(nodes, child)
+		switch child.Kind() {
+		case "class_declaration", "object_declaration", "function_declaration", "property_declaration", "type_alias":
+			declares = true
+		}
+	}
+	return nodes, declares
+}
+
 func kotlinBraceLineRecovery(source []byte) []byte {
 	recovered := append([]byte(nil), source...)
 	mask := kotlinCodeMask(source)
@@ -750,16 +979,22 @@ func kotlinEmptyCollectionDefaultRecovery(source []byte) []byte {
 }
 
 type parseBuilder struct {
-	ctx               context.Context
-	doc               *textdoc.Document
-	parsed            *ParsedFile
-	source            []byte
-	declarations      map[string]declarationSpec
-	keywords          map[string]bool
-	fieldIDs          map[string]uint16
-	syntax            *syntaxSnapshot
-	container         []int
-	selectionBytes    map[[2]int]bool
+	ctx    context.Context
+	doc    *textdoc.Document
+	parsed *ParsedFile
+	// replacements maps a misparsed top-level span to the nodes of the same
+	// span parsed in isolation (see kotlinTopLevelExpressions).
+	replacements   map[[2]uint][]*sitter.Node
+	source         []byte
+	declarations   map[string]declarationSpec
+	keywords       map[string]bool
+	fieldIDs       map[string]uint16
+	syntax         *syntaxSnapshot
+	container      []int
+	selectionBytes map[[2]int]bool
+	// genericCallSpans are the `<` comparisons recovered as type argument
+	// lists of `name<Type> { }` calls.
+	genericCallSpans  map[[2]int]bool
 	lexicalOccupied   []Token
 	lexicalTokens     []Token
 	ancestorNodes     []*sitter.Node
@@ -803,13 +1038,6 @@ func (b *parseBuilder) nodeIsMissing(node *sitter.Node) bool {
 		return record.flags&2 != 0
 	}
 	return node != nil && node.IsMissing()
-}
-
-func (b *parseBuilder) nodeHasError(node *sitter.Node) bool {
-	if record, _ := b.syntax.record(node); record != nil {
-		return record.flags&4 != 0
-	}
-	return node != nil && node.HasError()
 }
 
 func (b *parseBuilder) nodeParent(node *sitter.Node) *sitter.Node {
@@ -898,6 +1126,17 @@ func (b *parseBuilder) firstIdentifier(node *sitter.Node) *sitter.Node {
 }
 
 func (b *parseBuilder) walk(n *sitter.Node, parentKind string) {
+	if b.replacements != nil {
+		key := [2]uint{n.StartByte(), n.EndByte()}
+		if nodes, ok := b.replacements[key]; ok {
+			// Consumed once: a replacement can span exactly what it replaces.
+			delete(b.replacements, key)
+			for _, node := range nodes {
+				b.walk(node, parentKind)
+			}
+			return
+		}
+	}
 	if n == nil || b.ctx != nil && b.ctx.Err() != nil {
 		return
 	}
@@ -999,15 +1238,38 @@ func (b *parseBuilder) walk(n *sitter.Node, parentKind string) {
 	}
 
 	if isIdentifierKind(kind) && !b.selectionBytes[[2]int{startByte, endByte}] && !inPackageOrImport(parentKind) && !containsPackageOrImportAncestor(b.ancestorKinds) {
-		name := nodeText(b.source, n)
-		if name != "" && !b.keywords[name] {
+		// ``when`(mock)`` calls the JVM method named `when`: the quotes are
+		// syntax, so the reference must carry the same unquoted name as the
+		// declaration it binds to. A quoted name is never a keyword occurrence,
+		// which is the whole reason the author quoted it.
+		raw := nodeText(b.source, n)
+		quoted := len(raw) >= 2 && strings.HasPrefix(raw, "`") && strings.HasSuffix(raw, "`")
+		name := strings.Trim(raw, "`")
+		if name != "" && (quoted || !b.keywords[name]) {
 			role := roleForAncestors(parentKind, b.ancestorKinds)
+			switch {
+			case isAssignmentWriteTarget(n):
+				// `account.email = value` writes `email`, which the parent kind
+				// alone cannot see: the name sits under a navigation suffix.
+				role = RoleWrite
+			case role == RoleWrite:
+				role = RoleRead
+			}
 			if b.isCallCallee(n) {
 				role = RoleCall
 			}
 			ref := Reference{Name: name, Qualifier: b.qualifier(n), URI: b.doc.URI, Range: b.doc.Range(startByte, endByte), StartByte: startByte, EndByte: endByte, ContainerID: b.currentContainerID(), Role: role, Arity: -1, ArgumentLabel: b.isNamedArgumentLabel(n, parentKind)}
 			ref.ContextualBranch = role == RoleRead && ref.Qualifier == "" && b.isContextualBranchReference(n)
-			if role == RoleCall {
+			if left, right, ok := b.infixOperands(n, parentKind); ok {
+				// `a returns b` calls the infix function `returns` on `a` with
+				// the single argument `b`. Read as a bare name it looked up a
+				// local `returns`, found none, and was reported unresolved.
+				ref.Role, ref.Qualifier, ref.Arity = RoleCall, strings.TrimSpace(nodeText(b.source, left)), 1
+				start, end := b.nodeSpan(right)
+				ref.Arguments = []protocol.Range{b.doc.Range(start, end)}
+				ref.ContextualBranch = false
+				role = RoleCall
+			} else if role == RoleCall {
 				if arguments, ok := b.callArguments(n); ok {
 					ref.Arguments = arguments
 					ref.Arity = len(arguments)
@@ -1297,13 +1559,25 @@ func (b *parseBuilder) addDeclarations(n *sitter.Node, spec declarationSpec, par
 				_ = cs
 			}
 		case "companion_object":
-			// Anonymous companion objects still need a stable container symbol so
-			// their members resolve to Outer.Companion rather than leaking into
-			// the outer class.
+			// `companion object Key` is named Key -- `Ctx.Key`, and plain `Key`
+			// inside the class header. Anonymous companion objects still need
+			// a stable container symbol so their members resolve to
+			// Outer.Companion rather than leaking into the outer class.
+			if named := b.fieldNode(n, "name"); named != nil {
+				nameNodes = append(nameNodes, named)
+				break
+			}
 			fake := *n
 			nameNodes = append(nameNodes, &fake)
 		case "class_parameter", "parameter", "type_parameter", "catch_block":
-			if identifier := b.firstIdentifier(n); identifier != nil {
+			// The name is a direct child; an annotation on the parameter
+			// (`catch (@Suppress("X") e: Exception)`) holds identifiers of its
+			// own that come first.
+			identifier := b.firstDirectIdentifier(n)
+			if identifier == nil {
+				identifier = b.firstIdentifier(n)
+			}
+			if identifier != nil {
 				nameNodes = append(nameNodes, identifier)
 			}
 		case "type_pattern", "record_pattern_component":
@@ -1346,8 +1620,20 @@ func (b *parseBuilder) addDeclarations(n *sitter.Node, spec declarationSpec, par
 		if anonymousCompanion {
 			name = "Companion"
 		}
+		// A backticked Kotlin name is a single identifier whose quotes are not
+		// part of it, and inside them a space is an ordinary character:
+		// ``fun `sends one mail`()`` declares a method named "sends one mail".
+		// Rejecting such a name left the declaration out of the index entirely,
+		// and the walk then emitted the declaration's own name as a reference
+		// that could never resolve. Only a quote or a line break is impossible
+		// inside one.
+		quotedName := len(name) >= 2 && strings.HasPrefix(name, "`") && strings.HasSuffix(name, "`")
 		name = strings.Trim(name, "`")
-		if name == "" || strings.ContainsAny(name, " \t\r\n=,:(){}") {
+		if quotedName {
+			if name == "" || strings.ContainsAny(name, "`\r\n") {
+				continue
+			}
+		} else if name == "" || strings.ContainsAny(name, " \t\r\n=,:(){}") {
 			continue
 		}
 		kind := spec.kind
@@ -1429,12 +1715,21 @@ func (b *parseBuilder) addDeclarations(n *sitter.Node, spec declarationSpec, par
 		// bound with val or var matters just as much: assigning to a val is an
 		// error the index can prove without a compiler.
 		if kind == KindProperty || kind == KindVariable {
-			if keyword := kotlinBindingKeyword(n); keyword != "" {
+			keyword := kotlinBindingKeyword(n)
+			if parent := b.nodeParent(n); keyword == "" && parent != nil && b.nodeKind(parent) == "when_subject" {
+				// `when (val r = scope())`: the keyword belongs to the subject.
+				keyword = kotlinBindingKeyword(parent)
+			}
+			if keyword != "" {
 				s.Modifiers = append(s.Modifiers, keyword)
 			}
 		}
 		if nodeKind == "companion_object" {
 			s.Modifiers = append(s.Modifiers, "companion")
+		}
+		if nodeKind == "primary_constructor" {
+			// The class header itself, which an outline does not list again.
+			s.Modifiers = append(s.Modifiers, "primary-constructor")
 		}
 		s.Deprecated = contains(s.Modifiers, "deprecated") || contains(s.Modifiers, "Deprecated")
 		s.ReceiverType = b.receiverType(n, actualName)
@@ -1531,79 +1826,79 @@ func kotlinDeclarationPrefixHasModifier(source []byte, start int, modifier strin
 	if start <= 0 || start > len(source) {
 		return false
 	}
-	found := false
-	for offset := 0; offset < start; {
-		switch {
-		case source[offset] == '/' && offset+1 < start && source[offset+1] == '/':
-			offset += 2
-			for offset < start && source[offset] != '\n' {
-				offset++
+	// Read backwards over what may stand directly before a declaration --
+	// whitespace, comments, annotations and modifier keywords -- and stop at
+	// anything else. Scanning the file from its start instead let earlier code
+	// decide: a property named `data` made the next class a data class, and
+	// an import of `jackson.annotation.*` made it an annotation class.
+	cursor := start
+	for steps := 0; cursor > 0 && steps < 256; steps++ {
+		for cursor > 0 && isSpaceByte(source[cursor-1]) {
+			cursor--
+		}
+		if cursor == 0 {
+			return false
+		}
+		switch value := source[cursor-1]; {
+		case value == '/' && cursor >= 2 && source[cursor-2] == '*':
+			open := bytes.LastIndex(source[:cursor-2], []byte("/*"))
+			if open < 0 {
+				return false
 			}
+			cursor = open
 			continue
-		case source[offset] == '/' && offset+1 < start && source[offset+1] == '*':
-			offset += 2
-			depth := 1
-			for offset < start && depth > 0 {
-				if offset+1 < start && source[offset] == '/' && source[offset+1] == '*' {
+		case value == ')':
+			// An annotation's arguments: skip to the matching parenthesis and
+			// require the annotation name before it.
+			depth := 0
+			for cursor > 0 {
+				cursor--
+				if source[cursor] == ')' {
 					depth++
-					offset += 2
-				} else if offset+1 < start && source[offset] == '*' && source[offset+1] == '/' {
+				} else if source[cursor] == '(' {
 					depth--
-					offset += 2
-				} else {
-					offset++
+					if depth == 0 {
+						break
+					}
 				}
 			}
+			end := cursor
+			for cursor > 0 && (kotlinIdentifierByte(source[cursor-1]) || source[cursor-1] == '.' || source[cursor-1] == ':') {
+				cursor--
+			}
+			if cursor == end || cursor == 0 || source[cursor-1] != '@' {
+				return false
+			}
+			cursor--
 			continue
-		case source[offset] == '"' || source[offset] == '\'':
-			quote := source[offset]
-			triple := quote == '"' && offset+2 < start && source[offset+1] == '"' && source[offset+2] == '"'
-			if triple {
-				offset += 3
-				for offset+2 < start && !(source[offset] == '"' && source[offset+1] == '"' && source[offset+2] == '"') {
-					offset++
-				}
-				offset += 3
+		case kotlinIdentifierByte(value):
+			end := cursor
+			for cursor > 0 && (kotlinIdentifierByte(source[cursor-1]) || source[cursor-1] == '.' || source[cursor-1] == ':') {
+				cursor--
+			}
+			if cursor > 0 && source[cursor-1] == '@' {
+				cursor--
 				continue
 			}
-			offset++
-			for offset < start {
-				if source[offset] == '\\' {
-					offset += 2
-					continue
-				}
-				value := source[offset]
-				offset++
-				if value == quote {
-					break
-				}
-			}
-			continue
-		case source[offset] == '{' || source[offset] == '}' || source[offset] == ';':
-			found = false
-			offset++
-			continue
-		}
-		if source[offset] == '_' || source[offset] >= 'A' && source[offset] <= 'Z' || source[offset] >= 'a' && source[offset] <= 'z' {
-			end := offset + 1
-			for end < start && (source[end] == '_' || source[end] >= 'A' && source[end] <= 'Z' || source[end] >= 'a' && source[end] <= 'z' || source[end] >= '0' && source[end] <= '9') {
-				end++
-			}
-			word := string(source[offset:end])
+			word := string(source[cursor:end])
 			if word == modifier {
-				found = true
-			} else {
-				switch word {
-				case "class", "interface", "object", "fun", "val", "var", "typealias":
-					found = false
-				}
+				return true
 			}
-			offset = end
+			if !kotlinModifierKeywords[word] {
+				return false
+			}
 			continue
 		}
-		offset++
+		return false
 	}
-	return found
+	return false
+}
+
+var kotlinModifierKeywords = map[string]bool{
+	"abstract": true, "sealed": true, "open": true, "data": true, "enum": true, "annotation": true, "inner": true, "value": true,
+	"private": true, "internal": true, "public": true, "protected": true, "final": true, "expect": true, "actual": true,
+	"inline": true, "suspend": true, "const": true, "lateinit": true, "override": true, "operator": true, "infix": true,
+	"tailrec": true, "external": true, "fun": true,
 }
 
 // declarationScope records enough lexical structure for shadowing resolution
@@ -1623,6 +1918,21 @@ func (b *parseBuilder) declarationScope(node *sitter.Node, kind SymbolKind, star
 	}
 	if kind != KindVariable && kind != KindProperty && kind != KindParameter && kind != KindTypeParameter {
 		return start, end
+	}
+	if kind == KindParameter && b.nodeKind(node) == "class_parameter" {
+		// A primary-constructor parameter that declares no property is visible
+		// from its declaration through the supertype list (`: Base(param)`);
+		// the property initializers and init blocks it is also visible in are
+		// recorded as additional scopes, so member functions do not see it.
+		if class := b.enclosingNodeOfKind(node, "class_declaration"); class != nil {
+			scopeEnd := int(class.EndByte())
+			for _, child := range b.namedChildren(class) {
+				if kind := b.nodeKind(child); kind == "class_body" || kind == "enum_class_body" {
+					scopeEnd = int(child.StartByte())
+				}
+			}
+			return end, scopeEnd
+		}
 	}
 	if b.nodeKind(node) == "type_pattern" || b.nodeKind(node) == "instanceof_expression" || b.nodeKind(node) == "record_pattern_component" {
 		for current := b.nodeParent(node); current != nil; current = b.nodeParent(current) {
@@ -1700,6 +2010,16 @@ func (b *parseBuilder) declarationScope(node *sitter.Node, kind SymbolKind, star
 	return start, end
 }
 
+// enclosingNodeOfKind returns the nearest ancestor of node with the given kind.
+func (b *parseBuilder) enclosingNodeOfKind(node *sitter.Node, kind string) *sitter.Node {
+	for current := b.nodeParent(node); current != nil; current = b.nodeParent(current) {
+		if b.nodeKind(current) == kind {
+			return current
+		}
+	}
+	return nil
+}
+
 func javaNegatedPatternGuard(source []byte, statement, consequence *sitter.Node) bool {
 	if statement == nil || consequence == nil {
 		return false
@@ -1720,6 +2040,26 @@ func javaNegatedPatternGuard(source []byte, statement, consequence *sitter.Node)
 }
 
 func (b *parseBuilder) additionalDeclarationScopes(node *sitter.Node, kind SymbolKind) []ByteScope {
+	if b.parsed.Language == LanguageKotlin && kind == KindParameter && b.nodeKind(node) == "class_parameter" {
+		class := b.enclosingNodeOfKind(node, "class_declaration")
+		if class == nil {
+			return nil
+		}
+		var scopes []ByteScope
+		for _, child := range b.namedChildren(class) {
+			if kind := b.nodeKind(child); kind != "class_body" && kind != "enum_class_body" {
+				continue
+			}
+			for _, member := range b.namedChildren(child) {
+				switch b.nodeKind(member) {
+				case "property_declaration", "anonymous_initializer", "enum_entry":
+					memberStart, memberEnd := b.nodeSpan(member)
+					scopes = append(scopes, ByteScope{StartByte: memberStart, EndByte: memberEnd})
+				}
+			}
+		}
+		return scopes
+	}
 	if b.parsed.Language != LanguageJava || kind != KindVariable || b.nodeKind(node) != "type_pattern" && b.nodeKind(node) != "instanceof_expression" && b.nodeKind(node) != "record_pattern_component" {
 		return nil
 	}
@@ -1826,10 +2166,39 @@ func (b *parseBuilder) receiverType(n, name *sitter.Node) string {
 			head = strings.TrimSpace(head[close+1:])
 		}
 	}
-	if strings.ContainsAny(head, " \t\r\n={}") {
-		return ""
+	// A space or an `=` ends a receiver, but not one inside its type arguments:
+	// `Array<out T>` and `Map<String, Int>` are receivers.
+	depth := 0
+	for index := 0; index < len(head); index++ {
+		switch head[index] {
+		case '<':
+			depth++
+		case '>':
+			if depth > 0 {
+				depth--
+			}
+		case ' ', '\t', '\r', '\n':
+			if depth == 0 {
+				return ""
+			}
+		case '=', '{', '}':
+			return ""
+		}
 	}
 	return normalizeSpace(head)
+}
+
+// unquoteImportSegments removes the backticks Kotlin allows around any single
+// segment of an import path, leaving the names the index actually holds.
+func unquoteImportSegments(path string) string {
+	if !strings.Contains(path, "`") {
+		return path
+	}
+	segments := strings.Split(path, ".")
+	for index, segment := range segments {
+		segments[index] = strings.Trim(segment, "`")
+	}
+	return strings.Join(segments, ".")
 }
 
 func (b *parseBuilder) addImport(n *sitter.Node) {
@@ -1845,6 +2214,12 @@ func (b *parseBuilder) addImport(n *sitter.Node) {
 	}
 	wild := strings.HasSuffix(text, ".*")
 	text = strings.TrimSuffix(text, ".*")
+	// ``import org.mockito.Mockito.`when` `` imports the member named `when`:
+	// the quotes are syntax around one segment, not part of the name. Keeping
+	// them made the import match nothing, so every use of that member was
+	// reported as an undefined name.
+	text = unquoteImportSegments(text)
+	alias = strings.Trim(alias, "`")
 	b.parsed.Imports = append(b.parsed.Imports, Import{Path: text, Alias: alias, Wildcard: wild, Static: static, Range: b.doc.Range(int(n.StartByte()), int(n.EndByte()))})
 
 	// The generic walker intentionally skips package/import subtrees. Add the
@@ -1883,10 +2258,27 @@ func (b *parseBuilder) addImport(n *sitter.Node) {
 
 func (b *parseBuilder) modifiers(children []*sitter.Node) []string {
 	var out []string
-	for _, c := range children {
+	for index, c := range children {
+		if c.Kind() == "modifiers" && index+1 < len(children) {
+			// A recovered tree may have parsed with the modifier keywords
+			// blanked (blankDeclarationModifiers); the real source between the
+			// modifier list and the next child still holds them.
+			if gapStart, gapEnd := int(c.EndByte()), int(children[index+1].StartByte()); gapStart < gapEnd && gapEnd <= len(b.source) {
+				for _, w := range strings.FieldsFunc(withoutComments(string(b.source[gapStart:gapEnd])), func(r rune) bool { return !(unicode.IsLetter(r) || r == '_') }) {
+					if kotlinModifierKeywords[w] && w != "fun" {
+						out = append(out, w)
+					}
+				}
+			}
+		}
 		if c.Kind() == "modifiers" {
-			text := nodeText(b.source, c)
-			words := strings.FieldsFunc(text, func(r rune) bool { return !(unicode.IsLetter(r) || r == '_') })
+			// `@Suppress("X") // one small private mapper`: a comment's words
+			// are not modifiers either.
+			text := withoutComments(nodeText(b.source, c))
+			// Annotation arguments are not modifiers: `@JsonTypeInfo(property =
+			// "type")` and `value = X::class` name keywords that are no part of
+			// the declaration's own modifiers.
+			words := strings.FieldsFunc(withoutBracketedText(text), func(r rune) bool { return !(unicode.IsLetter(r) || r == '_') })
 			for _, w := range words {
 				if b.keywords[w] || w == "Deprecated" || w == "JvmStatic" || w == "JvmSynthetic" || w == "JvmOverloads" || w == "JvmField" || w == "JvmName" {
 					out = append(out, w)
@@ -1896,6 +2288,65 @@ func (b *parseBuilder) modifiers(children []*sitter.Node) []string {
 		}
 	}
 	return unique(out)
+}
+
+// withoutComments blanks line and block comments, keeping every offset.
+func withoutComments(text string) string {
+	if !strings.Contains(text, "/") {
+		return text
+	}
+	out := []byte(text)
+	for index := 0; index+1 < len(out); index++ {
+		switch {
+		case out[index] == '"':
+			for index++; index < len(out) && out[index] != '"' && out[index] != '\n'; index++ {
+				if out[index] == '\\' {
+					index++
+				}
+			}
+		case out[index] == '/' && out[index+1] == '/':
+			for index < len(out) && out[index] != '\n' {
+				out[index] = ' '
+				index++
+			}
+		case out[index] == '/' && out[index+1] == '*':
+			for index < len(out) && !(out[index] == '*' && index+1 < len(out) && out[index+1] == '/') {
+				if out[index] != '\n' {
+					out[index] = ' '
+				}
+				index++
+			}
+			if index+1 < len(out) {
+				out[index], out[index+1] = ' ', ' '
+				index++
+			}
+		}
+	}
+	return string(out)
+}
+
+// withoutBracketedText blanks everything inside parentheses, so only the
+// words written at the top level of a modifier list remain.
+func withoutBracketedText(text string) string {
+	out := []byte(text)
+	depth := 0
+	for index, value := range out {
+		switch value {
+		case '(':
+			depth++
+			out[index] = ' '
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			out[index] = ' '
+		default:
+			if depth > 0 {
+				out[index] = ' '
+			}
+		}
+	}
+	return string(out)
 }
 
 func annotationSimpleNames(source string) []string {
@@ -1944,7 +2395,7 @@ func declarationModifiers(prefix string) []string {
 		"external": true, "expect": true, "actual": true,
 		"vararg": true, "crossinline": true, "noinline": true,
 	}
-	words := strings.FieldsFunc(prefix, func(r rune) bool { return !(unicode.IsLetter(r) || r == '_') })
+	words := strings.FieldsFunc(withoutBracketedText(withoutComments(prefix)), func(r rune) bool { return !(unicode.IsLetter(r) || r == '_') })
 	out := make([]string, 0, 4)
 	for _, word := range words {
 		if allowed[word] {
@@ -1966,7 +2417,11 @@ func (b *parseBuilder) typeFor(n, name *sitter.Node, children []*sitter.Node) st
 		return ""
 	}
 	if b.parsed.Language == LanguageKotlin && (n.Kind() == "function_declaration" || n.Kind() == "property_declaration") {
-		if explicit := b.kotlinExplicitResultType(n, name); explicit != "" {
+		explicit := b.kotlinExplicitResultType(n, name)
+		if explicit != "" || n.Kind() == "function_declaration" {
+			// A function without `: Type` declares none: a block body returns
+			// Unit and an expression body is inferred. The first type node in
+			// it is an extension receiver or a parameter, never the result.
 			return explicit
 		}
 	}
@@ -2099,6 +2554,11 @@ func (b *parseBuilder) parameters(n *sitter.Node, children []*sitter.Node) []Par
 	out := make([]Parameter, 0, len(nodes))
 	for parameterIndex, p := range nodes {
 		nn := b.fieldNode(p, "name")
+		if nn == nil {
+			// A direct child: `@GraphQLIgnore private val deletedAt` holds the
+			// annotation's identifiers before the parameter's own name.
+			nn = b.firstDirectIdentifier(p)
+		}
 		if nn == nil {
 			nn = firstIdentifier(p)
 		}
@@ -2471,6 +2931,14 @@ func (b *parseBuilder) qualifier(n *sitter.Node) string {
 		if recv := b.fieldNode(p, "receiver"); recv != nil && recv.EndByte() <= n.StartByte() {
 			return strings.TrimSpace(nodeText(b.source, recv))
 		}
+		// tree-sitter-kotlin names no receiver field: the receiver is the
+		// first child. The lexical fallback stops at a line break, so
+		// `.firstOrNull { }` continued on the next line had no qualifier.
+		if p.Kind() == "navigation_expression" {
+			if children := b.namedChildren(p); len(children) > 0 && children[0].EndByte() <= n.StartByte() {
+				return strings.TrimSpace(nodeText(b.source, children[0]))
+			}
+		}
 	}
 	return lexicalQualifier(b.source, int(n.StartByte()))
 }
@@ -2809,6 +3277,14 @@ func (b *parseBuilder) addKotlinBinaryConventionReference(node *sitter.Node) {
 	left := node.ChildByFieldName("left")
 	right := node.ChildByFieldName("right")
 	if operator == nil || left == nil || right == nil {
+		return
+	}
+	if b.addKotlinGenericTrailingLambdaCall(node, left, operator, right) {
+		return
+	}
+	// The `<` of a recovered `name<Type> { }` call (see below) is no
+	// comparison either.
+	if b.genericCallSpans[[2]int{int(node.StartByte()), int(node.EndByte())}] {
 		return
 	}
 	name := map[string]string{
@@ -3281,20 +3757,30 @@ func (b *parseBuilder) addKotlinWhenSmartCasts(node *sitter.Node) {
 			break
 		}
 	}
-	identifier := b.firstIdentifier(subject)
-	if identifier == nil {
+	if subject == nil {
 		return
 	}
-	name := strings.Trim(strings.TrimSpace(nodeText(b.source, identifier)), "`")
-	if name == "" {
-		return
-	}
-	// Only a stable simple name can be refined. A subject such as `obj.value`
-	// must not accidentally refine `obj` merely because it is the first token.
 	subjectText := strings.TrimSpace(nodeText(b.source, subject))
 	subjectText = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(subjectText, "("), ")"))
-	if subjectText != name && !strings.HasPrefix(subjectText, "val "+name+" =") {
-		return
+	name := ""
+	if subjectText == "this" {
+		// `when (this) { is A -> member }` refines the implicit receiver: A's
+		// members are bare names in that branch. Recorded under "this".
+		name = "this"
+	} else {
+		identifier := b.firstIdentifier(subject)
+		if identifier == nil {
+			return
+		}
+		name = strings.Trim(strings.TrimSpace(nodeText(b.source, identifier)), "`")
+		if name == "" {
+			return
+		}
+		// Only a stable simple name can be refined. A subject such as
+		// `obj.value` must not refine `obj` merely because it is the first token.
+		if subjectText != name && !strings.HasPrefix(subjectText, "val "+name+" =") {
+			return
+		}
 	}
 	for _, entry := range b.namedChildren(node) {
 		if b.nodeKind(entry) != "when_entry" {
@@ -3351,21 +3837,6 @@ func (b *parseBuilder) enclosingKotlinBlockEnd() int {
 		}
 	}
 	return 0
-}
-
-func (b *parseBuilder) descendantOfKinds(node *sitter.Node, kinds map[string]bool, depth int) *sitter.Node {
-	if node == nil || depth < 0 {
-		return nil
-	}
-	for _, child := range b.namedChildren(node) {
-		if kinds[b.nodeKind(child)] {
-			return child
-		}
-		if found := b.descendantOfKinds(child, kinds, depth-1); found != nil {
-			return found
-		}
-	}
-	return nil
 }
 
 func (b *parseBuilder) addKotlinConventionReference(name, qualifier string, anchor *sitter.Node, arguments []*sitter.Node) {
@@ -3672,8 +4143,18 @@ func (b *parseBuilder) addLineFolds() {
 }
 
 func (b *parseBuilder) buildSemanticTokens() {
+	// Only a name written where it stands is coloured as that name. The
+	// implicit `it` is declared at its lambda's brace, and an operator's
+	// convention call (`!=` is `equals`, a call's `(` its `invoke`) is not
+	// spelled at all; those spans keep their lexical colour.
+	spelled := func(start, end int, name string) bool {
+		return start >= 0 && end <= len(b.source) && start < end && strings.Trim(string(b.source[start:end]), "`") == name
+	}
 	symbolTokens := make([]Token, 0, len(b.parsed.Symbols))
 	for _, s := range b.parsed.Symbols {
+		if !spelled(s.NameStartByte, s.NameEndByte, s.Name) {
+			continue
+		}
 		typ := semanticTypeForKind(s.Kind)
 		mods := SemanticModifierDeclaration
 		if contains(s.Modifiers, "static") || contains(s.Modifiers, "companion") {
@@ -3695,6 +4176,9 @@ func (b *parseBuilder) buildSemanticTokens() {
 	}
 	referenceTokens := make([]Token, 0, len(b.parsed.References))
 	for _, r := range b.parsed.References {
+		if !spelled(r.StartByte, r.EndByte, r.Name) {
+			continue
+		}
 		typ := uint32(8)
 		if r.Role == RoleType {
 			typ = 1
@@ -3867,11 +4351,50 @@ func roleFor(parent string) ReferenceRole {
 	switch parent {
 	case "user_type", "type_identifier", "generic_type", "superclass", "super_interfaces", "delegation_specifier":
 		return RoleType
-	case "assignment", "variable_declarator":
+	case "assignment", "assignment_expression", "variable_declarator":
 		return RoleWrite
 	default:
 		return RoleRead
 	}
+}
+
+// isAssignmentWriteTarget reports whether node is what an assignment writes to
+// rather than a value it reads. Both sides of an assignment are ordinary
+// children of the same node, so the parent kind alone marks `y` in `x = y` as a
+// write; the grammars name the target in the `left` (assignment) or `name`
+// (declarator) field, which is the only thing that distinguishes them.
+func isAssignmentWriteTarget(node *sitter.Node) bool {
+	if node == nil {
+		return false
+	}
+	// A member assignment writes the last name of its target expression:
+	// `account.email = x` writes `email` and reads `account`.
+	target := node
+	for parent := target.Parent(); parent != nil; parent = target.Parent() {
+		switch parent.Kind() {
+		case "navigation_expression", "navigation_suffix", "field_access", "scoped_identifier", "parenthesized_expression":
+			if parent.EndByte() != target.EndByte() {
+				return false
+			}
+			target = parent
+			continue
+		}
+		break
+	}
+	parent := target.Parent()
+	if parent == nil {
+		return false
+	}
+	var field *sitter.Node
+	switch parent.Kind() {
+	case "assignment", "assignment_expression":
+		field = parent.ChildByFieldName("left")
+	case "variable_declarator":
+		field = parent.ChildByFieldName("name")
+	default:
+		return false
+	}
+	return field != nil && field.StartByte() == target.StartByte() && field.EndByte() == target.EndByte()
 }
 
 func roleForAncestors(parent string, ancestors []string) ReferenceRole {
@@ -3936,36 +4459,6 @@ func kotlinClassKind(src []byte, n *sitter.Node) SymbolKind {
 		return KindClass
 	}
 }
-func extractTypeNames(src []byte, n *sitter.Node) []string {
-	var out []string
-	stack := []*sitter.Node{n}
-	for visited := 0; len(stack) > 0 && visited < 100_000; visited++ {
-		x := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if x == nil {
-			continue
-		}
-		if x.Kind() == "user_type" || x.Kind() == "type_identifier" || x.Kind() == "scoped_type_identifier" {
-			v := normalizeSpace(nodeText(src, x))
-			if i := strings.IndexByte(v, '('); i >= 0 {
-				v = v[:i]
-			}
-			if i := strings.IndexByte(v, '<'); i >= 0 {
-				v = v[:i]
-			}
-			out = append(out, strings.TrimSpace(v))
-			continue
-		}
-		count := x.NamedChildCount()
-		if uint(len(stack))+count > 100_000 {
-			return unique(out)
-		}
-		for index := int(count) - 1; index >= 0; index-- {
-			stack = append(stack, x.NamedChild(uint(index)))
-		}
-	}
-	return unique(out)
-}
 func cleanDoc(s string) string {
 	s = strings.TrimPrefix(s, "/**")
 	s = strings.TrimSuffix(s, "*/")
@@ -3977,4 +4470,116 @@ func cleanDoc(s string) string {
 }
 func semanticTypeForKind(k SymbolKind) uint32 {
 	return k.SemanticToken()
+}
+
+// infixOperands returns the operands of the infix call whose function name is
+// n: in Kotlin's grammar an infix_expression is (left, simple_identifier, right).
+func (b *parseBuilder) infixOperands(n *sitter.Node, parentKind string) (*sitter.Node, *sitter.Node, bool) {
+	if parentKind != "infix_expression" || len(b.ancestorNodes) == 0 || b.parsed.Language != LanguageKotlin {
+		return nil, nil, false
+	}
+	parent := b.ancestorNodes[len(b.ancestorNodes)-1]
+	children := directNamedChildren(parent)
+	if len(children) != 3 || children[1].StartByte() != n.StartByte() || children[1].EndByte() != n.EndByte() {
+		return nil, nil, false
+	}
+	return children[0], children[2], true
+}
+
+// addKotlinGenericTrailingLambdaCall recovers `tasks.withType<Jar> { ... }`,
+// which tree-sitter-kotlin reads as `(tasks.withType < Jar) > { ... }`: two
+// comparisons and a lambda. It is the call `withType<Jar>` with a trailing
+// lambda -- the shape of most Gradle Kotlin DSL configuration and of
+// `configure<T> { }` everywhere -- so it gets a call reference with the lambda
+// as its argument, the type argument a type reference, and neither `<` nor
+// `>` a compareTo.
+func (b *parseBuilder) addKotlinGenericTrailingLambdaCall(node, left, operator, right *sitter.Node) bool {
+	if nodeText(b.source, operator) != ">" || right.Kind() != "lambda_literal" && right.Kind() != "annotated_lambda" || left.Kind() != "binary_expression" {
+		return false
+	}
+	innerOperator, callee, typeArgument := left.ChildByFieldName("operator"), left.ChildByFieldName("left"), left.ChildByFieldName("right")
+	if innerOperator == nil || callee == nil || typeArgument == nil || nodeText(b.source, innerOperator) != "<" {
+		return false
+	}
+	// `withType<Jar>` is written without spaces around its brackets; a
+	// comparison of something with a lambda would not be.
+	if int(innerOperator.StartByte()) != int(callee.EndByte()) || int(typeArgument.StartByte()) != int(innerOperator.EndByte()) || int(operator.StartByte()) != int(typeArgument.EndByte()) {
+		return false
+	}
+	typeText := nodeText(b.source, typeArgument)
+	if !genericTypeArgumentText.MatchString(typeText) {
+		return false
+	}
+	nameStart, nameEnd := int(callee.StartByte()), int(callee.EndByte())
+	qualifier := ""
+	if callee.Kind() == "navigation_expression" {
+		children := b.namedChildren(callee)
+		if len(children) < 2 {
+			return false
+		}
+		last := children[len(children)-1]
+		nameStart, nameEnd = int(last.StartByte()), int(last.EndByte())
+		if last.Kind() == "navigation_suffix" {
+			if identifier := b.firstIdentifier(last); identifier != nil {
+				nameStart, nameEnd = int(identifier.StartByte()), int(identifier.EndByte())
+			}
+		}
+		qualifier = strings.TrimSpace(nodeText(b.source, children[0]))
+	} else if callee.Kind() != "identifier" && callee.Kind() != "simple_identifier" {
+		return false
+	}
+	name := strings.Trim(string(b.source[nameStart:nameEnd]), "`")
+	if name == "" || !isIdentifierText(name) {
+		return false
+	}
+	b.parsed.References = append(b.parsed.References, Reference{
+		Name: name, Qualifier: qualifier, URI: b.doc.URI,
+		Range: b.doc.Range(nameStart, nameEnd), StartByte: nameStart, EndByte: nameEnd,
+		ContainerID: b.currentContainerID(), Role: RoleCall, Arity: 1,
+		Arguments: []protocol.Range{b.doc.Range(int(right.StartByte()), int(right.EndByte()))},
+	})
+	b.selectionBytes[[2]int{nameStart, nameEnd}] = true
+	// The type argument names types, not values.
+	// `Outer.Nested` is two references, the second qualified by the first,
+	// as a dotted type is everywhere else: an unqualified `Nested` resolves to
+	// nothing.
+	for _, match := range genericTypeNames.FindAllStringIndex(typeText, -1) {
+		base := int(typeArgument.StartByte()) + match[0]
+		dotted := string(b.source[base : int(typeArgument.StartByte())+match[1]])
+		offset := 0
+		for _, segment := range strings.Split(dotted, ".") {
+			start, end := base+offset, base+offset+len(segment)
+			offset += len(segment) + 1
+			if segment == "" {
+				continue
+			}
+			qualifier := ""
+			if start > base {
+				qualifier = string(b.source[base : start-1])
+			}
+			b.parsed.References = append(b.parsed.References, Reference{
+				Name: segment, Qualifier: qualifier, URI: b.doc.URI, Range: b.doc.Range(start, end), StartByte: start, EndByte: end,
+				ContainerID: b.currentContainerID(), Role: RoleType, Arity: -1,
+			})
+			b.selectionBytes[[2]int{start, end}] = true
+		}
+	}
+	if b.genericCallSpans == nil {
+		b.genericCallSpans = make(map[[2]int]bool)
+	}
+	b.genericCallSpans[[2]int{int(left.StartByte()), int(left.EndByte())}] = true
+	return true
+}
+
+var genericTypeArgumentText = regexp.MustCompile(`^[A-Z][\w.]*(<[\w.<>, ?*]*>)?\??$`)
+
+var genericTypeNames = regexp.MustCompile(`[A-Za-z_][\w.]*`)
+
+func isIdentifierText(value string) bool {
+	for index, r := range value {
+		if !(r == '_' || unicode.IsLetter(r) || index > 0 && unicode.IsDigit(r)) {
+			return false
+		}
+	}
+	return value != ""
 }
