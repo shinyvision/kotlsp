@@ -101,6 +101,11 @@ func TestScopeEngineReportsProvablyUnresolvedNames(t *testing.T) {
 		{"other package top-level not imported", "package app\nfun f() = util()\n", "util"},
 		{"local in another function", "package app\nfun first() { val secret = 1 }\nfun second() = secret\n", "secret"},
 		{"familiar generated-member spelling without receiver", "package app\nclass Other { val length = 1 }\nfun f() = length\n", "length"},
+		// A function body whose first statement declares a local once read as
+		// a lambda of unknown receiver, which silenced the whole function.
+		{"function whose body starts with a val", "package app\nclass Other { val secret = 1 }\nfun f(): List<Int> {\n    val records = listOf(1)\n    secret\n    return records\n}\n", "secret"},
+		{"suspend override whose body starts with a var", "package app\ninterface Repo { suspend fun all(): List<Int> }\nclass Other { val secret = 1 }\nclass Impl : Repo {\n    override suspend fun all(): List<Int> {\n        var records = listOf(1)\n        secret\n        return records\n    }\n}\n", "secret"},
+		{"body starting with lateinit-free val after a comment", "package app\nclass Other { val secret = 1 }\nfun f() {\n    // first\n    val x = 1\n    println(secret + x)\n}\n", "secret"},
 	} {
 		files := map[string]string{"app/Probe.kt": fixture.source, "other/Util.kt": "package other\nfun util() = 1\n"}
 		idx := scopeIndex(t, files)
@@ -127,6 +132,9 @@ func TestScopeEngineAbstainsWhereANameCouldBeVisible(t *testing.T) {
 	for _, fixture := range []struct{ label, source, allowed string }{
 		{"member of the receiver lambda", "package app\nclass Ctx { fun put(x: Any) {} }\nfun f() { Ctx().apply { put(1) } }\n", ""},
 		{"member of an unresolvable lambda callee", "package app\nfun f() { mystery { secret } }\n", "mystery"},
+		{"reified type parameter as a value", "package app\nclass Row { fun into(type: Any): Any? = null }\nclass Rows { fun map(f: (Row) -> Any?): Any? = null }\nobject Queries {\n    suspend inline fun <reified T> ids(rows: Rows): Any? {\n        val first = 1\n        return rows\n            .map { it.into(T::class) }\n    }\n}\n", ""},
+		{"return to a lambda label", "package app\nclass Mono { fun contextWrite(f: (Int) -> Int): Int = f(1) }\nfun f(mono: Mono): Int {\n    val x = 1\n    return mono.contextWrite { v ->\n        return@contextWrite v + x\n    }\n}\n", ""},
+		{"lambda parameter list on its own line", "package app\nfun f() { mystery {\n    x ->\n    secret\n} }\n", "mystery"},
 		{"member of a with argument", "package app\nclass Ctx { val secret = 1 }\nfun f(c: Ctx) { with(c) { println(secret) } }\n", ""},
 		{"member through a companion", "package app\nclass Other { companion object { val secret = 1 } }\nclass C { fun f() = Other.secret }\n", ""},
 		{"own companion member", "package app\nclass C { companion object { val secret = 1 }\n fun f() = secret }\n", ""},

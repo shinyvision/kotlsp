@@ -254,7 +254,12 @@ func declarationDiscriminator(symbol analysis.Symbol) string {
 		b.WriteByte(';')
 	}
 	for _, parameter := range symbol.Parameters {
-		b.WriteString(simpleType(parameter.Type))
+		b.WriteString(simpleType(strings.TrimPrefix(strings.TrimSpace(parameter.Type), "vararg ")))
+		// A vararg parameter is an array on the JVM: where(Condition?) and
+		// where(vararg Condition?) are distinct overloads, as jOOQ generates.
+		if parameter.Variadic || strings.HasPrefix(strings.TrimSpace(parameter.Type), "vararg ") || strings.HasSuffix(parameter.Type, "...") {
+			b.WriteString("[]")
+		}
 		b.WriteByte(';')
 	}
 	b.WriteByte(')')

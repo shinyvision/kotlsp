@@ -700,7 +700,14 @@ func serverCapabilities() map[string]any {
 		"documentSymbolProvider":    true, "workspaceSymbolProvider": map[string]any{"resolveProvider": false, "workDoneProgress": true},
 		"documentFormattingProvider": true, "documentRangeFormattingProvider": true,
 		"codeActionProvider": map[string]any{"codeActionKinds": []string{"quickfix", "refactor", "source.organizeImports", "refactor.extract.variable", "refactor.extract.function", "refactor.extract.field", "refactor.extract.constant", "refactor.inline.variable"}, "resolveProvider": false, "workDoneProgress": false},
-		"diagnosticProvider": map[string]any{"interFileDependencies": true, "workspaceDiagnostics": true, "workDoneProgress": false},
+		// workspaceDiagnostics stays unadvertised: Neovim answers a
+		// workspace/diagnostic/refresh from a server that offers them with a
+		// workspace pull only, and drops that pull's reports for every open
+		// document, which it pulls itself. Open files then kept the report
+		// from before indexing finished -- empty -- until the next keystroke.
+		// Without it, a refresh re-pulls each open document. The request is
+		// still answered for clients that make it.
+		"diagnosticProvider": map[string]any{"interFileDependencies": true, "workspaceDiagnostics": false, "workDoneProgress": false},
 		"codeLensProvider":   map[string]any{"resolveProvider": false, "workDoneProgress": false}, "foldingRangeProvider": true,
 		"semanticTokensProvider": map[string]any{"legend": map[string]any{"tokenTypes": []string{"namespace", "class", "enum", "interface", "struct", "typeParameter", "type", "parameter", "variable", "property", "enumMember", "event", "function", "method", "macro", "keyword", "modifier", "comment", "string", "number", "regexp", "operator", "decorator"}, "tokenModifiers": []string{"declaration", "definition", "readonly", "static", "deprecated", "abstract", "async", "modification", "documentation", "defaultLibrary"}}, "range": true, "full": map[string]any{"delta": true}},
 		"inlayHintProvider":      map[string]bool{"resolveProvider": true}, "signatureHelpProvider": map[string]any{"triggerCharacters": []string{"(", ","}, "retriggerCharacters": []string{","}, "workDoneProgress": false},

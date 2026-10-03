@@ -1181,8 +1181,17 @@ func (i *Index) replaceLocked(file *analysis.ParsedFile) {
 	// lock acquisition. The run token is checked at transaction publication,
 	// so even mutation paths which are not initiated by an editor notification
 	// cannot publish diagnostics for the previous index snapshot.
-	i.compilerRun.Add(1)
-	i.invalidateCompilerDiagnosticsLocked()
+	//
+	// Library files are not compiler inputs -- the compiler reads their
+	// archives -- and indexing them used to supersede every pass that ran
+	// while libraries and source attachments were still arriving.
+	//
+	// The run token alone keeps a stale pass from publishing. Other files'
+	// findings stay until the next pass: wiping them all made every compiler
+	// error in every open file vanish on each keystroke in any one of them.
+	if !strings.HasPrefix(string(file.URI), "jar:") && i.librarySources[file.URI].Archive == "" {
+		i.compilerRun.Add(1)
+	}
 	old := i.files[file.URI]
 	if old != nil {
 		preserveLibraryAttachments(old, file)

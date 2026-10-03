@@ -129,6 +129,8 @@ func TestFastRulesStaySilentOnNearMisses(t *testing.T) {
 		{"lateinit ok", "package app\nclass C { lateinit var s: String }\n"},
 		{"lateinit two problems", "package app\nclass C { lateinit val a: Int }\n"},
 		{"one companion", "package app\nclass C { companion object }\n"},
+		// jOOQ's generated tables declare all three.
+		{"vararg overload", "package app\nclass Condition\nclass T {\n    fun where(condition: Condition?): T = this\n    fun where(conditions: Collection<Condition>): T = this\n    fun where(vararg conditions: Condition?): T = this\n}\n"},
 		{"data class ok", "package app\ndata class D(val x: Int)\n"},
 		{"data class vararg", "package app\ndata class D(val x: Int, vararg y: Int)\n"},
 		{"return present", "package app\nfun f(): Int { return 1 }\n"},

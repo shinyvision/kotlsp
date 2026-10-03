@@ -245,6 +245,23 @@ func (i *Index) unresolvedVerdictLocked(ctx context.Context, c *unresolvedNameCo
 	if before := skipBackCode(c.text, c.mask, ref.StartByte-1); before >= 0 && (c.text[before] == '.' || c.text[before] == ':' || c.text[before] == '?') {
 		return false, "qualified access"
 	}
+	// An enclosing declaration's type parameter: T::class.java with a
+	// reified T reads it as a value.
+	for _, symbol := range file.Symbols {
+		if symbol.StartByte > ref.StartByte || symbol.EndByte < ref.EndByte {
+			continue
+		}
+		for _, parameter := range symbol.TypeParameters {
+			if fields := strings.Fields(parameter); len(fields) > 0 && strings.TrimSuffix(fields[len(fields)-1], ",") == name {
+				return false, "a type parameter in scope"
+			}
+		}
+	}
+	// return@contextWrite, this@Outer, break@loop: a label names a lambda,
+	// class or loop, never a value.
+	if ref.StartByte > 0 && ref.StartByte <= len(c.text) && c.text[ref.StartByte-1] == '@' {
+		return false, "a label"
+	}
 	if c.isRootPackageSegment(i, name) {
 		return false, "the name is a package segment"
 	}
@@ -621,6 +638,12 @@ func (i *Index) lambdaSpansLocked(c *unresolvedNameContext) []lambdaSpan {
 		if open < 0 || seen[open] {
 			continue
 		}
+		// A lambda's parameters never start with val or var; a local declared
+		// as the first statement of a function body does, and read as a lambda
+		// it made every name in that function unreportable.
+		if declaredWithValOrVar(text, symbol) {
+			continue
+		}
 		seen[open] = true
 		end := matchingBrace(text, mask, open)
 		if end < 0 {
@@ -629,6 +652,35 @@ func (i *Index) lambdaSpansLocked(c *unresolvedNameContext) []lambdaSpan {
 		out = append(out, lambdaSpan{span: span{open, end}})
 	}
 	return out
+}
+
+// declaredWithValOrVar reports whether a symbol is introduced by the val or
+// var keyword (possibly with modifiers such as lateinit between).
+func declaredWithValOrVar(text string, symbol analysis.Symbol) bool {
+	name := symbol.NameStartByte
+	if name <= 0 || name > len(text) {
+		name = symbol.StartByte
+	}
+	start := symbol.StartByte
+	if start < 0 || start > name {
+		start = name
+	}
+	// The keyword sits at or after the declaration's start, before its name.
+	for _, word := range strings.Fields(text[start:name]) {
+		if word == "val" || word == "var" {
+			return true
+		}
+	}
+	at := start - 1
+	for at >= 0 && (text[at] == ' ' || text[at] == '\t') {
+		at--
+	}
+	end := at + 1
+	for at >= 0 && isIdentifierByteFast(text[at]) {
+		at--
+	}
+	word := text[at+1 : end]
+	return word == "val" || word == "var"
 }
 
 // lambdaReceiversLocked works out what a lambda's implicit receiver could be

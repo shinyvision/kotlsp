@@ -231,6 +231,9 @@ func (i *Index) scanJavaCompilerDiagnostics(parent context.Context, generation u
 	ctx := parent
 	diagnostics := make(map[protocol.URI][]protocol.Diagnostic)
 	passSuccessful := true
+	// The units holding open documents -- what the author is looking at --
+	// compile first and publish as soon as they finish; the rest follow.
+	units = i.openUnitsFirst(units)
 	for unitIndex, unit := range units {
 		if i.generation.Load() != generation || ctx.Err() != nil {
 			break
@@ -509,6 +512,9 @@ func (i *Index) scanKotlinCompilerDiagnostics(parent context.Context, generation
 	ctx := parent
 	diagnostics := make(map[protocol.URI][]protocol.Diagnostic)
 	passSuccessful := true
+	// The units holding open documents -- what the author is looking at --
+	// compile first and publish as soon as they finish; the rest follow.
+	units = i.openUnitsFirst(units)
 	for unitIndex, unit := range units {
 		if i.generation.Load() != generation || ctx.Err() != nil {
 			break
@@ -533,7 +539,9 @@ func (i *Index) scanKotlinCompilerDiagnostics(parent context.Context, generation
 			continue
 		}
 		plan := i.compilerIncrementalPlan("kotlin", unit)
-		if plan.Incremental && !compilerInputsContainKotlin(plan.Inputs) {
+		// A unit whose own files are unchanged, while files it reads changed
+		// only inside bodies no other file sees, has the diagnostics it had.
+		if plan.Incremental && (!compilerInputsContainKotlin(plan.Inputs) || !anyPrimary(unit, plan.Affected)) {
 			entry := plan.Previous
 			entry.InputHashes = plan.InputHashes
 			entry.DeclarationShapes = plan.DeclarationShapes
@@ -663,6 +671,7 @@ func (i *Index) scanKotlinCompilerDiagnostics(parent context.Context, generation
 			continue
 		}
 		mergePrimaryCompilerDiagnostics(diagnostics, values, unit.Primary, "kotlin")
+		i.publishUnitCompilerDiagnostics(ctx, unit, diagnostics, generation)
 	}
 	if !passSuccessful || ctx.Err() != nil || i.generation.Load() != generation {
 		if ctx.Err() != nil {
@@ -701,6 +710,78 @@ func (i *Index) scanKotlinCompilerDiagnostics(parent context.Context, generation
 			if strings.HasSuffix(lower, ".kt") || strings.HasSuffix(lower, ".kts") {
 				i.onParsed(file.URI, i.Diagnostics(file.URI))
 			}
+		}
+	}
+}
+
+func anyPrimary(unit compilerUnit, files map[protocol.URI]bool) bool {
+	for _, file := range unit.Primary {
+		if file != nil && files[file.URI] {
+			return true
+		}
+	}
+	return false
+}
+
+// openUnitsFirst orders units holding an open document ahead of the rest,
+// keeping the order within each group.
+func (i *Index) openUnitsFirst(units []compilerUnit) []compilerUnit {
+	i.mu.RLock()
+	open := make(map[protocol.URI]bool, len(i.docs))
+	for uri := range i.docs {
+		open[uri] = true
+	}
+	i.mu.RUnlock()
+	ordered := make([]compilerUnit, 0, len(units))
+	var rest []compilerUnit
+	for _, unit := range units {
+		holds := false
+		for _, file := range unit.Primary {
+			if file != nil && open[file.URI] {
+				holds = true
+				break
+			}
+		}
+		if holds {
+			ordered = append(ordered, unit)
+		} else {
+			rest = append(rest, unit)
+		}
+	}
+	return append(ordered, rest...)
+}
+
+// publishUnitCompilerDiagnostics publishes one compiled unit's Kotlin
+// findings for its open documents before the pass ends. A cold pass compiles
+// every unit before its transaction commits -- a minute and more on a large
+// workspace -- and the file being edited need not wait for the others. The
+// commit later publishes the same values with everything else.
+func (i *Index) publishUnitCompilerDiagnostics(ctx context.Context, unit compilerUnit, diagnostics map[protocol.URI][]protocol.Diagnostic, generation uint64) {
+	var published []protocol.URI
+	i.mu.Lock()
+	if i.generation.Load() != generation || ctx.Err() != nil {
+		i.mu.Unlock()
+		return
+	}
+	for _, file := range unit.Primary {
+		lower := strings.ToLower(string(file.URI))
+		if i.docs[file.URI] == nil || !strings.HasSuffix(lower, ".kt") && !strings.HasSuffix(lower, ".kts") {
+			continue
+		}
+		if values := diagnostics[file.URI]; len(values) > 0 {
+			i.compilerDiagnostics[file.URI] = values
+		} else {
+			delete(i.compilerDiagnostics, file.URI)
+		}
+		published = append(published, file.URI)
+	}
+	if len(published) > 0 {
+		i.diagnosticsVersion.Add(1)
+	}
+	i.mu.Unlock()
+	if i.onParsed != nil && !i.pushDisabled.Load() {
+		for _, uri := range published {
+			i.onParsed(uri, i.Diagnostics(uri))
 		}
 	}
 }
@@ -1272,7 +1353,7 @@ func (i *Index) compilerIncrementalPlan(language string, unit compilerUnit) incr
 		relevant = append(relevant, file)
 		byURI[file.URI] = file
 		inputHashes[file.URI] = file.TextHash
-		shapes[file.URI] = compilerDeclarationShape(file)
+		shapes[file.URI] = i.compilerShape(file)
 	}
 	full := incrementalCompilerPlan{Inputs: relevant, InputHashes: inputHashes, DeclarationShapes: shapes}
 	previous, ok := i.compilerCachePrevious(language, unit)
@@ -1299,10 +1380,10 @@ func (i *Index) compilerIncrementalPlan(language string, unit compilerUnit) incr
 		// Rebuilding cleanly is safer than layering on an incomplete snapshot.
 		return full
 	}
-	affected, complete := i.compilerAffectedClosure(changed, byURI)
-	if !complete {
-		return full
-	}
+	// Every changed file kept its shape -- leaking bodies included -- so no
+	// other file compiles differently: only the changed ones are recompiled,
+	// against the previous classes of the rest.
+	affected := changed
 	if len(affected)*4 > len(relevant)*3 {
 		return full
 	}
@@ -1346,7 +1427,67 @@ func compilerInputsContainKotlin(files []*analysis.ParsedFile) bool {
 	return false
 }
 
-func compilerDeclarationShape(file *analysis.ParsedFile) uint64 {
+// compilerShapeCache remembers each file's declaration shape by content: a
+// pass shapes every input of every unit, hundreds of files per unit.
+type compilerShapeKey struct {
+	uri  protocol.URI
+	hash uint64
+}
+
+var compilerShapeCache = struct {
+	sync.Mutex
+	values map[compilerShapeKey]uint64
+}{values: make(map[compilerShapeKey]uint64)}
+
+// compilerShape is the declaration shape of file, including the bodies other
+// files see: an inline function's, a constant's, and those of declarations
+// whose type is inferred from them. A change outside these leaves every
+// other file's compilation, and so its diagnostics, as it was.
+func (i *Index) compilerShape(file *analysis.ParsedFile) uint64 {
+	if file == nil {
+		return 0
+	}
+	key := compilerShapeKey{file.URI, file.TextHash}
+	compilerShapeCache.Lock()
+	shape, ok := compilerShapeCache.values[key]
+	compilerShapeCache.Unlock()
+	if ok {
+		return shape
+	}
+	i.mu.RLock()
+	text := i.documentTextLocked(file.URI)
+	i.mu.RUnlock()
+	shape = compilerDeclarationShape(file, text)
+	compilerShapeCache.Lock()
+	if len(compilerShapeCache.values) > 200_000 {
+		compilerShapeCache.values = make(map[compilerShapeKey]uint64)
+	}
+	compilerShapeCache.values[key] = shape
+	compilerShapeCache.Unlock()
+	return shape
+}
+
+// leaksBody reports whether a declaration's body is visible to other files'
+// compilation.
+func leaksBody(symbol analysis.Symbol, language analysis.Language) bool {
+	if hasAnyModifier(&symbol, "private") {
+		return false
+	}
+	if hasAnyModifier(&symbol, "inline") || hasAnyModifier(&symbol, "const") {
+		return true
+	}
+	if language == analysis.LanguageJava {
+		// javac inlines static final constants into their users.
+		return symbol.Kind == analysis.KindField && hasAnyModifier(&symbol, "static") && hasAnyModifier(&symbol, "final")
+	}
+	switch symbol.Kind {
+	case analysis.KindFunction, analysis.KindMethod, analysis.KindProperty, analysis.KindField:
+		return strings.TrimSpace(symbol.Type) == ""
+	}
+	return false
+}
+
+func compilerDeclarationShape(file *analysis.ParsedFile, text string) uint64 {
 	if file == nil {
 		return 0
 	}
@@ -1383,6 +1524,16 @@ func compilerDeclarationShape(file *analysis.ParsedFile) uint64 {
 			value.WriteString(parameter.Type)
 			if parameter.Variadic {
 				value.WriteByte('*')
+			}
+		}
+		if leaksBody(symbol, file.Language) {
+			if symbol.StartByte >= 0 && symbol.EndByte <= len(text) && symbol.StartByte < symbol.EndByte {
+				value.WriteByte(0)
+				value.WriteString(text[symbol.StartByte:symbol.EndByte])
+			} else {
+				// No text to compare: any edit may change what others see.
+				value.WriteByte(0)
+				value.WriteString(strconv.FormatUint(file.TextHash, 16))
 			}
 		}
 		shape := value.String()
@@ -2376,6 +2527,11 @@ func (i *Index) scheduleCompilerDiagnosticsNow(parent context.Context) {
 		case <-timer.C:
 		}
 		if i.closed.Load() || i.compilerRun.Load() != run || i.generation.Load() != generation || i.modelRefreshing.Load() {
+			return
+		}
+		// Start schedules a pass once its build model is in place.
+		if i.buildModelPending.Load() {
+			i.compilerStatus.publication(false, "waiting for the build model")
 			return
 		}
 		// Kotlin runs first because its cached unit artifact is also javac's

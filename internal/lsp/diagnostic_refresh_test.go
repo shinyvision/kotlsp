@@ -133,3 +133,14 @@ func TestCompilerPassAsksTheClientToRefresh(t *testing.T) {
 		t.Fatal("the client was never asked to re-request after a compiler pass")
 	}
 }
+
+// Neovim answers workspace/diagnostic/refresh from a server offering
+// workspace diagnostics with a workspace pull only, and drops that pull's
+// reports for open documents: an open file kept the empty report from before
+// indexing finished. Unadvertised, the refresh re-pulls each open document.
+func TestWorkspaceDiagnosticsAreNotAdvertised(t *testing.T) {
+	provider, _ := serverCapabilities()["diagnosticProvider"].(map[string]any)
+	if provider == nil || provider["workspaceDiagnostics"] != false {
+		t.Fatalf("diagnosticProvider = %#v, want workspaceDiagnostics false", provider)
+	}
+}

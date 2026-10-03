@@ -81,9 +81,13 @@ type Index struct {
 	health                 healthTracker
 	buildRefreshMu         sync.Mutex
 	modelRefreshing        atomic.Bool
-	refreshIncomplete      atomic.Bool
-	generatedSources       generatedSourceState
-	onDiagnosticsChanged   func()
+	// buildModelPending is set from Start until its build model -- modules
+	// and their classpaths -- is installed. A compiler pass before that has
+	// no classpath and would report nearly every name as unresolved.
+	buildModelPending    atomic.Bool
+	refreshIncomplete    atomic.Bool
+	generatedSources     generatedSourceState
+	onDiagnosticsChanged func()
 }
 
 // symbolTables are the index's global lookup tables: every declaration by

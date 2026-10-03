@@ -1281,6 +1281,7 @@ func (i *Index) uniqueDirectMemberResultTypeLocked(ctx context.Context, file *an
 	for _, instantiated := range i.instantiatedTypeHierarchyLocked(ctx, file, receiverType) {
 		owner, arguments := instantiated.symbol, instantiated.arguments
 		matches := 0
+		var overloadResults []overloadResult
 		// Kotlin prefers an overload that takes the arguments without a vararg:
 		// jOOQ's `insertInto(table)` is `insertInto(Table<R>)`, not
 		// `insertInto(Table<R>, Field<?>...)` with nothing spread.
@@ -1346,9 +1347,6 @@ func (i *Index) uniqueDirectMemberResultTypeLocked(ctx context.Context, file *an
 			if callable && arity >= 0 && (!matchesArityForLanguage(*member, arity, file.Language) || preferFixed && !takesArityWithoutVararg(*member, arity, file.Language)) {
 				continue
 			}
-			if callable && arity >= 0 && rejectsArguments(*member) {
-				continue
-			}
 			memberType := i.declaredOrInferredMemberTypeLocked(ctx, *member)
 			if memberType == "" {
 				continue
@@ -1363,20 +1361,49 @@ func (i *Index) uniqueDirectMemberResultTypeLocked(ctx context.Context, file *an
 				candidate = kotlinViewOfJavaType(candidate)
 			}
 			matches++
-			if matches == 1 {
-				result = candidate
-			} else if candidate != result {
-				// Overloads whose results differ are a real ambiguity. The same
-				// declaration indexed twice -- from a library's sources and from
-				// its class files -- is not, and must not cost the type.
-				result = ""
-			}
+			overloadResults = append(overloadResults, overloadResult{*member, candidate})
 		}
 		if matches > 0 {
-			return result, true
+			return agreedOverloadResult(overloadResults, func(member analysis.Symbol) bool {
+				return callable && arity >= 0 && rejectsArguments(member)
+			}), true
 		}
 	}
 	return "", false
+}
+
+type overloadResult struct {
+	member analysis.Symbol
+	result string
+}
+
+// agreedOverloadResult is the result every matching overload gives. The same
+// declaration indexed twice -- from a library's sources and from its class
+// files -- agrees with itself. Overloads that disagree are narrowed by their
+// arguments, which costs argument inference and so happens only then; if
+// they still disagree, the call is ambiguous and has no result.
+func agreedOverloadResult(candidates []overloadResult, rejects func(analysis.Symbol) bool) string {
+	agreed := func(values []overloadResult) string {
+		if len(values) == 0 {
+			return ""
+		}
+		for _, value := range values[1:] {
+			if value.result != values[0].result {
+				return ""
+			}
+		}
+		return values[0].result
+	}
+	if result := agreed(candidates); result != "" || len(candidates) < 2 {
+		return result
+	}
+	kept := candidates[:0:0]
+	for _, candidate := range candidates {
+		if !rejects(candidate.member) {
+			kept = append(kept, candidate)
+		}
+	}
+	return agreed(kept)
 }
 
 // uniqueExtensionResultTypeLocked applies the parts of extension overload

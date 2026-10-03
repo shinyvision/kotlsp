@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 
 	"github.com/shinyvision/kotlsp/internal/analysis"
 	"github.com/shinyvision/kotlsp/internal/protocol"
@@ -116,11 +117,11 @@ func (i *Index) Change(ctx context.Context, params protocol.DidChangeTextDocumen
 	guard.Lock()
 	i.syntaxStates[old.URI] = state
 	i.docs[old.URI] = old
-	// Compiler findings belong to the exact source/configuration transaction
-	// which produced them. Even an edit on another line can add an import,
-	// change overload resolution, or repair a project-wide declaration, so
-	// shifting old ranges is not evidence that the finding remains true.
-	i.dropCompilerDiagnosticsLocked(old.URI)
+	// The compiler's findings for this file stay until the next pass replaces
+	// them -- about a second later -- shifted past the edit; those on the
+	// edited lines go. Dropping them all made every compiler-only error
+	// vanish on each keystroke and reappear when the pass came back.
+	i.shiftCompilerDiagnosticsLocked(old.URI, previousText, old.Text)
 	i.replaceLocked(parsed)
 	i.fileGeneration[old.URI] = i.generation.Load()
 	guard.Unlock()
@@ -344,6 +345,49 @@ func (i *Index) removeLocked(uri protocol.URI) {
 	delete(i.indexedDocs, uri)
 	delete(i.libraryDocs, uri)
 	i.forgetLibrarySourceLocked(uri)
+}
+
+// shiftCompilerDiagnosticsLocked moves a file's compiler findings to where
+// their lines are after an edit, and drops those on lines the edit changed.
+func (i *Index) shiftCompilerDiagnosticsLocked(uri protocol.URI, before, after string) {
+	values, exists := i.compilerDiagnostics[uri]
+	if !exists {
+		return
+	}
+	start, oldEnd, newEnd := changedLines(before, after)
+	delta := newEnd - oldEnd
+	kept := make([]protocol.Diagnostic, 0, len(values))
+	for _, diagnostic := range values {
+		switch {
+		case diagnostic.Range.End.Line < start:
+			kept = append(kept, diagnostic)
+		case diagnostic.Range.Start.Line >= oldEnd:
+			diagnostic.Range.Start.Line += delta
+			diagnostic.Range.End.Line += delta
+			kept = append(kept, diagnostic)
+		}
+	}
+	if len(kept) == 0 {
+		delete(i.compilerDiagnostics, uri)
+	} else {
+		i.compilerDiagnostics[uri] = kept
+	}
+	i.diagnosticsVersion.Add(1)
+}
+
+// changedLines compares two texts line by line: lines [0, start) are equal,
+// and so are old lines from oldEnd and new lines from newEnd to the end.
+func changedLines(before, after string) (start, oldEnd, newEnd int) {
+	oldLines, newLines := strings.Split(before, "\n"), strings.Split(after, "\n")
+	for start < len(oldLines) && start < len(newLines) && oldLines[start] == newLines[start] {
+		start++
+	}
+	oldEnd, newEnd = len(oldLines), len(newLines)
+	for oldEnd > start && newEnd > start && oldLines[oldEnd-1] == newLines[newEnd-1] {
+		oldEnd--
+		newEnd--
+	}
+	return start, oldEnd, newEnd
 }
 
 func (i *Index) dropCompilerDiagnosticsLocked(uri protocol.URI) {
